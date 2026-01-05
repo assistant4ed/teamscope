@@ -13,6 +13,18 @@ export default function App() {
   const [activeModule, setActiveModule] = useState<AppModule>(AppModule.PULSE);
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
 
+  if (!process.env.GEMINI_API_KEY) {
+    return (
+      <div className="flex items-center justify-center h-screen bg-red-50 text-red-900">
+        <div className="text-center p-8 border border-red-200 rounded-lg bg-white shadow-md">
+          <h1 className="text-2xl font-bold mb-4">Configuration Error</h1>
+          <p>The <code>GEMINI_API_KEY</code> environment variable is not set.</p>
+          <p>Please set it in a <code>.env.local</code> file for local development or in your deployment settings.</p>
+        </div>
+      </div>
+    );
+  }
+
   const renderContent = () => {
     switch (activeModule) {
       case AppModule.PULSE:

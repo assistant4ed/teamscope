@@ -2,9 +2,29 @@
 import { GoogleGenAI, GenerateContentResponse } from "@google/genai";
 import { DailyLog } from '../types';
 
-// Initialize Gemini Client
-const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
+// Lazy initialization — avoid crashing the whole bundle at module load when
+// the key isn't provided (prod deployments without GEMINI_API_KEY still
+// render the UI; AI calls just return a friendly error).
+const API_KEY = process.env.API_KEY || process.env.GEMINI_API_KEY || '';
 const MODEL_NAME = 'gemini-3-flash-preview';
+
+let _ai: GoogleGenAI | null = null;
+function getAI(): GoogleGenAI | null {
+  if (!API_KEY || API_KEY === 'not-configured') return null;
+  if (!_ai) _ai = new GoogleGenAI({ apiKey: API_KEY });
+  return _ai;
+}
+
+const NOT_CONFIGURED_MSG =
+  "AI features are not configured. Set GEMINI_API_KEY at build time to enable.";
+
+async function safeGenerate(
+  config: Parameters<GoogleGenAI['models']['generateContent']>[0]
+): Promise<GenerateContentResponse | null> {
+  const ai = getAI();
+  if (!ai) return null;
+  return ai.models.generateContent(config);
+}
 
 /**
  * Generates a management summary from a list of team standup updates.
@@ -26,13 +46,14 @@ export const generateManagerSummary = async (updates: DailyLog[]): Promise<strin
     `;
 
     // Always use systemInstruction in the config object
-    const response: GenerateContentResponse = await ai.models.generateContent({
+    const response = await safeGenerate({
       model: MODEL_NAME,
       contents: prompt,
       config: {
         systemInstruction,
       }
     });
+    if (!response) return NOT_CONFIGURED_MSG;
 
     return response.text || "Unable to generate summary.";
   } catch (error) {
@@ -59,13 +80,14 @@ export const generateWeeklyReport = async (logs: DailyLog[], userName: string): 
     `;
 
     // Always use systemInstruction in the config object
-    const response: GenerateContentResponse = await ai.models.generateContent({
+    const response = await safeGenerate({
       model: MODEL_NAME,
       contents: prompt,
       config: {
         systemInstruction,
       }
     });
+    if (!response) return NOT_CONFIGURED_MSG;
 
     return response.text || "Unable to generate weekly report.";
   } catch (error) {
@@ -104,7 +126,7 @@ export const queryTeamLogs = async (
     `;
 
     // Always use systemInstruction in the config object
-    const response: GenerateContentResponse = await ai.models.generateContent({
+    const response = await safeGenerate({
       model: MODEL_NAME,
       contents: [
         ...historyFormatted,
@@ -114,6 +136,7 @@ export const queryTeamLogs = async (
         systemInstruction,
       }
     });
+    if (!response) return NOT_CONFIGURED_MSG;
 
     return response.text || "I couldn't analyze the data at this moment.";
   } catch (error) {
@@ -180,7 +203,7 @@ export const chatWithDocument = async (
     `;
 
     // Always use systemInstruction in the config object
-    const response: GenerateContentResponse = await ai.models.generateContent({
+    const response = await safeGenerate({
       model: MODEL_NAME,
       contents: [
         ...historyFormatted,
@@ -190,6 +213,7 @@ export const chatWithDocument = async (
         systemInstruction,
       }
     });
+    if (!response) return NOT_CONFIGURED_MSG;
 
     return response.text || "No response generated.";
   } catch (error) {
@@ -217,13 +241,14 @@ export const generateQuizQuestion = async (moduleTitle: string): Promise<string>
     `;
 
     // Always use systemInstruction in the config object
-    const response: GenerateContentResponse = await ai.models.generateContent({
+    const response = await safeGenerate({
       model: MODEL_NAME,
       contents: prompt,
       config: {
         systemInstruction,
       }
     });
+    if (!response) return NOT_CONFIGURED_MSG;
 
     return response.text || "Quiz generation failed.";
   } catch (error) {

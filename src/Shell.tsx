@@ -1,17 +1,24 @@
 import React, { useState } from 'react';
-import { LayoutDashboard, ListChecks, ClipboardList, Users, LogOut, Menu, X } from 'lucide-react';
+import {
+  LayoutDashboard, ListChecks, ClipboardList, Users, LogOut, Menu, X,
+  Bot, Activity as ActivityIcon,
+} from 'lucide-react';
 import { Me, signOut } from './auth';
 import Dashboard from './pages/Dashboard';
 import Tasks from './pages/Tasks';
 import Reports from './pages/Reports';
 import Team from './pages/Team';
+import Agent from './pages/Agent';
+import Activity from './pages/Activity';
 
-type Tab = 'dashboard' | 'tasks' | 'reports' | 'team';
+type Tab = 'dashboard' | 'agent' | 'tasks' | 'reports' | 'activity' | 'team';
 
 const NAV: { id: Tab; label: string; icon: React.ReactNode }[] = [
   { id: 'dashboard', label: 'Dashboard',    icon: <LayoutDashboard className="w-5 h-5" /> },
+  { id: 'agent',     label: 'AI Agent',     icon: <Bot            className="w-5 h-5" /> },
   { id: 'tasks',     label: 'Tasks',        icon: <ListChecks     className="w-5 h-5" /> },
   { id: 'reports',   label: 'Work Reports', icon: <ClipboardList  className="w-5 h-5" /> },
+  { id: 'activity',  label: 'Activity',     icon: <ActivityIcon   className="w-5 h-5" /> },
   { id: 'team',      label: 'Team',         icon: <Users          className="w-5 h-5" /> },
 ];
 
@@ -21,8 +28,10 @@ export default function Shell({ me }: { me: Me }) {
 
   const Page = {
     dashboard: <Dashboard />,
+    agent:     <Agent me={me} />,
     tasks:     <Tasks me={me} />,
     reports:   <Reports />,
+    activity:  <Activity />,
     team:      <Team me={me} />,
   }[tab];
 

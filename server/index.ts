@@ -268,6 +268,75 @@ app.post('/api/tasks/:id/cancel',
   }
 );
 
+// ---------- Agent (n8n integration) ------------------------------ //
+// n8n exposes `08 · TeamScope Agent Webhook` at N8N_AGENT_URL that takes
+// { text, user_email } and returns { classification, action_taken }.
+const N8N_AGENT_URL = process.env.N8N_AGENT_URL
+  || 'https://pa.stratexai.io/webhook/teamscope-agent';
+
+app.post('/api/agent/message',
+  requireRole('boss', 'pa'),
+  async (req, res) => {
+    const text = (req.body?.text as string || '').trim();
+    if (!text) return res.status(400).json({ error: 'text required' });
+    try {
+      const upstream = await fetch(N8N_AGENT_URL, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          text,
+          user_email: req.user!.email,
+        }),
+      });
+      const data = await upstream.json().catch(() => ({}));
+      if (!upstream.ok) {
+        return res.status(502).json({ error: 'agent_upstream_error', detail: data });
+      }
+      res.json(data);
+    } catch (e) {
+      res.status(500).json({ error: (e as Error).message });
+    }
+  }
+);
+
+app.get('/api/agent/actions', async (req, res) => {
+  const limit = Math.min(200, Math.max(1, Number(req.query.limit ?? 50)));
+  try {
+    const rows = await query(
+      `SELECT a.id, a.correlation_id, a.domain, a.action, a.executor,
+              a.outcome, a.created_at,
+              p.name AS requester_name
+         FROM ops.actions_log a
+    LEFT JOIN ops.profiles p ON p.id = a.profile_id
+        ORDER BY a.created_at DESC
+        LIMIT $1`,
+      [limit]
+    );
+    res.json({ actions: rows });
+  } catch (e) {
+    res.status(500).json({ error: (e as Error).message });
+  }
+});
+
+app.get('/api/agent/classifications', async (req, res) => {
+  const limit = Math.min(200, Math.max(1, Number(req.query.limit ?? 30)));
+  try {
+    const rows = await query(
+      `SELECT c.id, c.domain, c.action, c.confidence, c.requires_approval,
+              c.assignee, c.priority, c.created_at,
+              m.text AS source_text, m.channel
+         FROM ops.classifications c
+    LEFT JOIN ops.messages m ON m.id = c.message_id
+        ORDER BY c.created_at DESC
+        LIMIT $1`,
+      [limit]
+    );
+    res.json({ classifications: rows });
+  } catch (e) {
+    res.status(500).json({ error: (e as Error).message });
+  }
+});
+
 // ---------- Team (subscribers / profiles) ------------------------- //
 app.get('/api/team', async (_req, res) => {
   try {

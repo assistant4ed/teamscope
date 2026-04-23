@@ -2,6 +2,11 @@
 FROM node:20-alpine AS build
 WORKDIR /app
 
+# Vite bakes env vars at build time. Railway passes service vars as build
+# args automatically when a matching ARG is declared.
+ARG GEMINI_API_KEY
+ENV GEMINI_API_KEY=$GEMINI_API_KEY
+
 COPY package*.json ./
 RUN npm ci --no-audit --no-fund
 

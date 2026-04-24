@@ -725,6 +725,166 @@ app.post('/api/agent/classify-report', async (req, res) => {
   }
 });
 
+// Turn freeform text ("tell Andrea to prepare slides by Friday") into
+// a Kanban card. Claude extracts {title, description, assignee_name,
+// priority, due_date}, we match assignee_name to an active subscriber
+// (case-insensitive, first-name-ok), then insert. Intended for the AI
+// Agent "Send to Board" panel AND for n8n to call when a Telegram
+// message should skip the classification queue and land straight on
+// the board.
+app.post('/api/agent/create-card', async (req, res) => {
+  const text = ((req.body?.text as string) || '').trim().slice(0, 2000);
+  if (!text) return res.status(400).json({ error: 'text required' });
+  const columnOverride = req.body?.column_id as string | undefined;
+  const assigneeOverride = req.body?.assignee_id as string | undefined;
+  if (!ANTHROPIC_API_KEY) {
+    return res.status(503).json({ error: 'ANTHROPIC_API_KEY not configured' });
+  }
+
+  try {
+    const subs = await query<{ id: string; name: string; active: boolean }>(
+      `SELECT id, name, active FROM ops.report_subscribers WHERE active = true`
+    );
+    const subsList = subs.map(s => `- ${s.name}`).join('\n') || '(none yet)';
+
+    const system =
+      "You extract a Kanban card from freeform text. Output STRICT JSON only " +
+      "(no prose, no code fences):\n" +
+      '{\n' +
+      '  "title": "<short imperative, <80 chars>",\n' +
+      '  "description": "<optional 1-2 sentences of detail, or null>",\n' +
+      '  "assignee_name": "<exact name from the allowed list, or null>",\n' +
+      '  "priority": "low" | "medium" | "high" | "urgent",\n' +
+      '  "due_date": "<YYYY-MM-DD or null>"\n' +
+      '}\n\n' +
+      "Rules:\n" +
+      "- title: always fill. Rewrite the ask as a clear action, not a quote.\n" +
+      "- assignee_name: must match one of the allowed names verbatim (case matters in the output). " +
+      "First-name mention counts as a match if it's unambiguous. If the text doesn't name a person, return null.\n" +
+      "- priority: 'urgent' only if the text explicitly says so (urgent/asap/critical). Otherwise 'medium'.\n" +
+      "- due_date: resolve relative dates (today/tomorrow/Friday) to an absolute YYYY-MM-DD; " +
+      `today is ${new Date().toISOString().slice(0, 10)} (UTC). null if unspecified.\n\n` +
+      "Allowed assignee names:\n" + subsList;
+
+    const upstream = await fetch('https://api.anthropic.com/v1/messages', {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        'anthropic-version': '2023-06-01',
+        'x-api-key': ANTHROPIC_API_KEY,
+      },
+      body: JSON.stringify({
+        model: 'claude-sonnet-4-6',
+        max_tokens: 400,
+        system,
+        messages: [{ role: 'user', content: text }],
+      }),
+    });
+    const data = await upstream.json().catch(() => ({} as Record<string, unknown>));
+    if (!upstream.ok) {
+      return res.status(502).json({ error: 'anthropic_error', detail: data });
+    }
+    const raw = (data as { content?: Array<{ text?: string }> })?.content?.[0]?.text || '';
+    const parsed = extractJson(raw) as {
+      title?: string; description?: string | null;
+      assignee_name?: string | null;
+      priority?: 'low' | 'medium' | 'high' | 'urgent';
+      due_date?: string | null;
+    } | null;
+    if (!parsed || !parsed.title) {
+      return res.status(502).json({ error: 'claude_parse_failed', raw_preview: raw.slice(0, 200) });
+    }
+
+    // Resolve assignee: explicit override wins, else match Claude's name.
+    let assigneeId: string | null = assigneeOverride || null;
+    if (!assigneeId && parsed.assignee_name) {
+      const wanted = parsed.assignee_name.trim().toLowerCase();
+      const match = subs.find(s => s.name.trim().toLowerCase() === wanted)
+        || subs.find(s => s.name.trim().toLowerCase().split(/\s+/)[0] === wanted.split(/\s+/)[0]);
+      if (match) assigneeId = match.id;
+    }
+
+    // Resolve target column (default: "Today", else first non-done).
+    let columnId = columnOverride;
+    if (!columnId) {
+      const cols = await query<{ id: string }>(
+        `SELECT id FROM ops.kanban_columns
+          WHERE deleted_at IS NULL
+          ORDER BY CASE WHEN lower(name) = 'today' THEN 0
+                        WHEN is_done THEN 2 ELSE 1 END,
+                   position LIMIT 1`
+      );
+      columnId = cols[0]?.id;
+    }
+    if (!columnId) return res.status(400).json({ error: 'no_target_column' });
+
+    const client = await pool.connect();
+    let cardOut: Record<string, unknown>;
+    try {
+      await client.query('BEGIN');
+      const posRow = await client.query(
+        `SELECT COALESCE(MAX(position), -1) + 1 AS next_pos
+           FROM ops.kanban_cards
+          WHERE column_id = $1 AND deleted_at IS NULL`,
+        [columnId]
+      );
+      const priority = ['low', 'medium', 'high', 'urgent'].includes(parsed.priority as string)
+        ? parsed.priority : 'medium';
+      const cardRow = await client.query(
+        `INSERT INTO ops.kanban_cards
+           (column_id, title, description, priority, position, due_date,
+            created_by, source_kind, source_ref)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, 'agent', $8)
+         RETURNING id, column_id, title, description, priority, position,
+                   due_date, created_by, created_at, source_kind, source_ref`,
+        [columnId, parsed.title.slice(0, 200),
+         parsed.description || null, priority,
+         posRow.rows[0].next_pos, parsed.due_date || null,
+         req.user!.email, `agent:${Date.now()}`]
+      );
+      cardOut = cardRow.rows[0];
+      if (assigneeId) {
+        await client.query(
+          `INSERT INTO ops.kanban_assignees (card_id, subscriber_id, assigned_by)
+           VALUES ($1, $2, $3) ON CONFLICT DO NOTHING`,
+          [cardOut.id, assigneeId, req.user!.email]
+        );
+      }
+      await client.query('COMMIT');
+    } catch (e) {
+      await client.query('ROLLBACK').catch(() => {});
+      throw e;
+    } finally {
+      client.release();
+    }
+
+    await logActivity(req.user!.email, cardOut.id as string, 'card.created', {
+      title: cardOut.title, column_id: columnId,
+      assignees: assigneeId ? [assigneeId] : [],
+      source_kind: 'agent', source_text: text.slice(0, 200),
+    });
+    if (assigneeId) {
+      notifyAssignment([assigneeId],
+        { id: cardOut.id as string, title: cardOut.title as string },
+        req.user!.email);
+    }
+
+    res.json({
+      card: cardOut,
+      parsed: {
+        title: parsed.title,
+        description: parsed.description ?? null,
+        assignee_name: parsed.assignee_name ?? null,
+        assignee_id: assigneeId,
+        priority: cardOut.priority,
+        due_date: cardOut.due_date,
+      },
+    });
+  } catch (e) {
+    res.status(pgErrorStatus(e)).json({ error: (e as Error).message });
+  }
+});
+
 // Pull the first JSON object out of Claude's reply, even if wrapped
 // in prose or a fenced code block. Returns null if nothing parses.
 function extractJson(raw: string): Record<string, unknown> | null {

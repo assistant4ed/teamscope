@@ -2,6 +2,7 @@ import React, { useState, useRef, useEffect } from 'react';
 import { apiPost, apiFetch, Me } from '../auth';
 import {
   Send, Loader2, Bot, User as UserIcon, ChevronDown, ChevronUp, FlaskConical,
+  Kanban, Check,
 } from 'lucide-react';
 
 interface Classification {
@@ -71,6 +72,7 @@ export default function Agent({ me }: { me: Me }) {
           Same brain as <code>@edpapabot</code>, without Telegram.
         </p>
         {canUseClassifier && <ReportClassifierPanel />}
+        <SendToBoardPanel />
       </div>
 
       <div className="flex-1 overflow-y-auto px-4 md:px-10 py-6 space-y-4 bg-slate-50">
@@ -209,6 +211,90 @@ const Tag = ({ color, children }: { color: string; children: React.ReactNode }) 
   };
   return <span className={`px-2 py-0.5 rounded-full ${cls[color] || cls.slate}`}>{children}</span>;
 };
+
+// Quick natural-language card creation. Anyone authed can use this —
+// intent is the same flow n8n will call when a boss Telegram-messages
+// the bot with "add task for Andrea: prepare slides".
+function SendToBoardPanel() {
+  const [open, setOpen] = useState(false);
+  const [text, setText] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [result, setResult] = useState<Record<string, unknown> | null>(null);
+  const [err, setErr] = useState<string | null>(null);
+
+  async function submit() {
+    if (!text.trim() || busy) return;
+    setBusy(true); setErr(null); setResult(null);
+    try {
+      const res = await apiFetch('/api/agent/create-card', {
+        method: 'POST',
+        body: JSON.stringify({ text }),
+      });
+      const body = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error((body as { error?: string }).error || `HTTP ${res.status}`);
+      setResult(body);
+      setText('');
+    } catch (e) { setErr((e as Error).message); }
+    finally { setBusy(false); }
+  }
+
+  const card = result?.card as { title?: string } | undefined;
+  const parsed = result?.parsed as {
+    assignee_name?: string | null; priority?: string;
+    due_date?: string | null; description?: string | null;
+  } | undefined;
+
+  return (
+    <div className="mt-3">
+      <button onClick={() => setOpen(v => !v)}
+        className="inline-flex items-center gap-1.5 text-xs font-medium
+                   text-indigo-700 hover:text-indigo-900">
+        <Kanban className="w-3.5 h-3.5" />
+        Send to Board
+        {open ? <ChevronUp className="w-3 h-3" /> : <ChevronDown className="w-3 h-3" />}
+      </button>
+      {open && (
+        <div className="mt-3 bg-slate-50 border border-slate-200 rounded-xl p-4 space-y-3">
+          <p className="text-xs text-slate-500">
+            Describe the task in one sentence — Claude extracts the title, assignee,
+            priority and due date and drops a card in the Today column.
+            Same endpoint n8n will call from Telegram.
+          </p>
+          <div className="flex gap-2">
+            <textarea value={text} onChange={e => setText(e.target.value)}
+              rows={2}
+              placeholder='e.g. "tell Andrea to prepare slides for Friday, high priority"'
+              className="flex-1 border border-slate-200 rounded-lg px-3 py-2 text-sm" />
+            <button onClick={submit} disabled={busy || !text.trim()}
+              className="px-3 py-2 text-sm font-medium bg-slate-900 hover:bg-slate-800
+                         disabled:opacity-40 text-white rounded-lg self-stretch">
+              {busy ? <Loader2 className="w-4 h-4 animate-spin" /> : 'Create card'}
+            </button>
+          </div>
+          {err && <div className="text-xs text-rose-700 bg-rose-50 border border-rose-200 rounded-lg p-2">{err}</div>}
+          {card && parsed && (
+            <div className="text-xs bg-emerald-50 border border-emerald-200 rounded-lg p-3 space-y-1">
+              <div className="flex items-center gap-1.5 font-medium text-emerald-800">
+                <Check className="w-3.5 h-3.5" />
+                Card created: "{card.title}"
+              </div>
+              <div className="text-emerald-700 pl-5">
+                {parsed.assignee_name
+                  ? <>assigned to <b>{parsed.assignee_name}</b></>
+                  : <>no assignee (name not matched)</>}
+                {parsed.priority && parsed.priority !== 'medium' && <> · <b>{parsed.priority}</b> priority</>}
+                {parsed.due_date && <> · due <b>{parsed.due_date}</b></>}
+              </div>
+              {parsed.description && (
+                <div className="text-emerald-700 pl-5 italic">"{parsed.description}"</div>
+              )}
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
 
 // Lets a boss/PA paste a hypothetical Telegram reply and see how the
 // classifier labels it before wiring n8n. Collapsed by default so it

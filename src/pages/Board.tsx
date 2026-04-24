@@ -128,8 +128,24 @@ export default function Board({ me }: { me: Me }) {
   const visibleCards = useMemo(() => {
     if (!data) return [] as Card[];
     if (!filterSub) return data.cards;
+    if (filterSub === '__unassigned') {
+      return data.cards.filter(c => (assigneesByCard.get(c.id) || []).length === 0);
+    }
     return data.cards.filter(c => (assigneesByCard.get(c.id) || []).includes(filterSub));
   }, [data, filterSub, assigneesByCard]);
+
+  // Card counts per chip (independent of current filter so labels stay stable).
+  const countsByMember = useMemo(() => {
+    if (!data) return { total: 0, unassigned: 0, bySub: new Map<string, number>() };
+    const bySub = new Map<string, number>();
+    let unassigned = 0;
+    for (const c of data.cards) {
+      const ids = assigneesByCard.get(c.id) || [];
+      if (ids.length === 0) unassigned++;
+      for (const sid of ids) bySub.set(sid, (bySub.get(sid) ?? 0) + 1);
+    }
+    return { total: data.cards.length, unassigned, bySub };
+  }, [data, assigneesByCard]);
 
   if (loading && !data) {
     return <div className="p-10 text-center text-slate-400">Loading board…</div>;
@@ -148,15 +164,13 @@ export default function Board({ me }: { me: Me }) {
         <div>
           <h1 className="text-2xl font-bold text-slate-900">Board</h1>
           <p className="text-sm text-slate-500">
-            {visibleCards.length} card{visibleCards.length === 1 ? '' : 's'}
-            {filterSub && <> · filtered by <b>{subsById.get(filterSub)?.name}</b></>}
+            {visibleCards.length} card{visibleCards.length === 1 ? '' : 's'} visible
+            {filterSub && filterSub !== '__unassigned' &&
+              <> · filtered by <b>{subsById.get(filterSub)?.name}</b></>}
+            {filterSub === '__unassigned' && <> · showing unassigned only</>}
           </p>
         </div>
         <div className="flex items-center gap-2 flex-wrap">
-          <MemberFilter
-            subscribers={data.subscribers}
-            value={filterSub} onChange={setFilterSub}
-          />
           <div className="inline-flex bg-white border border-slate-200 rounded-lg p-0.5">
             <button onClick={() => setView('columns')}
               className={`px-3 py-1 text-sm rounded ${view==='columns'?'bg-slate-900 text-white':'text-slate-600'}`}>
@@ -174,6 +188,13 @@ export default function Board({ me }: { me: Me }) {
           </button>
         </div>
       </header>
+
+      <MemberTabStrip
+        subscribers={data.subscribers}
+        value={filterSub}
+        onChange={setFilterSub}
+        counts={countsByMember}
+      />
 
       {err && (
         <div className="mx-6 md:mx-10 mb-3 text-xs text-rose-700 bg-rose-50 border border-rose-200 rounded-lg p-2 flex items-start gap-2">
@@ -628,22 +649,51 @@ function DueDate({ date, done }: { date: string; done: boolean }) {
   );
 }
 
-function MemberFilter({ subscribers, value, onChange }: {
+function MemberTabStrip({ subscribers, value, onChange, counts }: {
   subscribers: Subscriber[];
   value: string | null;
   onChange: (v: string | null) => void;
+  counts: { total: number; unassigned: number; bySub: Map<string, number> };
+}) {
+  const active = subscribers.filter(s => s.active);
+  return (
+    <nav className="px-6 md:px-10 pb-3 flex items-center gap-1.5 flex-wrap border-b border-slate-100">
+      <Users className="w-3.5 h-3.5 text-slate-400 mr-1" />
+      <MemberChip label="Everyone" count={counts.total}
+        active={value === null} onClick={() => onChange(null)} />
+      {active.map(s => (
+        <MemberChip key={s.id}
+          label={s.name}
+          count={counts.bySub.get(s.id) ?? 0}
+          active={value === s.id}
+          onClick={() => onChange(s.id)} />
+      ))}
+      <MemberChip label="Unassigned" count={counts.unassigned}
+        active={value === '__unassigned'}
+        onClick={() => onChange('__unassigned')}
+        muted />
+    </nav>
+  );
+}
+
+function MemberChip({ label, count, active, onClick, muted = false }: {
+  label: string; count: number; active: boolean;
+  onClick: () => void; muted?: boolean;
 }) {
   return (
-    <label className="inline-flex items-center gap-2 bg-white border border-slate-200 rounded-lg px-2 py-1 text-xs">
-      <Users className="w-3.5 h-3.5 text-slate-400" />
-      <select value={value ?? ''} onChange={e => onChange(e.target.value || null)}
-        className="bg-transparent outline-none text-slate-700">
-        <option value="">Everyone</option>
-        {subscribers.filter(s => s.active).map(s => (
-          <option key={s.id} value={s.id}>{s.name}</option>
-        ))}
-      </select>
-    </label>
+    <button onClick={onClick}
+      className={`inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg text-xs font-medium transition
+        ${active
+          ? 'bg-slate-900 text-white'
+          : muted
+            ? 'text-slate-400 hover:text-slate-600 hover:bg-slate-100'
+            : 'text-slate-700 hover:bg-slate-100'}`}>
+      <span>{label}</span>
+      <span className={`text-[10px] tabular-nums px-1 rounded
+        ${active ? 'bg-white/20 text-white' : 'bg-slate-200/70 text-slate-600'}`}>
+        {count}
+      </span>
+    </button>
   );
 }
 

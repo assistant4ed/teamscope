@@ -174,7 +174,7 @@ app.get('/api/dashboard', async (_req, res) => {
     ]);
     res.json({ today, pending, recentActions, subs });
   } catch (e) {
-    res.status(500).json({ error: (e as Error).message });
+    res.status(pgErrorStatus(e)).json({ error: (e as Error).message });
   }
 });
 
@@ -184,7 +184,7 @@ app.get('/api/reports/today', async (_req, res) => {
     const rows = await query('SELECT * FROM ops.v_today_reports');
     res.json({ reports: rows });
   } catch (e) {
-    res.status(500).json({ error: (e as Error).message });
+    res.status(pgErrorStatus(e)).json({ error: (e as Error).message });
   }
 });
 
@@ -204,7 +204,7 @@ app.get('/api/reports/recent', async (req, res) => {
     );
     res.json({ reports: rows });
   } catch (e) {
-    res.status(500).json({ error: (e as Error).message });
+    res.status(pgErrorStatus(e)).json({ error: (e as Error).message });
   }
 });
 
@@ -227,7 +227,7 @@ app.get('/api/tasks', async (req, res) => {
     const rows = await query(sql);
     res.json({ tasks: rows });
   } catch (e) {
-    res.status(500).json({ error: (e as Error).message });
+    res.status(pgErrorStatus(e)).json({ error: (e as Error).message });
   }
 });
 
@@ -246,7 +246,7 @@ app.post('/api/tasks/:id/claim',
       if (rows.length === 0) return res.status(404).json({ error: 'not_found' });
       res.json({ task: rows[0] });
     } catch (e) {
-      res.status(500).json({ error: (e as Error).message });
+      res.status(pgErrorStatus(e)).json({ error: (e as Error).message });
     }
   }
 );
@@ -274,7 +274,7 @@ app.post('/api/tasks/:id/complete',
       );
       res.json({ task: rows[0] });
     } catch (e) {
-      res.status(500).json({ error: (e as Error).message });
+      res.status(pgErrorStatus(e)).json({ error: (e as Error).message });
     }
   }
 );
@@ -294,7 +294,7 @@ app.post('/api/tasks/:id/cancel',
       if (rows.length === 0) return res.status(404).json({ error: 'not_found' });
       res.json({ task: rows[0] });
     } catch (e) {
-      res.status(500).json({ error: (e as Error).message });
+      res.status(pgErrorStatus(e)).json({ error: (e as Error).message });
     }
   }
 );
@@ -325,7 +325,7 @@ app.post('/api/agent/message',
       }
       res.json(data);
     } catch (e) {
-      res.status(500).json({ error: (e as Error).message });
+      res.status(pgErrorStatus(e)).json({ error: (e as Error).message });
     }
   }
 );
@@ -345,7 +345,7 @@ app.get('/api/agent/actions', async (req, res) => {
     );
     res.json({ actions: rows });
   } catch (e) {
-    res.status(500).json({ error: (e as Error).message });
+    res.status(pgErrorStatus(e)).json({ error: (e as Error).message });
   }
 });
 
@@ -364,7 +364,7 @@ app.get('/api/agent/classifications', async (req, res) => {
     );
     res.json({ classifications: rows });
   } catch (e) {
-    res.status(500).json({ error: (e as Error).message });
+    res.status(pgErrorStatus(e)).json({ error: (e as Error).message });
   }
 });
 
@@ -380,7 +380,7 @@ app.get('/api/team', async (_req, res) => {
     ]);
     res.json({ subscribers, profiles });
   } catch (e) {
-    res.status(500).json({ error: (e as Error).message });
+    res.status(pgErrorStatus(e)).json({ error: (e as Error).message });
   }
 });
 
@@ -396,7 +396,7 @@ app.post('/api/team/subscribers/:id/toggle',
       if (rows.length === 0) return res.status(404).json({ error: 'not_found' });
       res.json({ subscriber: rows[0] });
     } catch (e) {
-      res.status(500).json({ error: (e as Error).message });
+      res.status(pgErrorStatus(e)).json({ error: (e as Error).message });
     }
   }
 );
@@ -430,7 +430,7 @@ app.patch('/api/team/subscribers/:id',
       if (rows.length === 0) return res.status(404).json({ error: 'not_found' });
       res.json({ subscriber: rows[0] });
     } catch (e) {
-      res.status(500).json({ error: (e as Error).message });
+      res.status(pgErrorStatus(e)).json({ error: (e as Error).message });
     }
   }
 );
@@ -446,7 +446,7 @@ app.delete('/api/team/subscribers/:id',
       if (rows.length === 0) return res.status(404).json({ error: 'not_found' });
       res.json({ deleted: rows[0] });
     } catch (e) {
-      res.status(500).json({ error: (e as Error).message });
+      res.status(pgErrorStatus(e)).json({ error: (e as Error).message });
     }
   }
 );
@@ -475,7 +475,7 @@ app.get('/api/team/subscribers/:id',
       if (sub.length === 0) return res.status(404).json({ error: 'not_found' });
       res.json({ subscriber: sub[0], recent_reports: reports });
     } catch (e) {
-      res.status(500).json({ error: (e as Error).message });
+      res.status(pgErrorStatus(e)).json({ error: (e as Error).message });
     }
   }
 );
@@ -508,7 +508,7 @@ app.post('/api/team/subscribers',
       );
       res.json({ subscriber: rows[0] });
     } catch (e) {
-      res.status(500).json({ error: (e as Error).message });
+      res.status(pgErrorStatus(e)).json({ error: (e as Error).message });
     }
   }
 );
@@ -566,7 +566,7 @@ app.post('/api/agent/summary',
         '(Claude returned nothing — check ANTHROPIC_API_KEY.)';
       res.json({ summary: text, rows: rows.length });
     } catch (e) {
-      res.status(500).json({ error: (e as Error).message });
+      res.status(pgErrorStatus(e)).json({ error: (e as Error).message });
     }
   }
 );
@@ -597,29 +597,40 @@ async function logActivity(
 // ---------- Telegram notifier ------------------------------------- //
 // Fire-and-forget DM sender. When TELEGRAM_BOT_TOKEN is blank the
 // helper short-circuits so self-hosted/dev environments don't fail.
+// Retries once on network-level errors because Node's undici fetch
+// occasionally fails cold-start the first time after process start.
 async function sendTelegramMessage(chatId: number, text: string): Promise<'sent' | 'disabled' | 'failed'> {
   if (!TELEGRAM_BOT_TOKEN) return 'disabled';
-  try {
-    const res = await fetch(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({
-        chat_id: chatId,
-        text,
-        parse_mode: 'Markdown',
-        disable_web_page_preview: true,
-      }),
-    });
-    if (!res.ok) {
-      const body = await res.text().catch(() => '');
-      console.error('[teamscope] telegram send failed:', res.status, body.slice(0, 200));
-      return 'failed';
+  const url = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`;
+  const body = JSON.stringify({
+    chat_id: chatId,
+    text,
+    parse_mode: 'Markdown',
+    disable_web_page_preview: true,
+  });
+  const headers = { 'content-type': 'application/json' };
+  for (let attempt = 1; attempt <= 2; attempt++) {
+    try {
+      const res = await fetch(url, { method: 'POST', headers, body });
+      if (!res.ok) {
+        const text = await res.text().catch(() => '');
+        // Telegram 4xx responses won't get better on retry.
+        console.error('[teamscope] telegram send failed:', res.status, text.slice(0, 200));
+        return 'failed';
+      }
+      return 'sent';
+    } catch (e) {
+      const err = e as Error & { cause?: { code?: string } };
+      if (attempt === 2) {
+        console.error('[teamscope] telegram send error after retry:', err.message,
+          err.cause?.code ? `(${err.cause.code})` : '');
+        return 'failed';
+      }
+      // Backoff a beat and try again — usually a transient undici hiccup.
+      await new Promise(r => setTimeout(r, 500));
     }
-    return 'sent';
-  } catch (e) {
-    console.error('[teamscope] telegram send error:', (e as Error).message);
-    return 'failed';
   }
+  return 'failed';
 }
 
 // Notify a set of subscribers about a card assignment. Runs outside
@@ -659,6 +670,16 @@ function escapeMarkdown(s: string): string {
   return s.replace(/([_*`[\]])/g, '\\$1');
 }
 
+// Map common pg errors to HTTP 4xx so bad client input doesn't
+// surface as 500. Everything else stays a 500.
+function pgErrorStatus(e: unknown): number {
+  const code = (e as { code?: string } | null)?.code;
+  if (code === '23503') return 400; // FK violation — referenced row missing
+  if (code === '22P02') return 400; // invalid text representation (bad UUID)
+  if (code === '23505') return 409; // unique violation
+  return 500;
+}
+
 // Full board load: columns + cards + assignees, in one round-trip.
 app.get('/api/kanban/board', async (_req, res) => {
   try {
@@ -691,7 +712,7 @@ app.get('/api/kanban/board', async (_req, res) => {
     ]);
     res.json({ columns, cards, assignees, subscribers });
   } catch (e) {
-    res.status(500).json({ error: (e as Error).message });
+    res.status(pgErrorStatus(e)).json({ error: (e as Error).message });
   }
 });
 
@@ -748,7 +769,7 @@ app.post('/api/kanban/cards',
       res.json({ card, assignee_ids: assigneeIds });
     } catch (e) {
       await client.query('ROLLBACK').catch(() => {});
-      res.status(500).json({ error: (e as Error).message });
+      res.status(pgErrorStatus(e)).json({ error: (e as Error).message });
     } finally {
       client.release();
     }
@@ -848,7 +869,7 @@ app.patch('/api/kanban/cards/:id',
       res.json({ card: card ?? { id: cardId } });
     } catch (e) {
       await client.query('ROLLBACK').catch(() => {});
-      res.status(500).json({ error: (e as Error).message });
+      res.status(pgErrorStatus(e)).json({ error: (e as Error).message });
     } finally {
       client.release();
     }
@@ -896,7 +917,7 @@ app.put('/api/kanban/cards/:id/move',
       }
       res.json({ card: rows[0] });
     } catch (e) {
-      res.status(500).json({ error: (e as Error).message });
+      res.status(pgErrorStatus(e)).json({ error: (e as Error).message });
     }
   }
 );
@@ -919,7 +940,7 @@ app.delete('/api/kanban/cards/:id',
       });
       res.json({ deleted: rows[0] });
     } catch (e) {
-      res.status(500).json({ error: (e as Error).message });
+      res.status(pgErrorStatus(e)).json({ error: (e as Error).message });
     }
   }
 );
@@ -1004,7 +1025,7 @@ app.post('/api/kanban/cards/from-action/:correlation_id',
       res.json({ card, promoted: correlationId });
     } catch (e) {
       await client.query('ROLLBACK').catch(() => {});
-      res.status(500).json({ error: (e as Error).message });
+      res.status(pgErrorStatus(e)).json({ error: (e as Error).message });
     } finally {
       client.release();
     }
@@ -1033,7 +1054,7 @@ app.post('/api/kanban/columns',
       await logActivity(req.user!.email, null, 'column.created', rows[0] as Record<string, unknown>);
       res.json({ column: rows[0] });
     } catch (e) {
-      res.status(500).json({ error: (e as Error).message });
+      res.status(pgErrorStatus(e)).json({ error: (e as Error).message });
     }
   }
 );
@@ -1065,7 +1086,7 @@ app.patch('/api/kanban/columns/:id',
         { column_id: req.params.id, changed: b });
       res.json({ column: rows[0] });
     } catch (e) {
-      res.status(500).json({ error: (e as Error).message });
+      res.status(pgErrorStatus(e)).json({ error: (e as Error).message });
     }
   }
 );
@@ -1090,7 +1111,7 @@ app.put('/api/kanban/columns/reorder',
       res.json({ ok: true });
     } catch (e) {
       await client.query('ROLLBACK').catch(() => {});
-      res.status(500).json({ error: (e as Error).message });
+      res.status(pgErrorStatus(e)).json({ error: (e as Error).message });
     } finally {
       client.release();
     }
@@ -1120,7 +1141,7 @@ app.delete('/api/kanban/columns/:id',
       await logActivity(req.user!.email, null, 'column.deleted', rows[0] as Record<string, unknown>);
       res.json({ deleted: rows[0] });
     } catch (e) {
-      res.status(500).json({ error: (e as Error).message });
+      res.status(pgErrorStatus(e)).json({ error: (e as Error).message });
     }
   }
 );
@@ -1169,7 +1190,7 @@ app.get('/api/activity', async (req, res) => {
     );
     res.json({ events: kanban });
   } catch (e) {
-    res.status(500).json({ error: (e as Error).message });
+    res.status(pgErrorStatus(e)).json({ error: (e as Error).message });
   }
 });
 
@@ -1184,7 +1205,7 @@ app.get('/api/messages/recent', async (req, res) => {
     );
     res.json({ messages: rows });
   } catch (e) {
-    res.status(500).json({ error: (e as Error).message });
+    res.status(pgErrorStatus(e)).json({ error: (e as Error).message });
   }
 });
 

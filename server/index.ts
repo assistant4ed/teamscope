@@ -508,6 +508,35 @@ app.post('/api/team/subscribers/:id/toggle',
   }
 );
 
+// Send a "ping" DM so the boss can verify @edpapabot can reach a
+// subscriber's chat_id after editing their schedule. Uses the
+// normal sendTelegramMessage helper so retry + no-token handling
+// are consistent with card-assignment notifications.
+app.post('/api/team/subscribers/:id/test-ping',
+  requireRole('boss'),
+  async (req, res) => {
+    const id = String(req.params.id);
+    try {
+      const rows = await query<{ name: string; telegram_chat_id: number }>(
+        `SELECT name, telegram_chat_id FROM ops.report_subscribers WHERE id = $1`,
+        [id]
+      );
+      if (rows.length === 0) return res.status(404).json({ error: 'not_found' });
+      const sub = rows[0];
+      const text =
+        `🔔 *TeamScope ping*\n\n` +
+        `This is a test message from ${req.user!.email.split('@')[0]}. ` +
+        `If you see this, @edpapabot can reach you at your current schedule.\n\n` +
+        `_No action needed._`;
+      const outcome = await sendTelegramMessage(sub.telegram_chat_id, text);
+      console.log(`[teamscope] test-ping ${sub.name} → ${outcome} (by ${req.user!.email})`);
+      res.json({ outcome, subscriber: { name: sub.name, chat_id: sub.telegram_chat_id } });
+    } catch (e) {
+      res.status(pgErrorStatus(e)).json({ error: (e as Error).message });
+    }
+  }
+);
+
 // Update an existing subscriber's editable fields (boss only).
 app.patch('/api/team/subscribers/:id',
   requireRole('boss'),

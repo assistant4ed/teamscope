@@ -9,6 +9,7 @@ import Tasks from './pages/Tasks';
 import Board from './pages/Board';
 import Reports from './pages/Reports';
 import Team from './pages/Team';
+import Member from './pages/Member';
 import Agent from './pages/Agent';
 import Activity from './pages/Activity';
 
@@ -27,15 +28,21 @@ const NAV: { id: Tab; label: string; icon: React.ReactNode }[] = [
 export default function Shell({ me }: { me: Me }) {
   const [tab, setTab] = useState<Tab>('dashboard');
   const [open, setOpen] = useState(false);
+  // When non-null the main pane swaps in the Member detail page.
+  // Kept parallel to `tab` so the sidebar still highlights "Team".
+  const [memberId, setMemberId] = useState<string | null>(null);
 
-  const Page = {
+  const Page = memberId ? (
+    <Member me={me} subscriberId={memberId}
+      onBack={() => { setMemberId(null); setTab('team'); }} />
+  ) : {
     dashboard: <Dashboard />,
     board:     <Board me={me} />,
     agent:     <Agent me={me} />,
     tasks:     <Tasks me={me} />,
     reports:   <Reports me={me} />,
     activity:  <Activity />,
-    team:      <Team me={me} />,
+    team:      <Team me={me} onOpenMember={id => setMemberId(id)} />,
   }[tab];
 
   return (
@@ -53,9 +60,9 @@ export default function Shell({ me }: { me: Me }) {
             {NAV.map(n => (
               <button
                 key={n.id}
-                onClick={() => { setTab(n.id); setOpen(false); }}
+                onClick={() => { setTab(n.id); setMemberId(null); setOpen(false); }}
                 className={`w-full flex items-center gap-3 px-3 py-2 rounded-lg text-sm transition
-                  ${tab === n.id
+                  ${tab === n.id && !memberId
                     ? 'bg-slate-900 text-white'
                     : 'text-slate-600 hover:bg-slate-100'}`}>
                 {n.icon}{n.label}

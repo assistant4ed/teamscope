@@ -22,7 +22,10 @@ interface Profile {
   role: string; timezone: string; active: boolean;
 }
 
-export default function Team({ me }: { me: Me }) {
+export default function Team({ me, onOpenMember }: {
+  me: Me;
+  onOpenMember: (subscriberId: string) => void;
+}) {
   const [subs, setSubs] = useState<Subscriber[]>([]);
   const [profiles, setProfiles] = useState<Profile[]>([]);
   const [roster, setRoster] = useState<{email:string;role:string}[]>([]);
@@ -90,8 +93,8 @@ export default function Team({ me }: { me: Me }) {
               )}
               {subs.map(s => (
                 <tr key={s.id}
-                    className={`${s.active ? '' : 'opacity-40'} ${me.role === 'boss' ? 'cursor-pointer hover:bg-slate-50' : ''}`}
-                    onClick={() => me.role === 'boss' && setEditId(s.id)}>
+                    className={`${s.active ? '' : 'opacity-40'} cursor-pointer hover:bg-slate-50`}
+                    onClick={() => onOpenMember(s.id)}>
                   <Td className="font-medium text-slate-800">
                     <div className="flex items-center gap-2">
                       {s.name}

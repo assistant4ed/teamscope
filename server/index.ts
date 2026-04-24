@@ -30,6 +30,10 @@ const {
   ALLOWED_USERS = 'hobbychan111@gmail.com:boss',
   PORT = '3000',
   NODE_ENV = 'production',
+  // Used by the outbound Telegram notifier. Both optional — the
+  // notifier becomes a no-op if the token is missing.
+  TELEGRAM_BOT_TOKEN = '',
+  APP_URL = '',
 } = process.env;
 
 if (!SUPABASE_DB_URL) {
@@ -590,6 +594,71 @@ async function logActivity(
   }
 }
 
+// ---------- Telegram notifier ------------------------------------- //
+// Fire-and-forget DM sender. When TELEGRAM_BOT_TOKEN is blank the
+// helper short-circuits so self-hosted/dev environments don't fail.
+async function sendTelegramMessage(chatId: number, text: string): Promise<'sent' | 'disabled' | 'failed'> {
+  if (!TELEGRAM_BOT_TOKEN) return 'disabled';
+  try {
+    const res = await fetch(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        chat_id: chatId,
+        text,
+        parse_mode: 'Markdown',
+        disable_web_page_preview: true,
+      }),
+    });
+    if (!res.ok) {
+      const body = await res.text().catch(() => '');
+      console.error('[teamscope] telegram send failed:', res.status, body.slice(0, 200));
+      return 'failed';
+    }
+    return 'sent';
+  } catch (e) {
+    console.error('[teamscope] telegram send error:', (e as Error).message);
+    return 'failed';
+  }
+}
+
+// Notify a set of subscribers about a card assignment. Runs outside
+// the user-facing request path — never awaited from the endpoint so
+// a slow Telegram API call does not delay the HTTP response.
+async function notifyAssignment(
+  subscriberIds: string[],
+  card: { id: string; title: string },
+  actorEmail: string
+) {
+  if (subscriberIds.length === 0) return;
+  try {
+    const rows = await query<{ id: string; name: string; telegram_chat_id: number }>(
+      `SELECT id, name, telegram_chat_id
+         FROM ops.report_subscribers
+        WHERE id = ANY($1::uuid[]) AND active = true`,
+      [subscriberIds]
+    );
+    const link = APP_URL ? `\n\n→ ${APP_URL}` : '';
+    const body =
+      `📋 *New task assigned*\n\n` +
+      `_${escapeMarkdown(card.title)}_${link}`;
+    for (const sub of rows) {
+      const outcome = await sendTelegramMessage(sub.telegram_chat_id, body);
+      console.log(
+        `[teamscope] notify ${sub.name} (${sub.telegram_chat_id}) ` +
+        `about card ${card.id.slice(0, 8)} → ${outcome} (by ${actorEmail})`
+      );
+    }
+  } catch (e) {
+    console.error('[teamscope] notify error:', (e as Error).message);
+  }
+}
+
+// Telegram Markdown has a narrow safe set; escape the ones the API cares about.
+function escapeMarkdown(s: string): string {
+  return s.replace(/([_*`[\]])/g, '\\$1');
+}
+
 // Full board load: columns + cards + assignees, in one round-trip.
 app.get('/api/kanban/board', async (_req, res) => {
   try {
@@ -674,6 +743,8 @@ app.post('/api/kanban/cards',
       await logActivity(req.user!.email, card.id, 'card.created', {
         title: card.title, column_id: card.column_id, assignees: assigneeIds,
       });
+      // Fire-and-forget: notify new assignees on Telegram.
+      notifyAssignment(assigneeIds, { id: card.id, title: card.title }, req.user!.email);
       res.json({ card, assignee_ids: assigneeIds });
     } catch (e) {
       await client.query('ROLLBACK').catch(() => {});
@@ -731,11 +802,18 @@ app.patch('/api/kanban/cards/:id',
           return res.status(404).json({ error: 'not_found' });
         }
       }
+      let newlyAssigned: string[] = [];
       if (Array.isArray(b.assignee_ids)) {
         if (b.assignee_ids.length > 5) {
           await client.query('ROLLBACK');
           return res.status(400).json({ error: 'max 5 assignees per card' });
         }
+        const priorRows = await client.query<{ subscriber_id: string }>(
+          `SELECT subscriber_id FROM ops.kanban_assignees WHERE card_id = $1`,
+          [req.params.id]
+        );
+        const prior = new Set(priorRows.rows.map(r => r.subscriber_id));
+        newlyAssigned = b.assignee_ids.filter((id: string) => !prior.has(id));
         await client.query(
           `DELETE FROM ops.kanban_assignees WHERE card_id = $1`,
           [req.params.id]
@@ -754,6 +832,19 @@ app.patch('/api/kanban/cards/:id',
         changed: Object.fromEntries(fields.filter(k => b[k] !== undefined).map(k => [k, b[k]])),
         ...(Array.isArray(b.assignee_ids) ? { assignees: b.assignee_ids } : {}),
       });
+      // Only notify the newly-added assignees so edits don't spam people
+      // who were already on the card.
+      if (newlyAssigned.length > 0) {
+        // card may be null if only assignees changed; fetch title if needed.
+        let title = (card?.title as string) || '';
+        if (!title) {
+          const t = await query<{ title: string }>(
+            `SELECT title FROM ops.kanban_cards WHERE id = $1`, [cardId]
+          );
+          title = t[0]?.title || '(untitled)';
+        }
+        notifyAssignment(newlyAssigned, { id: cardId, title }, req.user!.email);
+      }
       res.json({ card: card ?? { id: cardId } });
     } catch (e) {
       await client.query('ROLLBACK').catch(() => {});
@@ -908,6 +999,7 @@ app.post('/api/kanban/cards/from-action/:correlation_id',
         title, column_id: columnId, assignees: assigneeIds,
         source_kind: 'agent', source_ref: correlationId,
       });
+      notifyAssignment(assigneeIds, { id: card.id, title }, req.user!.email);
 
       res.json({ card, promoted: correlationId });
     } catch (e) {

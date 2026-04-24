@@ -159,6 +159,55 @@ app.use('/api', (req, res, next) => {
   return requireUser(req, res, next);
 });
 
+// ---------- Report-prompt templates -------------------------------- //
+// Three rows keyed by slot; n8n fetches them so its DM prompts aren't
+// hardcoded. Shaped as an object so consumers can do `.morning.text`
+// without finding-by-slot.
+app.get('/api/config/prompt-templates', async (_req, res) => {
+  try {
+    const rows = await query<{
+      slot: string; template_text: string;
+      updated_at: string; updated_by: string | null;
+    }>(
+      `SELECT slot, template_text, updated_at, updated_by
+         FROM ops.report_prompt_templates`
+    );
+    const out: Record<string, { text: string; updated_at: string; updated_by: string | null }> = {};
+    for (const r of rows) {
+      out[r.slot] = { text: r.template_text, updated_at: r.updated_at, updated_by: r.updated_by };
+    }
+    res.json({ templates: out });
+  } catch (e) {
+    res.status(pgErrorStatus(e)).json({ error: (e as Error).message });
+  }
+});
+
+app.patch('/api/config/prompt-templates/:slot',
+  requireRole('boss'),
+  async (req, res) => {
+    const slot = String(req.params.slot);
+    if (!['morning', 'midday', 'eod'].includes(slot)) {
+      return res.status(400).json({ error: 'slot must be morning|midday|eod' });
+    }
+    const text = (req.body?.text as string || '').trim();
+    if (!text) return res.status(400).json({ error: 'text required' });
+    if (text.length > 4000) return res.status(400).json({ error: 'text too long (max 4000)' });
+    try {
+      const rows = await query(
+        `UPDATE ops.report_prompt_templates
+            SET template_text = $1, updated_at = now(), updated_by = $2
+          WHERE slot = $3
+        RETURNING slot, template_text, updated_at, updated_by`,
+        [text, req.user!.email, slot]
+      );
+      if (rows.length === 0) return res.status(404).json({ error: 'slot_not_found' });
+      res.json({ template: rows[0] });
+    } catch (e) {
+      res.status(pgErrorStatus(e)).json({ error: (e as Error).message });
+    }
+  }
+);
+
 // ---------- Dashboard summary ------------------------------------- //
 app.get('/api/dashboard', async (_req, res) => {
   try {

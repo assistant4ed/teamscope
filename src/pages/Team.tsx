@@ -161,6 +161,8 @@ export default function Team({ me }: { me: Me }) {
         </div>
       </section>
 
+      <PromptTemplatesSection isBoss={me.role === 'boss'} />
+
       <section>
         <h2 className="text-sm font-semibold text-slate-500 uppercase tracking-wider mb-3">
           Telegram profiles ({profiles.length})
@@ -176,6 +178,132 @@ export default function Team({ me }: { me: Me }) {
           </ul>
         </div>
       </section>
+    </div>
+  );
+}
+
+interface PromptTemplate {
+  text: string;
+  updated_at: string;
+  updated_by: string | null;
+}
+type PromptSlot = 'morning' | 'midday' | 'eod';
+const PROMPT_SLOTS: Array<{ slot: PromptSlot; label: string; time: string }> = [
+  { slot: 'morning', label: 'Morning',    time: '09:00 SGT' },
+  { slot: 'midday',  label: 'Midday',     time: '13:30 SGT' },
+  { slot: 'eod',     label: 'End of day', time: '18:30 SGT' },
+];
+
+function PromptTemplatesSection({ isBoss }: { isBoss: boolean }) {
+  const [templates, setTemplates] = useState<Record<string, PromptTemplate> | null>(null);
+  const [err, setErr] = useState<string | null>(null);
+
+  async function load() {
+    try {
+      const d = await apiGet<{ templates: Record<string, PromptTemplate> }>(
+        '/api/config/prompt-templates'
+      );
+      setTemplates(d.templates);
+      setErr(null);
+    } catch (e) { setErr(String(e)); }
+  }
+  useEffect(() => { load(); }, []);
+
+  return (
+    <section className="mb-8">
+      <h2 className="text-sm font-semibold text-slate-500 uppercase tracking-wider mb-3">
+        Report prompt templates
+      </h2>
+      <p className="text-xs text-slate-500 mb-3">
+        What <code className="px-1 bg-slate-100 rounded">@edpapabot</code> DMs each subscriber at their slot times.
+        {' '}n8n's <i>03 · Report Prompter</i> flow reads these — edit here, no redeploy.
+      </p>
+      {err && <div className="text-xs text-rose-700 bg-rose-50 border border-rose-200 rounded-lg p-2 mb-3">{err}</div>}
+      {!templates ? (
+        <div className="text-sm text-slate-400 py-4">Loading…</div>
+      ) : (
+        <div className="space-y-3">
+          {PROMPT_SLOTS.map(s => (
+            <PromptTemplateRow key={s.slot}
+              slot={s.slot} label={s.label} time={s.time}
+              template={templates[s.slot]}
+              isBoss={isBoss}
+              onSaved={() => load()} />
+          ))}
+        </div>
+      )}
+    </section>
+  );
+}
+
+function PromptTemplateRow({ slot, label, time, template, isBoss, onSaved }: {
+  slot: PromptSlot; label: string; time: string;
+  template: PromptTemplate | undefined;
+  isBoss: boolean;
+  onSaved: () => void;
+}) {
+  const [text, setText] = useState(template?.text ?? '');
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+  const [justSaved, setJustSaved] = useState(false);
+
+  // Keep local state in sync if templates reload from the server.
+  useEffect(() => { setText(template?.text ?? ''); }, [template?.text]);
+
+  const dirty = text !== (template?.text ?? '');
+
+  async function save() {
+    setBusy(true); setErr(null);
+    try {
+      const res = await apiFetch(`/api/config/prompt-templates/${slot}`, {
+        method: 'PATCH',
+        body: JSON.stringify({ text }),
+      });
+      if (!res.ok) {
+        const body = await res.json().catch(() => ({}));
+        throw new Error(body.error || `HTTP ${res.status}`);
+      }
+      setJustSaved(true);
+      setTimeout(() => setJustSaved(false), 2000);
+      onSaved();
+    } catch (e) { setErr((e as Error).message); }
+    finally { setBusy(false); }
+  }
+
+  return (
+    <div className="bg-white border border-slate-200 rounded-xl p-4">
+      <div className="flex items-center justify-between mb-2">
+        <div>
+          <span className="text-sm font-semibold text-slate-800">{label}</span>
+          <span className="text-xs text-slate-400 ml-2">{time}</span>
+        </div>
+        {template?.updated_at && (
+          <span className="text-[11px] text-slate-400">
+            updated {new Date(template.updated_at).toLocaleString(undefined,
+              { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' })}
+            {template.updated_by && <> by {template.updated_by.split('@')[0]}</>}
+          </span>
+        )}
+      </div>
+      <textarea value={text} onChange={e => setText(e.target.value)}
+        readOnly={!isBoss} rows={6}
+        className={`w-full border rounded-lg px-3 py-2 text-sm font-mono leading-relaxed
+                    ${isBoss ? 'border-slate-200 focus:border-indigo-300'
+                             : 'border-slate-100 bg-slate-50 text-slate-500'}`} />
+      {isBoss && (
+        <div className="mt-2 flex items-center gap-2">
+          <button onClick={save} disabled={!dirty || busy}
+            className="px-3 py-1.5 text-xs font-medium bg-slate-900 hover:bg-slate-800
+                       disabled:opacity-40 text-white rounded-lg">
+            {busy ? 'Saving…' : 'Save changes'}
+          </button>
+          {justSaved && <span className="text-xs text-emerald-600">✓ Saved</span>}
+          {err && <span className="text-xs text-rose-600">{err}</span>}
+          {dirty && !busy && !justSaved && (
+            <span className="text-xs text-amber-600">Unsaved</span>
+          )}
+        </div>
+      )}
     </div>
   );
 }

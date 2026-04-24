@@ -33,7 +33,7 @@ export default function Shell({ me }: { me: Me }) {
     board:     <Board me={me} />,
     agent:     <Agent me={me} />,
     tasks:     <Tasks me={me} />,
-    reports:   <Reports />,
+    reports:   <Reports me={me} />,
     activity:  <Activity />,
     team:      <Team me={me} />,
   }[tab];

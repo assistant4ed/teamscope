@@ -237,6 +237,63 @@ app.get('/api/reports/today', async (_req, res) => {
   }
 });
 
+// Edit a daily-report row (boss only). Accepts any subset of the
+// human-authored fields; nulls are allowed to clear a slot. The n8n
+// pipeline won't re-overwrite an edited slot within the same day
+// unless the subscriber sends a fresh Telegram reply.
+app.patch('/api/reports/:id',
+  requireRole('boss'),
+  async (req, res) => {
+    const id = String(req.params.id);
+    const b = req.body || {};
+    const editable = [
+      'goals', 'mid_progress', 'mid_issues', 'mid_changes',
+      'eod_completed', 'eod_unfinished', 'eod_hours',
+    ] as const;
+    const sets: string[] = [];
+    const vals: unknown[] = [];
+    for (const k of editable) {
+      if (b[k] !== undefined) {
+        sets.push(`${k} = $${sets.length + 1}`);
+        vals.push(b[k] === '' ? null : b[k]);
+      }
+    }
+    if (sets.length === 0) return res.status(400).json({ error: 'no fields to update' });
+    vals.push(id);
+    try {
+      const rows = await query(
+        `UPDATE ops.daily_reports SET ${sets.join(', ')}, updated_at = now()
+          WHERE id = $${vals.length}
+        RETURNING id, subscriber_id, to_char(report_date, 'YYYY-MM-DD') AS report_date,
+                  goals, mid_progress, mid_issues, mid_changes,
+                  eod_completed, eod_unfinished, eod_hours, updated_at`,
+        vals
+      );
+      if (rows.length === 0) return res.status(404).json({ error: 'not_found' });
+      res.json({ report: rows[0] });
+    } catch (e) {
+      res.status(pgErrorStatus(e)).json({ error: (e as Error).message });
+    }
+  }
+);
+
+app.delete('/api/reports/:id',
+  requireRole('boss'),
+  async (req, res) => {
+    try {
+      const rows = await query(
+        `DELETE FROM ops.daily_reports WHERE id = $1
+        RETURNING id, subscriber_id, to_char(report_date, 'YYYY-MM-DD') AS report_date`,
+        [String(req.params.id)]
+      );
+      if (rows.length === 0) return res.status(404).json({ error: 'not_found' });
+      res.json({ deleted: rows[0] });
+    } catch (e) {
+      res.status(pgErrorStatus(e)).json({ error: (e as Error).message });
+    }
+  }
+);
+
 app.get('/api/reports/recent', async (req, res) => {
   const days = Math.min(30, Math.max(1, Number(req.query.days ?? 14)));
   try {

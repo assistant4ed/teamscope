@@ -2,9 +2,9 @@ import React, { useEffect, useMemo, useState } from 'react';
 import {
   Sun, Moon, Clock, Sparkles, Activity, List, Calendar as CalendarIcon,
   Loader2, AlertTriangle, CheckCircle2, User as UserIcon,
-  Kanban, ArrowRight,
+  Kanban, ArrowRight, Pencil, Trash2, X, Check, RotateCcw,
 } from 'lucide-react';
-import { apiGet, apiPost, apiFetch } from '../auth';
+import { apiGet, apiPost, apiFetch, Me } from '../auth';
 
 interface Report {
   id: string;
@@ -52,7 +52,8 @@ function formatDateLabel(raw: string | null): string {
     { weekday: 'long', month: 'short', day: 'numeric' });
 }
 
-export default function Reports() {
+export default function Reports({ me }: { me: Me }) {
+  const isBoss = me.role === 'boss';
   const [reports, setReports] = useState<Report[]>([]);
   const [days, setDays] = useState(14);
   const [subFilter, setSubFilter] = useState<string>('all');
@@ -256,8 +257,9 @@ export default function Reports() {
               <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-3">
                 {rows.map(r => (
                   <ReportCard key={r.id} r={r}
+                    isBoss={isBoss}
                     importedCount={importedById.get(r.id) ?? 0}
-                    onImported={() => load()} />
+                    onChanged={() => load()} />
                 ))}
               </div>
             </section>
@@ -285,11 +287,14 @@ const StatCard = ({ label, icon, value, sub, tone = 'default' }: {
   </div>
 );
 
-const ReportCard = ({ r, importedCount, onImported }: {
+const ReportCard = ({ r, isBoss, importedCount, onChanged }: {
   r: Report;
+  isBoss: boolean;
   importedCount: number;
-  onImported: () => void;
+  onChanged: () => void;
 }) => {
+  const [confirmDel, setConfirmDel] = useState(false);
+  const [delBusy, setDelBusy] = useState(false);
   const progress =
     [r.goals, r.mid_progress, r.eod_completed].filter(Boolean).length / 3;
   const statusColor =
@@ -297,6 +302,28 @@ const ReportCard = ({ r, importedCount, onImported }: {
     progress >= 0.67 ? 'bg-sky-500' :
     progress >= 0.34 ? 'bg-amber-500' :
     progress === 0 ? 'bg-slate-300' : 'bg-slate-400';
+
+  async function patchField(field: string, value: string | number | null) {
+    const res = await apiFetch(`/api/reports/${r.id}`, {
+      method: 'PATCH',
+      body: JSON.stringify({ [field]: value }),
+    });
+    if (!res.ok) {
+      const body = await res.json().catch(() => ({}));
+      throw new Error(body.error || `HTTP ${res.status}`);
+    }
+    onChanged();
+  }
+
+  async function deleteRow() {
+    setDelBusy(true);
+    try {
+      const res = await apiFetch(`/api/reports/${r.id}`, { method: 'DELETE' });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      onChanged();
+    } catch { /* swallow — parent load() will refetch anyway */ }
+    finally { setDelBusy(false); }
+  }
 
   return (
     <article className="bg-white border border-slate-200 rounded-3xl p-5 shadow-sm hover:shadow-md transition">
@@ -314,22 +341,51 @@ const ReportCard = ({ r, importedCount, onImported }: {
             </span>
           )}
           <span className={`block w-2 h-2 rounded-full ${statusColor}`} title={`${Math.round(progress*100)}% filed`} />
+          {isBoss && !confirmDel && (
+            <button onClick={() => setConfirmDel(true)}
+              title="Delete this report row"
+              className="p-1 text-slate-300 hover:text-rose-600 hover:bg-rose-50 rounded">
+              <Trash2 className="w-3.5 h-3.5" />
+            </button>
+          )}
         </div>
       </header>
+      {isBoss && confirmDel && (
+        <div className="mb-3 -mt-2 flex items-center gap-2 text-xs text-rose-700
+                        bg-rose-50 border border-rose-200 rounded-lg px-2 py-1.5">
+          <AlertTriangle className="w-3.5 h-3.5 flex-shrink-0" />
+          Delete this whole report row?
+          <button onClick={deleteRow} disabled={delBusy}
+            className="ml-auto px-2 py-0.5 text-xs font-medium bg-rose-600 hover:bg-rose-700
+                       disabled:opacity-40 text-white rounded">
+            {delBusy ? '…' : 'Yes, delete'}
+          </button>
+          <button onClick={() => setConfirmDel(false)}
+            className="px-2 py-0.5 text-xs text-slate-600 hover:bg-slate-200 rounded">
+            Cancel
+          </button>
+        </div>
+      )}
 
       <SlotRow icon={<Sun className="w-4 h-4 text-amber-500"/>} label="Morning goals"
-        value={r.goals} slot="morning" />
+        value={r.goals} slot="morning"
+        canEdit={isBoss} fieldName="goals"
+        onSave={v => patchField('goals', v)} />
       {r.goals && r.goals.trim() && (
         <ImportGoalsButton reportId={r.id} goals={r.goals}
           importedCount={importedCount}
-          onImported={onImported} />
+          onImported={onChanged} />
       )}
       <SlotRow icon={<Clock className="w-4 h-4 text-sky-500"/>} label="Midday progress"
         value={r.mid_progress}
-        issues={r.mid_issues} changes={r.mid_changes} slot="midday" />
+        issues={r.mid_issues} changes={r.mid_changes} slot="midday"
+        canEdit={isBoss} fieldName="mid_progress"
+        onSave={v => patchField('mid_progress', v)} />
       <SlotRow icon={<Moon className="w-4 h-4 text-indigo-500"/>} label="End of day"
         value={r.eod_completed}
-        unfinished={r.eod_unfinished} slot="eod" last />
+        unfinished={r.eod_unfinished} slot="eod" last
+        canEdit={isBoss} fieldName="eod_completed"
+        onSave={v => patchField('eod_completed', v)} />
     </article>
   );
 };
@@ -406,19 +462,73 @@ function previewGoalLines(text: string): number {
   return Math.min(lines.length, 20);
 }
 
-const SlotRow = ({ icon, label, value, issues, changes, unfinished, slot, last = false }: {
+const SlotRow = ({ icon, label, value, issues, changes, unfinished, slot, last = false,
+                   canEdit = false, fieldName, onSave }: {
   icon: React.ReactNode; label: string; value: string | null;
   issues?: string | null; changes?: string | null; unfinished?: string | null;
   slot: 'morning' | 'midday' | 'eod'; last?: boolean;
+  canEdit?: boolean;
+  fieldName?: 'goals' | 'mid_progress' | 'eod_completed';
+  onSave?: (v: string | null) => Promise<void>;
 }) => {
   const filled = !!value;
+  const [editing, setEditing] = useState(false);
+  const [draft, setDraft] = useState(value || '');
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+
+  useEffect(() => { setDraft(value || ''); }, [value]);
+
+  async function commit(next: string | null) {
+    if (!onSave) return;
+    setBusy(true); setErr(null);
+    try {
+      await onSave(next);
+      setEditing(false);
+    } catch (e) { setErr((e as Error).message); }
+    finally { setBusy(false); }
+  }
+
   return (
     <div className={`${last ? '' : 'pb-3 mb-3 border-b border-slate-100'}`}>
       <div className="flex items-center gap-2 text-xs font-bold text-slate-500 mb-1">
         {icon}<span className="uppercase tracking-wide">{label}</span>
-        {!filled && <span className="ml-auto text-[10px] text-slate-300">pending</span>}
+        {!filled && !editing && <span className="ml-auto text-[10px] text-slate-300">pending</span>}
+        {canEdit && fieldName && !editing && (
+          <button onClick={() => { setDraft(value || ''); setEditing(true); }}
+            title={filled ? 'Edit' : 'Add entry'}
+            className={`${!filled ? '' : 'ml-auto'} p-0.5 text-slate-300 hover:text-indigo-600 rounded`}>
+            <Pencil className="w-3 h-3" />
+          </button>
+        )}
       </div>
-      {filled ? (
+      {editing ? (
+        <div className="space-y-2">
+          <textarea value={draft} onChange={e => setDraft(e.target.value)}
+            rows={3} autoFocus
+            className="w-full border border-slate-200 rounded-lg px-2 py-1.5 text-sm" />
+          <div className="flex items-center gap-1.5">
+            <button onClick={() => commit(draft.trim() || null)} disabled={busy}
+              className="inline-flex items-center gap-1 px-2 py-0.5 text-xs font-medium
+                         bg-slate-900 hover:bg-slate-800 disabled:opacity-40 text-white rounded">
+              <Check className="w-3 h-3" /> Save
+            </button>
+            {filled && (
+              <button onClick={() => commit(null)} disabled={busy}
+                title="Clear this slot (set to null)"
+                className="inline-flex items-center gap-1 px-2 py-0.5 text-xs text-rose-600 hover:bg-rose-50 rounded">
+                <RotateCcw className="w-3 h-3" /> Clear
+              </button>
+            )}
+            <button onClick={() => { setEditing(false); setDraft(value || ''); setErr(null); }}
+              disabled={busy}
+              className="inline-flex items-center gap-1 px-2 py-0.5 text-xs text-slate-500 hover:bg-slate-100 rounded">
+              <X className="w-3 h-3" /> Cancel
+            </button>
+            {err && <span className="text-[11px] text-rose-600">{err}</span>}
+          </div>
+        </div>
+      ) : filled ? (
         <p className="text-sm text-slate-700 whitespace-pre-line">{value}</p>
       ) : (
         <p className="text-xs text-slate-300 italic">No entry from {slot} slot yet.</p>

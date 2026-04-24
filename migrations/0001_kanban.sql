@@ -11,6 +11,9 @@
 -- environment comes up self-provisioned.
 
 CREATE SCHEMA IF NOT EXISTS ops;
+-- gen_random_uuid() lives in pgcrypto. Supabase ships with it enabled,
+-- but a fresh plain-Postgres target would 500 without this.
+CREATE EXTENSION IF NOT EXISTS pgcrypto;
 
 -- Columns ------------------------------------------------------------- --
 CREATE TABLE IF NOT EXISTS ops.kanban_columns (

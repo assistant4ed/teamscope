@@ -18,6 +18,7 @@
 import express, { type Request, type Response, type NextFunction } from 'express';
 import compression from 'compression';
 import pg from 'pg';
+import fs from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -91,6 +92,32 @@ async function query<T = Record<string, unknown>>(
 ): Promise<T[]> {
   const { rows } = await pool.query(sql, params);
   return rows as T[];
+}
+
+// ---------- Schema auto-provision -------------------------------- //
+// Every *.sql file under migrations/ is expected to be idempotent
+// (CREATE TABLE IF NOT EXISTS, INSERT WHERE NOT EXISTS, etc.) and
+// is re-run on every boot. Keeps a fresh Supabase project in lockstep
+// with the code without any manual SQL pasting.
+async function ensureSchema() {
+  const dir = path.resolve(__dirname, '..', 'migrations');
+  let entries: string[] = [];
+  try {
+    entries = (await fs.readdir(dir)).filter(n => n.endsWith('.sql')).sort();
+  } catch {
+    console.warn('[teamscope] no migrations/ dir found, skipping schema bootstrap');
+    return;
+  }
+  for (const name of entries) {
+    const sql = await fs.readFile(path.join(dir, name), 'utf8');
+    try {
+      await pool.query(sql);
+      console.log(`[teamscope] applied migration ${name}`);
+    } catch (e) {
+      console.error(`[teamscope] migration ${name} FAILED:`, (e as Error).message);
+      throw e;
+    }
+  }
 }
 
 // ---------- App ---------------------------------------------------- //
@@ -540,6 +567,434 @@ app.post('/api/agent/summary',
   }
 );
 
+// ---------- Kanban ------------------------------------------------ //
+// Single shared board. Columns are seeded by migration; cards carry an
+// integer `position` per column. Every mutation writes a row into
+// ops.kanban_activity so the Activity page has a stable audit trail.
+
+async function logActivity(
+  actorEmail: string,
+  cardId: string | null,
+  action: string,
+  payload: Record<string, unknown> = {}
+) {
+  try {
+    await query(
+      `INSERT INTO ops.kanban_activity (card_id, actor_email, action, payload)
+       VALUES ($1, $2, $3, $4::jsonb)`,
+      [cardId, actorEmail, action, JSON.stringify(payload)]
+    );
+  } catch (e) {
+    // Activity log failures must not block the user's mutation.
+    console.error('[teamscope] activity log write failed:', (e as Error).message);
+  }
+}
+
+// Full board load: columns + cards + assignees, in one round-trip.
+app.get('/api/kanban/board', async (_req, res) => {
+  try {
+    const [columns, cards, assignees, subscribers] = await Promise.all([
+      query<{ id: string; name: string; position: number; is_done: boolean; wip_limit: number | null }>(
+        `SELECT id, name, position, is_done, wip_limit
+           FROM ops.kanban_columns
+          WHERE deleted_at IS NULL
+          ORDER BY position`
+      ),
+      query(
+        `SELECT id, column_id, title, description, priority, position, due_date,
+                created_by, created_at, updated_at, done_at,
+                source_kind, source_ref
+           FROM ops.kanban_cards
+          WHERE deleted_at IS NULL
+          ORDER BY column_id, position`
+      ),
+      query<{ card_id: string; subscriber_id: string; assigned_at: string }>(
+        `SELECT a.card_id, a.subscriber_id, a.assigned_at
+           FROM ops.kanban_assignees a
+           JOIN ops.kanban_cards c ON c.id = a.card_id
+          WHERE c.deleted_at IS NULL`
+      ),
+      query(
+        `SELECT id, name, role, timezone, telegram_chat_id, active
+           FROM ops.report_subscribers
+          ORDER BY active DESC, name`
+      ),
+    ]);
+    res.json({ columns, cards, assignees, subscribers });
+  } catch (e) {
+    res.status(500).json({ error: (e as Error).message });
+  }
+});
+
+// Create a card. Position defaults to the end of the target column.
+app.post('/api/kanban/cards',
+  requireRole('boss', 'pa', 'colleague'),
+  async (req, res) => {
+    const b = req.body || {};
+    const title = (b.title as string || '').trim();
+    const columnId = b.column_id as string;
+    if (!title) return res.status(400).json({ error: 'title required' });
+    if (!columnId) return res.status(400).json({ error: 'column_id required' });
+    const assigneeIds: string[] = Array.isArray(b.assignee_ids) ? b.assignee_ids : [];
+    if (assigneeIds.length > 5) {
+      return res.status(400).json({ error: 'max 5 assignees per card' });
+    }
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      const positionRow = await client.query(
+        `SELECT COALESCE(MAX(position), -1) + 1 AS next_pos
+           FROM ops.kanban_cards
+          WHERE column_id = $1 AND deleted_at IS NULL`,
+        [columnId]
+      );
+      const position = positionRow.rows[0].next_pos;
+      const insert = await client.query(
+        `INSERT INTO ops.kanban_cards
+           (column_id, title, description, priority, position, due_date,
+            created_by, source_kind, source_ref)
+         VALUES ($1, $2, $3, COALESCE($4, 'medium'), $5, $6, $7,
+                 COALESCE($8, 'manual'), $9)
+         RETURNING id, column_id, title, description, priority, position,
+                   due_date, created_by, created_at, updated_at, done_at,
+                   source_kind, source_ref`,
+        [columnId, title, b.description ?? null, b.priority ?? null,
+         position, b.due_date ?? null, req.user!.email,
+         b.source_kind ?? null, b.source_ref ?? null]
+      );
+      const card = insert.rows[0];
+      for (const sid of assigneeIds) {
+        await client.query(
+          `INSERT INTO ops.kanban_assignees (card_id, subscriber_id, assigned_by)
+           VALUES ($1, $2, $3) ON CONFLICT DO NOTHING`,
+          [card.id, sid, req.user!.email]
+        );
+      }
+      await client.query('COMMIT');
+      await logActivity(req.user!.email, card.id, 'card.created', {
+        title: card.title, column_id: card.column_id, assignees: assigneeIds,
+      });
+      res.json({ card, assignee_ids: assigneeIds });
+    } catch (e) {
+      await client.query('ROLLBACK').catch(() => {});
+      res.status(500).json({ error: (e as Error).message });
+    } finally {
+      client.release();
+    }
+  }
+);
+
+// Update a card's editable fields. Separate from move to keep intents clear.
+app.patch('/api/kanban/cards/:id',
+  requireRole('boss', 'pa', 'colleague'),
+  async (req, res) => {
+    const b = req.body || {};
+    const fields = ['title', 'description', 'priority', 'due_date'] as const;
+    const sets: string[] = [];
+    const vals: unknown[] = [];
+    for (const k of fields) {
+      if (b[k] !== undefined) {
+        sets.push(`${k} = $${sets.length + 1}`);
+        vals.push(b[k]);
+      }
+    }
+    if (sets.length === 0 && !Array.isArray(b.assignee_ids)) {
+      return res.status(400).json({ error: 'no fields to update' });
+    }
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      let card: Record<string, unknown> | null = null;
+      if (sets.length) {
+        vals.push(req.params.id);
+        const r = await client.query(
+          `UPDATE ops.kanban_cards
+              SET ${sets.join(', ')}, updated_at = now()
+            WHERE id = $${vals.length} AND deleted_at IS NULL
+          RETURNING id, column_id, title, description, priority, position,
+                    due_date, created_by, created_at, updated_at, done_at,
+                    source_kind, source_ref`,
+          vals
+        );
+        if (r.rowCount === 0) {
+          await client.query('ROLLBACK');
+          return res.status(404).json({ error: 'not_found' });
+        }
+        card = r.rows[0];
+      } else {
+        const r = await client.query(
+          `SELECT id FROM ops.kanban_cards WHERE id = $1 AND deleted_at IS NULL`,
+          [req.params.id]
+        );
+        if (r.rowCount === 0) {
+          await client.query('ROLLBACK');
+          return res.status(404).json({ error: 'not_found' });
+        }
+      }
+      if (Array.isArray(b.assignee_ids)) {
+        if (b.assignee_ids.length > 5) {
+          await client.query('ROLLBACK');
+          return res.status(400).json({ error: 'max 5 assignees per card' });
+        }
+        await client.query(
+          `DELETE FROM ops.kanban_assignees WHERE card_id = $1`,
+          [req.params.id]
+        );
+        for (const sid of b.assignee_ids) {
+          await client.query(
+            `INSERT INTO ops.kanban_assignees (card_id, subscriber_id, assigned_by)
+             VALUES ($1, $2, $3) ON CONFLICT DO NOTHING`,
+            [req.params.id, sid, req.user!.email]
+          );
+        }
+      }
+      await client.query('COMMIT');
+      const cardId = String(req.params.id);
+      await logActivity(req.user!.email, cardId, 'card.updated', {
+        changed: Object.fromEntries(fields.filter(k => b[k] !== undefined).map(k => [k, b[k]])),
+        ...(Array.isArray(b.assignee_ids) ? { assignees: b.assignee_ids } : {}),
+      });
+      res.json({ card: card ?? { id: cardId } });
+    } catch (e) {
+      await client.query('ROLLBACK').catch(() => {});
+      res.status(500).json({ error: (e as Error).message });
+    } finally {
+      client.release();
+    }
+  }
+);
+
+// Move a card to a column + position. Sets done_at when target column is_done.
+app.put('/api/kanban/cards/:id/move',
+  requireRole('boss', 'pa', 'colleague'),
+  async (req, res) => {
+    const columnId = req.body?.column_id as string;
+    const position = Number(req.body?.position);
+    if (!columnId || !Number.isFinite(position)) {
+      return res.status(400).json({ error: 'column_id + position required' });
+    }
+    try {
+      const colRows = await query<{ is_done: boolean }>(
+        `SELECT is_done FROM ops.kanban_columns
+          WHERE id = $1 AND deleted_at IS NULL`,
+        [columnId]
+      );
+      if (colRows.length === 0) return res.status(404).json({ error: 'column_not_found' });
+      const isDone = colRows[0].is_done;
+      const rows = await query(
+        `UPDATE ops.kanban_cards
+            SET column_id = $1,
+                position = $2,
+                updated_at = now(),
+                done_at = CASE
+                  WHEN $3 AND done_at IS NULL THEN now()
+                  WHEN NOT $3 THEN NULL
+                  ELSE done_at
+                END
+          WHERE id = $4 AND deleted_at IS NULL
+        RETURNING id, column_id, position, done_at`,
+        [columnId, position, isDone, req.params.id]
+      );
+      if (rows.length === 0) return res.status(404).json({ error: 'not_found' });
+      const cardId = String(req.params.id);
+      await logActivity(req.user!.email, cardId, 'card.moved', {
+        column_id: columnId, position, is_done: isDone,
+      });
+      if (isDone) {
+        await logActivity(req.user!.email, cardId, 'card.done', {});
+      }
+      res.json({ card: rows[0] });
+    } catch (e) {
+      res.status(500).json({ error: (e as Error).message });
+    }
+  }
+);
+
+// Soft-delete a card.
+app.delete('/api/kanban/cards/:id',
+  requireRole('boss', 'pa'),
+  async (req, res) => {
+    try {
+      const rows = await query(
+        `UPDATE ops.kanban_cards
+            SET deleted_at = now(), updated_at = now()
+          WHERE id = $1 AND deleted_at IS NULL
+        RETURNING id, title`,
+        [req.params.id]
+      );
+      if (rows.length === 0) return res.status(404).json({ error: 'not_found' });
+      await logActivity(req.user!.email, String(req.params.id), 'card.deleted', {
+        title: (rows[0] as { title: string }).title,
+      });
+      res.json({ deleted: rows[0] });
+    } catch (e) {
+      res.status(500).json({ error: (e as Error).message });
+    }
+  }
+);
+
+// Column CRUD ------------------------------------------------------- //
+app.post('/api/kanban/columns',
+  requireRole('boss'),
+  async (req, res) => {
+    const name = (req.body?.name as string || '').trim();
+    const isDone = Boolean(req.body?.is_done);
+    const wipLimit = req.body?.wip_limit == null ? null : Number(req.body.wip_limit);
+    if (!name) return res.status(400).json({ error: 'name required' });
+    try {
+      const posRow = await query<{ next_pos: number }>(
+        `SELECT COALESCE(MAX(position), -1) + 1 AS next_pos
+           FROM ops.kanban_columns WHERE deleted_at IS NULL`
+      );
+      const rows = await query(
+        `INSERT INTO ops.kanban_columns (name, position, is_done, wip_limit)
+         VALUES ($1, $2, $3, $4)
+       RETURNING id, name, position, is_done, wip_limit`,
+        [name, posRow[0].next_pos, isDone, wipLimit]
+      );
+      await logActivity(req.user!.email, null, 'column.created', rows[0] as Record<string, unknown>);
+      res.json({ column: rows[0] });
+    } catch (e) {
+      res.status(500).json({ error: (e as Error).message });
+    }
+  }
+);
+
+app.patch('/api/kanban/columns/:id',
+  requireRole('boss'),
+  async (req, res) => {
+    const b = req.body || {};
+    const fields = ['name', 'is_done', 'wip_limit'] as const;
+    const sets: string[] = [];
+    const vals: unknown[] = [];
+    for (const k of fields) {
+      if (b[k] !== undefined) {
+        sets.push(`${k} = $${sets.length + 1}`);
+        vals.push(b[k]);
+      }
+    }
+    if (sets.length === 0) return res.status(400).json({ error: 'no fields to update' });
+    vals.push(req.params.id);
+    try {
+      const rows = await query(
+        `UPDATE ops.kanban_columns SET ${sets.join(', ')}
+          WHERE id = $${vals.length} AND deleted_at IS NULL
+        RETURNING id, name, position, is_done, wip_limit`,
+        vals
+      );
+      if (rows.length === 0) return res.status(404).json({ error: 'not_found' });
+      await logActivity(req.user!.email, null, 'column.renamed',
+        { column_id: req.params.id, changed: b });
+      res.json({ column: rows[0] });
+    } catch (e) {
+      res.status(500).json({ error: (e as Error).message });
+    }
+  }
+);
+
+app.put('/api/kanban/columns/reorder',
+  requireRole('boss'),
+  async (req, res) => {
+    const ids: string[] = Array.isArray(req.body?.column_ids) ? req.body.column_ids : [];
+    if (ids.length === 0) return res.status(400).json({ error: 'column_ids required' });
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      for (let i = 0; i < ids.length; i++) {
+        await client.query(
+          `UPDATE ops.kanban_columns SET position = $1
+            WHERE id = $2 AND deleted_at IS NULL`,
+          [i, ids[i]]
+        );
+      }
+      await client.query('COMMIT');
+      await logActivity(req.user!.email, null, 'column.reordered', { order: ids });
+      res.json({ ok: true });
+    } catch (e) {
+      await client.query('ROLLBACK').catch(() => {});
+      res.status(500).json({ error: (e as Error).message });
+    } finally {
+      client.release();
+    }
+  }
+);
+
+app.delete('/api/kanban/columns/:id',
+  requireRole('boss'),
+  async (req, res) => {
+    try {
+      // Refuse to delete a column that still has live cards.
+      const cardsLeft = await query<{ n: number }>(
+        `SELECT COUNT(*)::int AS n FROM ops.kanban_cards
+          WHERE column_id = $1 AND deleted_at IS NULL`,
+        [req.params.id]
+      );
+      if (cardsLeft[0].n > 0) {
+        return res.status(409).json({ error: 'column_not_empty', cards: cardsLeft[0].n });
+      }
+      const rows = await query(
+        `UPDATE ops.kanban_columns SET deleted_at = now()
+          WHERE id = $1 AND deleted_at IS NULL
+        RETURNING id, name`,
+        [req.params.id]
+      );
+      if (rows.length === 0) return res.status(404).json({ error: 'not_found' });
+      await logActivity(req.user!.email, null, 'column.deleted', rows[0] as Record<string, unknown>);
+      res.json({ deleted: rows[0] });
+    } catch (e) {
+      res.status(500).json({ error: (e as Error).message });
+    }
+  }
+);
+
+// ---------- Staff activity feed ------------------------------------ //
+// Used by the Activity page — combines kanban_activity with actions_log.
+// `subscriber_id` query filters activity where a specific member is the
+// subject (either assigned a card or named in the payload).
+app.get('/api/activity', async (req, res) => {
+  const limit = Math.min(200, Math.max(1, Number(req.query.limit ?? 100)));
+  const actor = (req.query.actor as string || '').trim().toLowerCase();
+  const subscriber = (req.query.subscriber_id as string || '').trim();
+  const since = (req.query.since as string || '').trim();
+  try {
+    const kanbanWhere: string[] = [];
+    const kanbanVals: unknown[] = [];
+    if (actor) {
+      kanbanVals.push(actor);
+      kanbanWhere.push(`a.actor_email = $${kanbanVals.length}`);
+    }
+    if (subscriber) {
+      kanbanVals.push(subscriber);
+      kanbanWhere.push(
+        `(a.payload->>'subscriber_id' = $${kanbanVals.length}
+          OR a.payload->'assignees' ? $${kanbanVals.length}
+          OR EXISTS (SELECT 1 FROM ops.kanban_assignees ka
+                      WHERE ka.card_id = a.card_id
+                        AND ka.subscriber_id = $${kanbanVals.length}::uuid))`
+      );
+    }
+    if (since) {
+      kanbanVals.push(since);
+      kanbanWhere.push(`a.created_at >= $${kanbanVals.length}::timestamptz`);
+    }
+    kanbanVals.push(limit);
+    const kanban = await query(
+      `SELECT a.id::text AS id, a.card_id, c.title AS card_title,
+              a.actor_email, a.action, a.payload, a.created_at,
+              'kanban' AS source
+         FROM ops.kanban_activity a
+    LEFT JOIN ops.kanban_cards c ON c.id = a.card_id
+        ${kanbanWhere.length ? `WHERE ${kanbanWhere.join(' AND ')}` : ''}
+        ORDER BY a.created_at DESC
+        LIMIT $${kanbanVals.length}`,
+      kanbanVals
+    );
+    res.json({ events: kanban });
+  } catch (e) {
+    res.status(500).json({ error: (e as Error).message });
+  }
+});
+
 // ---------- Messages ---------------------------------------------- //
 app.get('/api/messages/recent', async (req, res) => {
   const limit = Math.min(100, Math.max(1, Number(req.query.limit ?? 30)));
@@ -568,6 +1023,13 @@ app.use((err: Error, _req: Request, res: Response, _next: NextFunction) => {
   res.status(500).json({ error: 'internal_error' });
 });
 
-app.listen(Number(PORT), () => {
-  console.log(`[teamscope] listening on :${PORT}  env=${NODE_ENV}`);
-});
+ensureSchema()
+  .then(() => {
+    app.listen(Number(PORT), () => {
+      console.log(`[teamscope] listening on :${PORT}  env=${NODE_ENV}`);
+    });
+  })
+  .catch(err => {
+    console.error('[teamscope] FATAL: schema bootstrap failed', err);
+    process.exit(1);
+  });

@@ -2,8 +2,9 @@ import React, { useEffect, useMemo, useState } from 'react';
 import {
   Sun, Moon, Clock, Sparkles, Activity, List, Calendar as CalendarIcon,
   Loader2, AlertTriangle, CheckCircle2, User as UserIcon,
+  Kanban, ArrowRight,
 } from 'lucide-react';
-import { apiGet, apiPost } from '../auth';
+import { apiGet, apiPost, apiFetch } from '../auth';
 
 interface Report {
   id: string;
@@ -31,6 +32,9 @@ export default function Reports() {
   const [summary, setSummary] = useState('');
   const [genLoading, setGenLoading] = useState(false);
   const [loading, setLoading] = useState(true);
+  // report_id → count of cards already imported. Drives the button state
+  // so re-clicks (or a reload) can't double-create.
+  const [importedById, setImportedById] = useState<Map<string, number>>(new Map());
 
   async function load() {
     setLoading(true);
@@ -38,6 +42,18 @@ export default function Reports() {
       const d = await apiGet<{ reports: Report[] }>(`/api/reports/recent?days=${days}`);
       setReports(d.reports);
     } finally { setLoading(false); }
+    try {
+      const b = await apiGet<{ cards: Array<{ source_kind: string; source_ref: string | null }> }>(
+        '/api/kanban/board'
+      );
+      const m = new Map<string, number>();
+      for (const c of b.cards) {
+        if (c.source_kind === 'report_goal' && c.source_ref) {
+          m.set(c.source_ref, (m.get(c.source_ref) ?? 0) + 1);
+        }
+      }
+      setImportedById(m);
+    } catch {/* non-fatal; button just defaults to "Import" state */}
   }
   useEffect(() => { load(); }, [days]);
 
@@ -189,7 +205,11 @@ export default function Reports() {
                 {date === today && <span className="ml-2 text-indigo-600">· Today</span>}
               </h3>
               <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-3">
-                {rows.map(r => <ReportCard key={r.id} r={r} />)}
+                {rows.map(r => (
+                  <ReportCard key={r.id} r={r}
+                    importedCount={importedById.get(r.id) ?? 0}
+                    onImported={() => load()} />
+                ))}
               </div>
             </section>
           ))}
@@ -216,7 +236,11 @@ const StatCard = ({ label, icon, value, sub, tone = 'default' }: {
   </div>
 );
 
-const ReportCard = ({ r }: { r: Report }) => {
+const ReportCard = ({ r, importedCount, onImported }: {
+  r: Report;
+  importedCount: number;
+  onImported: () => void;
+}) => {
   const progress =
     [r.goals, r.mid_progress, r.eod_completed].filter(Boolean).length / 3;
   const statusColor =
@@ -246,6 +270,11 @@ const ReportCard = ({ r }: { r: Report }) => {
 
       <SlotRow icon={<Sun className="w-4 h-4 text-amber-500"/>} label="Morning goals"
         value={r.goals} slot="morning" />
+      {r.goals && r.goals.trim() && (
+        <ImportGoalsButton reportId={r.id} goals={r.goals}
+          importedCount={importedCount}
+          onImported={onImported} />
+      )}
       <SlotRow icon={<Clock className="w-4 h-4 text-sky-500"/>} label="Midday progress"
         value={r.mid_progress}
         issues={r.mid_issues} changes={r.mid_changes} slot="midday" />
@@ -255,6 +284,78 @@ const ReportCard = ({ r }: { r: Report }) => {
     </article>
   );
 };
+
+// Compact row under Morning goals that turns those goals into Board cards.
+// Already-imported reports show a disabled badge so the boss doesn't
+// double-click and the backend's 409 guard stays a belt-and-braces check.
+function ImportGoalsButton({ reportId, goals, importedCount, onImported }: {
+  reportId: string;
+  goals: string;
+  importedCount: number;
+  onImported: () => void;
+}) {
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+  const parsed = previewGoalLines(goals);
+
+  async function submit() {
+    if (busy) return;
+    setBusy(true); setErr(null);
+    try {
+      const res = await apiFetch(`/api/kanban/cards/from-report/${reportId}`, {
+        method: 'POST',
+      });
+      if (!res.ok) {
+        const body = await res.json().catch(() => ({}));
+        throw new Error(body.error || `HTTP ${res.status}`);
+      }
+      onImported();
+    } catch (e) {
+      setErr((e as Error).message);
+    } finally { setBusy(false); }
+  }
+
+  if (importedCount > 0) {
+    return (
+      <div className="ml-6 mb-3 text-xs text-emerald-700 bg-emerald-50
+                      border border-emerald-200 rounded-lg px-2.5 py-1 inline-flex items-center gap-1.5">
+        <CheckCircle2 className="w-3.5 h-3.5" />
+        {importedCount} goal {importedCount === 1 ? 'card' : 'cards'} on Board
+      </div>
+    );
+  }
+  return (
+    <div className="ml-6 mb-3">
+      <button onClick={submit} disabled={busy || parsed === 0}
+        title={`Creates ${parsed} card${parsed === 1 ? '' : 's'} in the Today column, assigned to the author.`}
+        className="inline-flex items-center gap-1.5 text-xs font-medium
+                   text-indigo-700 bg-indigo-50 hover:bg-indigo-100
+                   disabled:opacity-40 rounded-lg px-2.5 py-1">
+        {busy
+          ? <Loader2 className="w-3.5 h-3.5 animate-spin" />
+          : <Kanban className="w-3.5 h-3.5" />}
+        Import {parsed} {parsed === 1 ? 'goal' : 'goals'}
+        <ArrowRight className="w-3 h-3" />
+      </button>
+      {err && <div className="text-[11px] text-rose-600 mt-1">{err}</div>}
+    </div>
+  );
+}
+
+// Mirror of the server-side parser — line count only, so the button
+// shows "Import 3 goals" before the user clicks.
+function previewGoalLines(text: string): number {
+  const lines = text
+    .split(/\r?\n+/)
+    .map(l => l.trim()
+      .replace(/^[\d]+\s*[.):]\s+/, '')
+      .replace(/^[-*•·‣]\s+/, '')
+      .replace(/^\[\s*\]\s+/, '')
+      .trim())
+    .filter(l => l.length > 0);
+  if (lines.length === 0 && text.trim()) return 1;
+  return Math.min(lines.length, 20);
+}
 
 const SlotRow = ({ icon, label, value, issues, changes, unfinished, slot, last = false }: {
   icon: React.ReactNode; label: string; value: string | null;

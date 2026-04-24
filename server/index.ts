@@ -1032,6 +1032,138 @@ app.post('/api/kanban/cards/from-action/:correlation_id',
   }
 );
 
+// Promote a daily-report's morning goals into Kanban cards. Parses
+// the goals text into line items and creates one card per line in
+// the Today column, assigned to the report's subscriber. Refuses
+// if any card with source_ref = this report already exists so a
+// double-click doesn't duplicate the boss's work.
+app.post('/api/kanban/cards/from-report/:report_id',
+  requireRole('boss', 'pa'),
+  async (req, res) => {
+    const reportId = String(req.params.report_id);
+    const columnOverride = req.body?.column_id as string | undefined;
+    try {
+      // Fetch the report + subscriber in one round trip.
+      const reports = await query<{
+        id: string; subscriber_id: string; goals: string | null; name: string;
+      }>(
+        `SELECT d.id, d.subscriber_id, d.goals, s.name
+           FROM ops.daily_reports d
+      LEFT JOIN ops.report_subscribers s ON s.id = d.subscriber_id
+          WHERE d.id = $1`,
+        [reportId]
+      );
+      if (reports.length === 0) return res.status(404).json({ error: 'report_not_found' });
+      const r = reports[0];
+      if (!r.goals || !r.goals.trim()) return res.status(400).json({ error: 'no_goals' });
+
+      // Duplicate guard: has this report already been imported?
+      const existing = await query<{ n: number }>(
+        `SELECT COUNT(*)::int AS n FROM ops.kanban_cards
+          WHERE source_kind = 'report_goal' AND source_ref = $1 AND deleted_at IS NULL`,
+        [reportId]
+      );
+      if (existing[0].n > 0) {
+        return res.status(409).json({ error: 'already_imported', existing: existing[0].n });
+      }
+
+      // Pick the target column. Default: one named "Today"; fallback:
+      // the first non-done column. If the boss wants another, they POST column_id.
+      let targetColumnId = columnOverride;
+      if (!targetColumnId) {
+        const cols = await query<{ id: string }>(
+          `SELECT id FROM ops.kanban_columns
+            WHERE deleted_at IS NULL
+            ORDER BY CASE WHEN lower(name) = 'today' THEN 0
+                          WHEN is_done THEN 2 ELSE 1 END,
+                     position LIMIT 1`
+        );
+        targetColumnId = cols[0]?.id;
+      }
+      if (!targetColumnId) return res.status(400).json({ error: 'no_target_column' });
+
+      const titles = parseGoalLines(r.goals);
+      if (titles.length === 0) return res.status(400).json({ error: 'no parseable goals' });
+
+      const created: Array<{ id: string; title: string; position: number }> = [];
+      const client = await pool.connect();
+      try {
+        await client.query('BEGIN');
+        const posRow = await client.query(
+          `SELECT COALESCE(MAX(position), -1) + 1 AS next_pos
+             FROM ops.kanban_cards
+            WHERE column_id = $1 AND deleted_at IS NULL`,
+          [targetColumnId]
+        );
+        let pos: number = posRow.rows[0].next_pos;
+        for (const title of titles) {
+          const ins = await client.query(
+            `INSERT INTO ops.kanban_cards
+               (column_id, title, priority, position, created_by,
+                source_kind, source_ref)
+             VALUES ($1, $2, 'medium', $3, $4, 'report_goal', $5)
+             RETURNING id, title, position`,
+            [targetColumnId, title, pos, req.user!.email, reportId]
+          );
+          pos += 1;
+          const cardId = ins.rows[0].id as string;
+          if (r.subscriber_id) {
+            await client.query(
+              `INSERT INTO ops.kanban_assignees (card_id, subscriber_id, assigned_by)
+               VALUES ($1, $2, $3) ON CONFLICT DO NOTHING`,
+              [cardId, r.subscriber_id, req.user!.email]
+            );
+          }
+          created.push(ins.rows[0]);
+        }
+        await client.query('COMMIT');
+      } catch (e) {
+        await client.query('ROLLBACK').catch(() => {});
+        throw e;
+      } finally {
+        client.release();
+      }
+
+      // Activity log, one event per card.
+      for (const c of created) {
+        await logActivity(req.user!.email, c.id, 'card.created', {
+          title: c.title,
+          column_id: targetColumnId,
+          source_kind: 'report_goal',
+          source_ref: reportId,
+          assignees: r.subscriber_id ? [r.subscriber_id] : [],
+        });
+      }
+      // Intentionally NO Telegram notify — the subscriber wrote these
+      // goals themselves; DMing them back about their own input is noise.
+
+      res.json({ created_count: created.length, cards: created });
+    } catch (e) {
+      res.status(pgErrorStatus(e)).json({ error: (e as Error).message });
+    }
+  }
+);
+
+// Naive-but-robust goal parser. Splits on newlines, strips common
+// bullet/number prefixes, drops blanks, caps lengths. Falls back to
+// the raw text as a single card if nothing parseable is found.
+function parseGoalLines(text: string): string[] {
+  const lines = text
+    .split(/\r?\n+/)
+    .map(l => l.trim()
+      .replace(/^[\d]+\s*[.):]\s+/, '') // "1. foo", "1) foo", "1: foo"
+      .replace(/^[-*•·‣]\s+/, '')        // "- foo", "• foo", "* foo"
+      .replace(/^\[\s*\]\s+/, '')        // "[ ] foo" checkbox style
+      .trim())
+    .filter(l => l.length > 0);
+  if (lines.length === 0) {
+    const trimmed = text.trim();
+    if (!trimmed) return [];
+    return [trimmed.slice(0, 200)];
+  }
+  return lines.map(l => l.slice(0, 200)).slice(0, 20);
+}
+
 // Column CRUD ------------------------------------------------------- //
 app.post('/api/kanban/columns',
   requireRole('boss'),

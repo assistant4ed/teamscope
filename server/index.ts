@@ -568,6 +568,124 @@ app.post('/api/team/subscribers',
 // would flag the structured request as a potential prompt injection).
 const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY || '';
 
+// Classify an incoming Telegram reply into report / task / chatter so
+// n8n's 03 · Report Prompter can (a) confirm a clean summary before
+// storing, or (b) hand off tasks to the existing agent pipeline.
+// Same Anthropic direct-call pattern as /api/agent/summary for the
+// same injection-avoidance reason.
+const REPORT_SLOTS = ['morning', 'midday', 'eod'] as const;
+type ReportSlot = typeof REPORT_SLOTS[number];
+
+app.post('/api/agent/classify-report', async (req, res) => {
+  const textRaw = (req.body?.text as string | undefined) || '';
+  const slotRaw = (req.body?.slot as string | undefined) || '';
+  const subscriberName = (req.body?.subscriber_name as string | undefined) || 'Teammate';
+  if (!textRaw.trim()) return res.status(400).json({ error: 'text required' });
+  if (!(REPORT_SLOTS as readonly string[]).includes(slotRaw)) {
+    return res.status(400).json({ error: 'slot must be morning|midday|eod' });
+  }
+  const slot = slotRaw as ReportSlot;
+  const text = textRaw.trim().slice(0, 2000);
+
+  if (!ANTHROPIC_API_KEY) {
+    return res.status(503).json({ error: 'ANTHROPIC_API_KEY not configured' });
+  }
+
+  try {
+    // Pull the prompt template so the classifier knows what the bot asked.
+    const tplRows = await query<{ template_text: string }>(
+      `SELECT template_text FROM ops.report_prompt_templates WHERE slot = $1`,
+      [slot]
+    );
+    const botPrompt = tplRows[0]?.template_text
+      || `(template missing for slot=${slot})`;
+
+    const slotFields: Record<ReportSlot, string> = {
+      morning: '{"hours": number|null, "goals": string[]}',
+      midday:  '{"completed": string|null, "blockers": string|null, "plan_change": string|null}',
+      eod:     '{"hours": number|null, "completed": string[]|null, "unfinished": string[]|null}',
+    };
+
+    const system =
+      "You are a message classifier for a Telegram bot that collects daily work reports. " +
+      "The bot asks its subscribers a question at each slot (morning/midday/eod). " +
+      "Your job: read the subscriber's reply and classify it.\n\n" +
+      "Possible kinds:\n" +
+      "- report_goals: subscriber giving their morning plan (hours, goals)\n" +
+      "- report_progress: subscriber giving midday progress (what's done, blockers)\n" +
+      "- report_eod: subscriber giving end-of-day summary (hours, completed, unfinished)\n" +
+      "- task: subscriber is giving an instruction or delegation, not reporting their own work\n" +
+      "- chatter: small talk, confusion, unrelated text, or empty/nonsense\n\n" +
+      "Output STRICT JSON only (no prose, no markdown fences) matching this shape:\n" +
+      '{\n' +
+      '  "kind": "report_goals" | "report_progress" | "report_eod" | "task" | "chatter",\n' +
+      '  "confidence": <float 0.0 - 1.0>,\n' +
+      '  "summary": "<one short line, max 160 chars, plain prose>",\n' +
+      `  "structured": ${slotFields[slot]},\n` +
+      '  "suggested_task": { "title": "<short>", "details": "<one-line>" }  // ONLY when kind==="task"; omit otherwise\n' +
+      '}\n';
+
+    const userMessage =
+      `Slot: ${slot}\n` +
+      `Subscriber: ${subscriberName}\n\n` +
+      `The bot asked:\n---\n${botPrompt}\n---\n\n` +
+      `Their reply:\n---\n${text}\n---\n\n` +
+      `Classify per the rules.`;
+
+    const upstream = await fetch('https://api.anthropic.com/v1/messages', {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        'anthropic-version': '2023-06-01',
+        'x-api-key': ANTHROPIC_API_KEY,
+      },
+      body: JSON.stringify({
+        model: 'claude-sonnet-4-6',
+        max_tokens: 600,
+        system,
+        messages: [{ role: 'user', content: userMessage }],
+      }),
+    });
+    const data = await upstream.json().catch(() => ({} as Record<string, unknown>));
+    if (!upstream.ok) {
+      return res.status(502).json({ error: 'anthropic_error', detail: data });
+    }
+    const raw = (data as { content?: Array<{ text?: string }> })?.content?.[0]?.text || '';
+    const parsed = extractJson(raw);
+    if (!parsed) {
+      return res.status(200).json({
+        kind: 'chatter',
+        confidence: 0,
+        summary: text.slice(0, 160),
+        structured: {},
+        parse_error: 'claude returned non-JSON',
+        raw_preview: raw.slice(0, 200),
+      });
+    }
+    res.json(parsed);
+  } catch (e) {
+    res.status(pgErrorStatus(e)).json({ error: (e as Error).message });
+  }
+});
+
+// Pull the first JSON object out of Claude's reply, even if wrapped
+// in prose or a fenced code block. Returns null if nothing parses.
+function extractJson(raw: string): Record<string, unknown> | null {
+  if (!raw) return null;
+  const fenced = raw.match(/```(?:json)?\s*([\s\S]+?)\s*```/);
+  const candidate = fenced ? fenced[1] : raw;
+  const start = candidate.indexOf('{');
+  const end = candidate.lastIndexOf('}');
+  if (start === -1 || end === -1 || end <= start) return null;
+  const slice = candidate.slice(start, end + 1);
+  try {
+    const obj = JSON.parse(slice);
+    return typeof obj === 'object' && obj !== null ? obj as Record<string, unknown> : null;
+  } catch {
+    return null;
+  }
+}
+
 app.post('/api/agent/summary',
   requireRole('boss', 'pa'),
   async (_req, res) => {

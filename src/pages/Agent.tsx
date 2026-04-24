@@ -1,6 +1,8 @@
 import React, { useState, useRef, useEffect } from 'react';
-import { apiPost, Me } from '../auth';
-import { Send, Loader2, Bot, User as UserIcon } from 'lucide-react';
+import { apiPost, apiFetch, Me } from '../auth';
+import {
+  Send, Loader2, Bot, User as UserIcon, ChevronDown, ChevronUp, FlaskConical,
+} from 'lucide-react';
 
 interface Classification {
   domain: string;
@@ -59,6 +61,7 @@ export default function Agent({ me }: { me: Me }) {
     } finally { setLoading(false); }
   }
 
+  const canUseClassifier = me.role === 'boss' || me.role === 'pa';
   return (
     <div className="flex flex-col h-full">
       <div className="px-6 md:px-10 pt-6 pb-3 border-b border-slate-200 bg-white">
@@ -67,6 +70,7 @@ export default function Agent({ me }: { me: Me }) {
           Send a task. Claude classifies + routes to PA / Manus / auto-execute.
           Same brain as <code>@edpapabot</code>, without Telegram.
         </p>
+        {canUseClassifier && <ReportClassifierPanel />}
       </div>
 
       <div className="flex-1 overflow-y-auto px-4 md:px-10 py-6 space-y-4 bg-slate-50">
@@ -205,6 +209,97 @@ const Tag = ({ color, children }: { color: string; children: React.ReactNode }) 
   };
   return <span className={`px-2 py-0.5 rounded-full ${cls[color] || cls.slate}`}>{children}</span>;
 };
+
+// Lets a boss/PA paste a hypothetical Telegram reply and see how the
+// classifier labels it before wiring n8n. Collapsed by default so it
+// doesn't clutter the main chat flow.
+function ReportClassifierPanel() {
+  const [open, setOpen] = useState(false);
+  const [text, setText] = useState('');
+  const [slot, setSlot] = useState<'morning' | 'midday' | 'eod'>('morning');
+  const [busy, setBusy] = useState(false);
+  const [result, setResult] = useState<Record<string, unknown> | null>(null);
+  const [err, setErr] = useState<string | null>(null);
+
+  async function classify() {
+    if (!text.trim() || busy) return;
+    setBusy(true); setErr(null); setResult(null);
+    try {
+      const res = await apiFetch('/api/agent/classify-report', {
+        method: 'POST',
+        body: JSON.stringify({ text, slot }),
+      });
+      const body = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error((body as { error?: string }).error || `HTTP ${res.status}`);
+      setResult(body);
+    } catch (e) { setErr((e as Error).message); }
+    finally { setBusy(false); }
+  }
+
+  const kind = result?.kind as string | undefined;
+  const kindColor =
+    kind === 'task'          ? 'bg-amber-100 text-amber-800 border-amber-200' :
+    kind === 'chatter'       ? 'bg-slate-100 text-slate-700 border-slate-200' :
+    kind?.startsWith('report') ? 'bg-emerald-100 text-emerald-800 border-emerald-200' :
+                                 'bg-slate-100 text-slate-700 border-slate-200';
+
+  return (
+    <div className="mt-3">
+      <button onClick={() => setOpen(v => !v)}
+        className="inline-flex items-center gap-1.5 text-xs font-medium
+                   text-indigo-700 hover:text-indigo-900">
+        <FlaskConical className="w-3.5 h-3.5" />
+        Report classifier (test)
+        {open ? <ChevronUp className="w-3 h-3" /> : <ChevronDown className="w-3 h-3" />}
+      </button>
+      {open && (
+        <div className="mt-3 bg-slate-50 border border-slate-200 rounded-xl p-4 space-y-3">
+          <p className="text-xs text-slate-500">
+            Paste a hypothetical subscriber reply below, pick the slot it would have arrived on,
+            and see how the classifier labels it. Use to QA the classifier before n8n wires it in.
+          </p>
+          <div className="flex gap-2">
+            <select value={slot} onChange={e => setSlot(e.target.value as typeof slot)}
+              className="border border-slate-200 rounded-lg px-3 py-2 text-sm bg-white">
+              <option value="morning">Morning</option>
+              <option value="midday">Midday</option>
+              <option value="eod">End of day</option>
+            </select>
+            <textarea value={text} onChange={e => setText(e.target.value)}
+              rows={3} placeholder='e.g. "tell Meghan to plan my trip to Malaysia"'
+              className="flex-1 border border-slate-200 rounded-lg px-3 py-2 text-sm" />
+            <button onClick={classify} disabled={busy || !text.trim()}
+              className="px-3 py-2 text-sm font-medium bg-slate-900 hover:bg-slate-800
+                         disabled:opacity-40 text-white rounded-lg self-stretch">
+              {busy ? <Loader2 className="w-4 h-4 animate-spin" /> : 'Classify'}
+            </button>
+          </div>
+          {err && <div className="text-xs text-rose-700 bg-rose-50 border border-rose-200 rounded-lg p-2">{err}</div>}
+          {result && (
+            <div className="space-y-2">
+              <div className="flex flex-wrap gap-2 text-xs items-center">
+                <span className={`px-2 py-0.5 rounded-full border font-medium ${kindColor}`}>
+                  {kind || '?'}
+                </span>
+                {typeof result.confidence === 'number' && (
+                  <span className="text-slate-500">
+                    conf {Math.round((result.confidence as number) * 100)}%
+                  </span>
+                )}
+                {typeof result.summary === 'string' && (
+                  <span className="text-slate-700 italic">"{result.summary as string}"</span>
+                )}
+              </div>
+              <pre className="text-[11px] bg-white border border-slate-200 rounded-lg p-2 overflow-x-auto leading-snug">
+                {JSON.stringify(result, null, 2)}
+              </pre>
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
 
 const EmptyState = ({ email }: { email: string }) => (
   <div className="max-w-xl mx-auto mt-10 space-y-4 text-slate-600 text-sm">

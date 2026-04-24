@@ -82,6 +82,33 @@ export default function Board({ me }: { me: Me }) {
     }
   }
 
+  // Optimistic column reorder: move sourceId to target's slot, re-persist.
+  async function reorderColumn(sourceId: string, targetId: string) {
+    if (!data || sourceId === targetId) return;
+    const before = data;
+    const order = data.columns.map(c => c.id);
+    const fromIdx = order.indexOf(sourceId);
+    const toIdx = order.indexOf(targetId);
+    if (fromIdx < 0 || toIdx < 0) return;
+    order.splice(fromIdx, 1);
+    order.splice(toIdx, 0, sourceId);
+    const repositioned = order.map((id, i) => {
+      const col = data.columns.find(c => c.id === id)!;
+      return { ...col, position: i };
+    });
+    setData({ ...data, columns: repositioned });
+    try {
+      const res = await apiFetch('/api/kanban/columns/reorder', {
+        method: 'PUT',
+        body: JSON.stringify({ column_ids: order }),
+      });
+      if (!res.ok) throw new Error(`reorder failed: ${res.status}`);
+    } catch (e) {
+      setErr((e as Error).message);
+      setData(before);
+    }
+  }
+
   const subsById = useMemo(() => {
     const m = new Map<string, Subscriber>();
     data?.subscribers.forEach(s => m.set(s.id, s));
@@ -113,6 +140,7 @@ export default function Board({ me }: { me: Me }) {
 
   const canEdit = me.role === 'boss' || me.role === 'pa' || me.role === 'colleague';
   const canDelete = me.role === 'boss' || me.role === 'pa';
+  const canReorderColumns = me.role === 'boss';
 
   return (
     <div className="flex flex-col h-full">
@@ -163,7 +191,9 @@ export default function Board({ me }: { me: Me }) {
             data={data} visibleCards={visibleCards}
             assigneesByCard={assigneesByCard} subsById={subsById}
             canEdit={canEdit}
+            canReorderColumns={canReorderColumns}
             onMove={moveCard}
+            onColumnMove={reorderColumn}
             onAddClick={c => setAddToCol(c)}
             onCardClick={id => setEditCardId(id)}
           />
@@ -207,15 +237,17 @@ export default function Board({ me }: { me: Me }) {
 
 // ---------- Columns view ------------------------------------------- //
 function ColumnsView({
-  data, visibleCards, assigneesByCard, subsById, canEdit,
-  onMove, onAddClick, onCardClick,
+  data, visibleCards, assigneesByCard, subsById, canEdit, canReorderColumns,
+  onMove, onColumnMove, onAddClick, onCardClick,
 }: {
   data: BoardData;
   visibleCards: Card[];
   assigneesByCard: Map<string, string[]>;
   subsById: Map<string, Subscriber>;
   canEdit: boolean;
+  canReorderColumns: boolean;
   onMove: (id: string, col: string, pos: number) => void;
+  onColumnMove: (sourceId: string, targetId: string) => void;
   onAddClick: (columnId: string) => void;
   onCardClick: (cardId: string) => void;
 }) {
@@ -229,7 +261,9 @@ function ColumnsView({
           assigneesByCard={assigneesByCard}
           subsById={subsById}
           canEdit={canEdit}
+          canReorderColumns={canReorderColumns}
           onMove={onMove}
+          onColumnMove={onColumnMove}
           onAdd={() => onAddClick(col.id)}
           onCardClick={onCardClick}
         />
@@ -239,20 +273,24 @@ function ColumnsView({
 }
 
 function ColumnLane({
-  column, cards, assigneesByCard, subsById, canEdit,
-  onMove, onAdd, onCardClick,
+  column, cards, assigneesByCard, subsById, canEdit, canReorderColumns,
+  onMove, onColumnMove, onAdd, onCardClick,
 }: {
   column: Column;
   cards: Card[];
   assigneesByCard: Map<string, string[]>;
   subsById: Map<string, Subscriber>;
   canEdit: boolean;
+  canReorderColumns: boolean;
   onMove: (id: string, col: string, pos: number) => void;
+  onColumnMove: (sourceId: string, targetId: string) => void;
   onAdd: () => void;
   onCardClick: (id: string) => void;
 }) {
   const [dropIndex, setDropIndex] = useState<number | null>(null);
-  const [isOver, setIsOver] = useState(false);
+  const [isOverForCard, setIsOverForCard] = useState(false);
+  const [isOverForCol, setIsOverForCol] = useState(false);
+  const [colDragging, setColDragging] = useState(false);
   const laneRef = useRef<HTMLDivElement>(null);
 
   function computeIndex(e: React.DragEvent) {
@@ -267,27 +305,63 @@ function ColumnLane({
   }
 
   return (
-    <div className={`w-72 flex-shrink-0 bg-slate-100 rounded-xl flex flex-col
-        ${isOver ? 'ring-2 ring-indigo-400' : ''}`}
-      onDragEnter={e => { e.preventDefault(); setIsOver(true); }}
-      onDragOver={e => {
-        e.preventDefault();
+    <div className={`w-72 flex-shrink-0 bg-slate-100 rounded-xl flex flex-col transition
+        ${isOverForCard ? 'ring-2 ring-indigo-400' : ''}
+        ${isOverForCol  ? 'ring-2 ring-emerald-400 ring-offset-2' : ''}
+        ${colDragging   ? 'opacity-40' : ''}`}
+      onDragEnter={e => {
         if (e.dataTransfer.types.includes('text/card-id')) {
+          e.preventDefault();
+          setIsOverForCard(true);
+        }
+      }}
+      onDragOver={e => {
+        if (e.dataTransfer.types.includes('text/card-id')) {
+          e.preventDefault();
           setDropIndex(computeIndex(e));
         }
       }}
       onDragLeave={e => {
         if (e.currentTarget.contains(e.relatedTarget as Node)) return;
-        setIsOver(false); setDropIndex(null);
+        setIsOverForCard(false); setDropIndex(null);
       }}
       onDrop={e => {
-        e.preventDefault();
-        const cardId = e.dataTransfer.getData('text/card-id');
-        const idx = computeIndex(e);
-        setIsOver(false); setDropIndex(null);
-        if (cardId) onMove(cardId, column.id, idx);
+        const types = e.dataTransfer.types;
+        if (types.includes('text/card-id')) {
+          e.preventDefault();
+          const cardId = e.dataTransfer.getData('text/card-id');
+          const idx = computeIndex(e);
+          setIsOverForCard(false); setDropIndex(null);
+          if (cardId) onMove(cardId, column.id, idx);
+        }
       }}>
-      <header className="px-3 py-2.5 flex items-center justify-between">
+      <header
+        draggable={canReorderColumns}
+        onDragStart={e => {
+          if (!canReorderColumns) return;
+          e.dataTransfer.setData('text/column-id', column.id);
+          e.dataTransfer.effectAllowed = 'move';
+          setColDragging(true);
+          e.stopPropagation();
+        }}
+        onDragEnd={() => setColDragging(false)}
+        onDragOver={e => {
+          if (e.dataTransfer.types.includes('text/column-id')) {
+            e.preventDefault(); e.stopPropagation();
+            setIsOverForCol(true);
+          }
+        }}
+        onDragLeave={() => setIsOverForCol(false)}
+        onDrop={e => {
+          if (e.dataTransfer.types.includes('text/column-id')) {
+            e.preventDefault(); e.stopPropagation();
+            const sourceId = e.dataTransfer.getData('text/column-id');
+            setIsOverForCol(false);
+            if (sourceId && sourceId !== column.id) onColumnMove(sourceId, column.id);
+          }
+        }}
+        className={`px-3 py-2.5 flex items-center justify-between select-none
+          ${canReorderColumns ? 'cursor-grab active:cursor-grabbing' : ''}`}>
         <div className="flex items-center gap-2">
           <h3 className="text-xs font-semibold uppercase tracking-wider text-slate-600">
             {column.name}

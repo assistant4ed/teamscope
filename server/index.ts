@@ -370,6 +370,85 @@ app.post('/api/team/subscribers/:id/toggle',
   }
 );
 
+// Update an existing subscriber's editable fields (boss only).
+app.patch('/api/team/subscribers/:id',
+  requireRole('boss'),
+  async (req, res) => {
+    const b = req.body || {};
+    const allowed = ['name', 'role', 'timezone',
+                     'slot_morning', 'slot_midday', 'slot_eod',
+                     'working_days', 'active', 'telegram_chat_id'] as const;
+    const sets: string[] = [];
+    const vals: unknown[] = [];
+    for (const k of allowed) {
+      if (b[k] !== undefined) {
+        sets.push(`${k} = $${sets.length + 1}`);
+        vals.push(b[k]);
+      }
+    }
+    if (sets.length === 0) return res.status(400).json({ error: 'no fields to update' });
+    vals.push(req.params.id);
+    try {
+      const rows = await query(
+        `UPDATE ops.report_subscribers SET ${sets.join(', ')}, updated_at = now()
+          WHERE id = $${vals.length}
+        RETURNING id, telegram_chat_id, name, role, timezone,
+                  slot_morning, slot_midday, slot_eod, working_days, active`,
+        vals
+      );
+      if (rows.length === 0) return res.status(404).json({ error: 'not_found' });
+      res.json({ subscriber: rows[0] });
+    } catch (e) {
+      res.status(500).json({ error: (e as Error).message });
+    }
+  }
+);
+
+app.delete('/api/team/subscribers/:id',
+  requireRole('boss'),
+  async (req, res) => {
+    try {
+      const rows = await query(
+        `DELETE FROM ops.report_subscribers WHERE id = $1 RETURNING id, name`,
+        [req.params.id]
+      );
+      if (rows.length === 0) return res.status(404).json({ error: 'not_found' });
+      res.json({ deleted: rows[0] });
+    } catch (e) {
+      res.status(500).json({ error: (e as Error).message });
+    }
+  }
+);
+
+// Full details for the edit modal — includes last 5 reports + last active.
+app.get('/api/team/subscribers/:id',
+  async (req, res) => {
+    try {
+      const [sub, reports] = await Promise.all([
+        query(
+          `SELECT id, telegram_chat_id, name, role, timezone,
+                  slot_morning, slot_midday, slot_eod, working_days,
+                  active, created_at, updated_at
+             FROM ops.report_subscribers WHERE id = $1`,
+          [req.params.id]
+        ),
+        query(
+          `SELECT report_date, goals, mid_progress, mid_issues,
+                  eod_completed, eod_unfinished, eod_hours, updated_at
+             FROM ops.daily_reports
+            WHERE subscriber_id = $1
+            ORDER BY report_date DESC LIMIT 5`,
+          [req.params.id]
+        ),
+      ]);
+      if (sub.length === 0) return res.status(404).json({ error: 'not_found' });
+      res.json({ subscriber: sub[0], recent_reports: reports });
+    } catch (e) {
+      res.status(500).json({ error: (e as Error).message });
+    }
+  }
+);
+
 // Create a new daily-report subscriber so 03 · Report Prompter will DM them
 // at the three slot times (morning/midday/eod in their timezone).
 app.post('/api/team/subscribers',

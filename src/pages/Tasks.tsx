@@ -1,6 +1,8 @@
 import React, { useEffect, useState } from 'react';
-import { apiGet, apiPost, Me } from '../auth';
-import { CheckCircle2, PlayCircle, XCircle, RefreshCw } from 'lucide-react';
+import { apiGet, apiFetch, apiPost, Me } from '../auth';
+import {
+  CheckCircle2, PlayCircle, XCircle, RefreshCw, Kanban, X,
+} from 'lucide-react';
 
 interface Task {
   correlation_id: string;
@@ -15,12 +17,18 @@ interface Task {
   requester_role: string | null;
 }
 
+interface Column { id: string; name: string; is_done: boolean }
+interface Subscriber { id: string; name: string; active: boolean }
+
 export default function Tasks({ me }: { me: Me }) {
   const [tasks, setTasks] = useState<Task[]>([]);
+  const [columns, setColumns] = useState<Column[]>([]);
+  const [subs, setSubs] = useState<Subscriber[]>([]);
   const [loading, setLoading] = useState(true);
   const [err, setErr] = useState<string | null>(null);
   const [scope, setScope] = useState<'all' | 'mine'>(me.role === 'pa' ? 'mine' : 'all');
   const [busy, setBusy] = useState<string | null>(null);
+  const [promote, setPromote] = useState<Task | null>(null);
 
   async function load() {
     setLoading(true);
@@ -32,7 +40,18 @@ export default function Tasks({ me }: { me: Me }) {
     finally { setLoading(false); }
   }
 
+  // Lightweight load of the Kanban targets so we can populate the
+  // promote-to-card modal without opening the Board first.
+  async function loadKanbanTargets() {
+    try {
+      const d = await apiGet<{ columns: Column[]; subscribers: Subscriber[] }>('/api/kanban/board');
+      setColumns(d.columns);
+      setSubs(d.subscribers);
+    } catch { /* non-fatal — promote button will still work once columns exist */ }
+  }
+
   useEffect(() => { load(); }, [scope]);
+  useEffect(() => { loadKanbanTargets(); }, []);
 
   async function act(id: string, verb: 'claim' | 'complete' | 'cancel') {
     setBusy(id + ':' + verb);
@@ -79,16 +98,29 @@ export default function Tasks({ me }: { me: Me }) {
       )}
 
       <ul className="space-y-3">
-        {tasks.map(t => <TaskCard key={t.correlation_id} t={t} me={me} busy={busy} act={act} />)}
+        {tasks.map(t => (
+          <TaskCard key={t.correlation_id}
+            t={t} me={me} busy={busy} act={act}
+            onPromote={() => setPromote(t)}
+          />
+        ))}
       </ul>
+
+      {promote && (
+        <PromoteModal task={promote}
+          columns={columns} subscribers={subs}
+          onDone={() => { setPromote(null); load(); }}
+          onClose={() => setPromote(null)} />
+      )}
     </div>
   );
 }
 
-function TaskCard({ t, me, busy, act }: {
+function TaskCard({ t, me, busy, act, onPromote }: {
   t: Task; me: Me;
   busy: string | null;
   act: (id: string, verb: 'claim' | 'complete' | 'cancel') => void;
+  onPromote: () => void;
 }) {
   const canAct = me.role === 'pa' || me.role === 'boss';
 
@@ -121,11 +153,15 @@ function TaskCard({ t, me, busy, act }: {
 
       {canAct && t.status !== 'completed' && t.status !== 'cancelled' && (
         <div className="mt-4 flex flex-wrap gap-2 pt-4 border-t border-slate-100">
+          <ActionBtn onClick={onPromote}
+            busy={false}
+            icon={<Kanban className="w-4 h-4" />} label="Promote to card"
+            color="indigo" />
           {t.status !== 'in_progress' && (
             <ActionBtn onClick={() => act(t.correlation_id, 'claim')}
               busy={busy === t.correlation_id + ':claim'}
               icon={<PlayCircle className="w-4 h-4" />} label="Claim / Start"
-              color="indigo" />
+              color="slate" />
           )}
           <ActionBtn onClick={() => act(t.correlation_id, 'complete')}
             busy={busy === t.correlation_id + ':complete'}
@@ -140,6 +176,141 @@ function TaskCard({ t, me, busy, act }: {
         </div>
       )}
     </li>
+  );
+}
+
+function PromoteModal({ task, columns, subscribers, onDone, onClose }: {
+  task: Task;
+  columns: Column[];
+  subscribers: Subscriber[];
+  onDone: () => void;
+  onClose: () => void;
+}) {
+  // Default to the first non-done column (usually "Backlog" or "Today").
+  const defaultCol = columns.find(c => !c.is_done)?.id || columns[0]?.id || '';
+  const [columnId, setColumnId] = useState(defaultCol);
+  const [title, setTitle] = useState(
+    (task.origin_text || task.kind || '').slice(0, 200)
+  );
+  const [assignees, setAssignees] = useState<string[]>([]);
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+
+  function toggleAssignee(id: string) {
+    if (assignees.includes(id)) setAssignees(assignees.filter(x => x !== id));
+    else if (assignees.length < 5) setAssignees([...assignees, id]);
+  }
+
+  async function submit(e: React.FormEvent) {
+    e.preventDefault();
+    setBusy(true); setErr(null);
+    try {
+      const res = await apiFetch(
+        `/api/kanban/cards/from-action/${encodeURIComponent(task.correlation_id)}`,
+        {
+          method: 'POST',
+          body: JSON.stringify({
+            column_id: columnId,
+            title: title.trim() || undefined,
+            assignee_ids: assignees,
+          }),
+        }
+      );
+      if (!res.ok) {
+        const body = await res.json().catch(() => ({}));
+        throw new Error(body.error || `HTTP ${res.status}`);
+      }
+      onDone();
+    } catch (e) { setErr((e as Error).message); }
+    finally { setBusy(false); }
+  }
+
+  const canSubmit = !!columnId && !!title.trim() && !busy;
+  const noColumns = columns.length === 0;
+
+  return (
+    <div className="fixed inset-0 z-50 bg-slate-900/40 grid place-items-center p-4"
+         onMouseDown={e => { if (e.target === e.currentTarget) onClose(); }}>
+      <form onSubmit={submit}
+        className="bg-white rounded-2xl w-full max-w-lg shadow-2xl overflow-hidden max-h-[92vh] flex flex-col">
+        <header className="flex items-center justify-between px-6 py-4 border-b border-slate-100">
+          <div>
+            <h3 className="text-lg font-bold text-slate-900">Promote to Board card</h3>
+            <p className="text-xs text-slate-400 mt-0.5">
+              Marks the queue task done and creates a trackable card on the Board.
+            </p>
+          </div>
+          <button type="button" onClick={onClose}
+            className="text-slate-400 hover:text-slate-600">
+            <X className="w-5 h-5" />
+          </button>
+        </header>
+        <div className="p-6 space-y-4 overflow-y-auto">
+          {noColumns && (
+            <div className="text-xs text-amber-800 bg-amber-50 border border-amber-200 rounded-lg p-2">
+              No Kanban columns exist yet. Open the Board tab once to initialise them.
+            </div>
+          )}
+          <label className="block">
+            <span className="text-xs font-medium text-slate-700">Card title</span>
+            <textarea value={title} onChange={e => setTitle(e.target.value)}
+              rows={2}
+              className="mt-1 w-full border border-slate-200 rounded-lg px-3 py-2 text-sm" />
+          </label>
+          <label className="block">
+            <span className="text-xs font-medium text-slate-700">Column</span>
+            <select value={columnId} onChange={e => setColumnId(e.target.value)}
+              className="mt-1 w-full border border-slate-200 rounded-lg px-3 py-2 text-sm">
+              {columns.map(c => (
+                <option key={c.id} value={c.id}>{c.name}</option>
+              ))}
+            </select>
+          </label>
+          <div>
+            <div className="text-xs font-medium text-slate-700 mb-1">
+              Assignees ({assignees.length}/5)
+            </div>
+            <div className="flex flex-wrap gap-1.5">
+              {subscribers.filter(s => s.active).map(s => {
+                const on = assignees.includes(s.id);
+                return (
+                  <button key={s.id} type="button" onClick={() => toggleAssignee(s.id)}
+                    disabled={!on && assignees.length >= 5}
+                    className={`px-2 py-1 rounded-lg text-xs border transition
+                      disabled:opacity-30 disabled:cursor-not-allowed
+                      ${on
+                        ? 'bg-indigo-50 border-indigo-300 text-indigo-800'
+                        : 'bg-white border-slate-200 text-slate-600 hover:border-slate-300'}`}>
+                    {s.name}
+                  </button>
+                );
+              })}
+              {subscribers.filter(s => s.active).length === 0 && (
+                <p className="text-xs text-slate-400">
+                  No active subscribers — add teammates on the Team page.
+                </p>
+              )}
+            </div>
+          </div>
+          {err && (
+            <div className="text-xs text-rose-700 bg-rose-50 border border-rose-200 rounded-lg p-2">
+              {err}
+            </div>
+          )}
+        </div>
+        <footer className="px-6 py-4 border-t border-slate-100 bg-slate-50 flex items-center justify-end gap-2">
+          <button type="button" onClick={onClose}
+            className="px-4 py-2 text-sm text-slate-600 hover:bg-slate-100 rounded-lg">
+            Cancel
+          </button>
+          <button type="submit" disabled={!canSubmit || noColumns}
+            className="px-4 py-2 text-sm font-medium bg-slate-900 hover:bg-slate-800
+                       disabled:opacity-40 text-white rounded-lg">
+            {busy ? 'Promoting…' : 'Create card'}
+          </button>
+        </footer>
+      </form>
+    </div>
   );
 }
 

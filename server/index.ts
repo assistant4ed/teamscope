@@ -833,6 +833,92 @@ app.delete('/api/kanban/cards/:id',
   }
 );
 
+// Promote an AI-classified pending_action into a Kanban card. Closes
+// out the pending_action so the Queue stops re-offering it, and keeps
+// the original correlation_id in card.source_ref for traceability.
+app.post('/api/kanban/cards/from-action/:correlation_id',
+  requireRole('boss', 'pa'),
+  async (req, res) => {
+    const correlationId = String(req.params.correlation_id);
+    const columnId = req.body?.column_id as string;
+    const assigneeIds: string[] = Array.isArray(req.body?.assignee_ids) ? req.body.assignee_ids : [];
+    const titleOverride = (req.body?.title as string || '').trim();
+    if (!columnId) return res.status(400).json({ error: 'column_id required' });
+    if (assigneeIds.length > 5) return res.status(400).json({ error: 'max 5 assignees per card' });
+
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      const action = await client.query(
+        `SELECT pa.correlation_id, pa.kind, pa.payload, pa.profile_id,
+                m.text AS origin_text
+           FROM ops.pending_actions pa
+      LEFT JOIN ops.messages m ON m.id = pa.message_id
+          WHERE pa.correlation_id = $1`,
+        [correlationId]
+      );
+      if (action.rowCount === 0) {
+        await client.query('ROLLBACK');
+        return res.status(404).json({ error: 'not_found' });
+      }
+      const a = action.rows[0];
+      const title = (titleOverride || a.origin_text || a.kind || 'Untitled').slice(0, 200);
+
+      const posRow = await client.query(
+        `SELECT COALESCE(MAX(position), -1) + 1 AS next_pos
+           FROM ops.kanban_cards
+          WHERE column_id = $1 AND deleted_at IS NULL`,
+        [columnId]
+      );
+      const cardRow = await client.query(
+        `INSERT INTO ops.kanban_cards
+           (column_id, title, description, priority, position,
+            created_by, source_kind, source_ref)
+         VALUES ($1, $2, $3, 'medium', $4, $5, 'agent', $6)
+         RETURNING id, column_id, title, description, priority, position,
+                   created_by, created_at, source_kind, source_ref`,
+        [columnId, title, a.origin_text, posRow.rows[0].next_pos,
+         req.user!.email, correlationId]
+      );
+      const card = cardRow.rows[0];
+
+      for (const sid of assigneeIds) {
+        await client.query(
+          `INSERT INTO ops.kanban_assignees (card_id, subscriber_id, assigned_by)
+           VALUES ($1, $2, $3) ON CONFLICT DO NOTHING`,
+          [card.id, sid, req.user!.email]
+        );
+      }
+
+      await client.query(
+        `UPDATE ops.pending_actions
+            SET status = 'completed', resolved_at = now()
+          WHERE correlation_id = $1`,
+        [correlationId]
+      );
+      await client.query(
+        `INSERT INTO ops.actions_log
+           (correlation_id, profile_id, domain, action, executor, outcome)
+         VALUES ($1, $2, 'kanban', 'promote_to_card', $3, 'success')`,
+        [correlationId, a.profile_id, req.user!.role]
+      );
+      await client.query('COMMIT');
+
+      await logActivity(req.user!.email, card.id, 'card.created', {
+        title, column_id: columnId, assignees: assigneeIds,
+        source_kind: 'agent', source_ref: correlationId,
+      });
+
+      res.json({ card, promoted: correlationId });
+    } catch (e) {
+      await client.query('ROLLBACK').catch(() => {});
+      res.status(500).json({ error: (e as Error).message });
+    } finally {
+      client.release();
+    }
+  }
+);
+
 // Column CRUD ------------------------------------------------------- //
 app.post('/api/kanban/columns',
   requireRole('boss'),

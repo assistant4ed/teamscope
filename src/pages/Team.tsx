@@ -1,4 +1,5 @@
 import React, { useEffect, useState } from 'react';
+import { UserPlus, X } from 'lucide-react';
 import { apiGet, apiPost, Me } from '../auth';
 
 interface Subscriber {
@@ -16,6 +17,7 @@ export default function Team({ me }: { me: Me }) {
   const [subs, setSubs] = useState<Subscriber[]>([]);
   const [profiles, setProfiles] = useState<Profile[]>([]);
   const [roster, setRoster] = useState<{email:string;role:string}[]>([]);
+  const [showAdd, setShowAdd] = useState(false);
 
   async function load() {
     const d = await apiGet<{ subscribers: Subscriber[]; profiles: Profile[] }>('/api/team');
@@ -39,9 +41,21 @@ export default function Team({ me }: { me: Me }) {
       <p className="text-sm text-slate-500 mb-6">Subscribers for daily reports + web-app users.</p>
 
       <section className="mb-8">
-        <h2 className="text-sm font-semibold text-slate-500 uppercase tracking-wider mb-3">
-          Daily-report subscribers
-        </h2>
+        <div className="flex items-center justify-between mb-3">
+          <h2 className="text-sm font-semibold text-slate-500 uppercase tracking-wider">
+            Daily-report subscribers
+          </h2>
+          {me.role === 'boss' && (
+            <button onClick={() => setShowAdd(true)}
+              className="inline-flex items-center gap-1.5 text-xs font-medium
+                         bg-indigo-50 text-indigo-700 hover:bg-indigo-100
+                         px-3 py-1.5 rounded-lg">
+              <UserPlus className="w-3.5 h-3.5" /> Add subscriber
+            </button>
+          )}
+        </div>
+        {showAdd && <AddSubscriberModal onDone={() => { setShowAdd(false); load(); }}
+                                         onClose={() => setShowAdd(false)} />}
         <div className="bg-white border border-slate-200 rounded-xl overflow-hidden">
           <table className="w-full text-sm">
             <thead className="bg-slate-50 text-slate-500 text-xs uppercase">
@@ -140,4 +154,98 @@ const Th = ({ children }: { children?: React.ReactNode }) => (
 );
 const Td = ({ children, className = '' }: { children?: React.ReactNode; className?: string }) => (
   <td className={`px-4 py-2 ${className}`}>{children}</td>
+);
+
+function AddSubscriberModal({ onDone, onClose }: { onDone: () => void; onClose: () => void }) {
+  const [name, setName] = useState('');
+  const [chatId, setChatId] = useState('');
+  const [role, setRole] = useState('colleague');
+  const [tz, setTz] = useState('Asia/Singapore');
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+
+  async function submit(e: React.FormEvent) {
+    e.preventDefault();
+    setBusy(true); setErr(null);
+    try {
+      await apiPost('/api/team/subscribers', {
+        name, telegram_chat_id: Number(chatId), role, timezone: tz,
+      });
+      onDone();
+    } catch (e) { setErr(String(e)); }
+    finally { setBusy(false); }
+  }
+
+  return (
+    <div className="fixed inset-0 z-50 bg-slate-900/40 grid place-items-center p-4">
+      <form onSubmit={submit}
+        className="bg-white rounded-2xl p-6 w-full max-w-md space-y-4 shadow-2xl">
+        <div className="flex items-center justify-between">
+          <h3 className="text-lg font-bold text-slate-900">Add daily-report subscriber</h3>
+          <button type="button" onClick={onClose} className="text-slate-400 hover:text-slate-600">
+            <X className="w-5 h-5" />
+          </button>
+        </div>
+        <p className="text-xs text-slate-500">
+          They'll receive Telegram DMs at 09:00 · 13:30 · 18:30 (SGT) asking
+          for morning goals / mid-day progress / end-of-day summary.
+        </p>
+        <Field label="Name">
+          <input required value={name} onChange={e => setName(e.target.value)}
+            placeholder="Meghan Ang"
+            className="w-full border border-slate-200 rounded-lg px-3 py-2 text-sm" />
+        </Field>
+        <Field label="Telegram chat ID"
+          hint="Ask them to DM @userinfobot → copy the numeric id it replies with.">
+          <input required value={chatId} onChange={e => setChatId(e.target.value)}
+            placeholder="5246139725"
+            className="w-full border border-slate-200 rounded-lg px-3 py-2 text-sm font-mono" />
+        </Field>
+        <div className="grid grid-cols-2 gap-3">
+          <Field label="Role">
+            <select value={role} onChange={e => setRole(e.target.value)}
+              className="w-full border border-slate-200 rounded-lg px-3 py-2 text-sm">
+              <option value="colleague">Colleague</option>
+              <option value="pa">PA</option>
+              <option value="designer">Designer</option>
+              <option value="dev">Developer</option>
+              <option value="sales">Sales</option>
+            </select>
+          </Field>
+          <Field label="Timezone">
+            <select value={tz} onChange={e => setTz(e.target.value)}
+              className="w-full border border-slate-200 rounded-lg px-3 py-2 text-sm">
+              <option>Asia/Singapore</option>
+              <option>Asia/Kuala_Lumpur</option>
+              <option>Asia/Hong_Kong</option>
+              <option>Asia/Taipei</option>
+              <option>Asia/Shanghai</option>
+              <option>Asia/Tokyo</option>
+              <option>UTC</option>
+            </select>
+          </Field>
+        </div>
+        {err && <div className="text-xs text-rose-700 bg-rose-50 border border-rose-200 rounded-lg p-2">{err}</div>}
+        <div className="flex justify-end gap-2 pt-2">
+          <button type="button" onClick={onClose}
+            className="px-4 py-2 text-sm text-slate-600 hover:bg-slate-100 rounded-lg">
+            Cancel
+          </button>
+          <button type="submit" disabled={busy}
+            className="px-4 py-2 text-sm font-medium bg-slate-900 hover:bg-slate-800
+                       disabled:opacity-40 text-white rounded-lg">
+            {busy ? 'Adding…' : 'Add subscriber'}
+          </button>
+        </div>
+      </form>
+    </div>
+  );
+}
+
+const Field = ({ label, hint, children }: { label: string; hint?: string; children: React.ReactNode }) => (
+  <label className="block">
+    <span className="text-xs font-medium text-slate-700">{label}</span>
+    <div className="mt-1">{children}</div>
+    {hint && <p className="text-[11px] text-slate-400 mt-1">{hint}</p>}
+  </label>
 );

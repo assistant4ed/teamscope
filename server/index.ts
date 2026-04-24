@@ -370,6 +370,77 @@ app.post('/api/team/subscribers/:id/toggle',
   }
 );
 
+// Create a new daily-report subscriber so 03 · Report Prompter will DM them
+// at the three slot times (morning/midday/eod in their timezone).
+app.post('/api/team/subscribers',
+  requireRole('boss'),
+  async (req, res) => {
+    const b = req.body || {};
+    const name = (b.name as string || '').trim();
+    const telegram = Number(b.telegram_chat_id);
+    const role = (b.role as string || 'colleague').trim();
+    const tz = (b.timezone as string || 'Asia/Singapore').trim();
+    if (!name || !telegram) {
+      return res.status(400).json({ error: 'name + telegram_chat_id required' });
+    }
+    try {
+      const rows = await query(
+        `INSERT INTO ops.report_subscribers
+           (telegram_chat_id, name, role, timezone)
+         VALUES ($1::bigint, $2, $3, $4)
+         ON CONFLICT (telegram_chat_id)
+           DO UPDATE SET name = EXCLUDED.name, role = EXCLUDED.role,
+                         timezone = EXCLUDED.timezone, active = true,
+                         updated_at = now()
+         RETURNING id, telegram_chat_id, name, role, timezone,
+                   slot_morning, slot_midday, slot_eod, active`,
+        [telegram, name, role, tz]
+      );
+      res.json({ subscriber: rows[0] });
+    } catch (e) {
+      res.status(500).json({ error: (e as Error).message });
+    }
+  }
+);
+
+// AI-generated summary of today's reports (sent through the same
+// n8n agent webhook so formatting + tone stay consistent).
+app.post('/api/agent/summary',
+  requireRole('boss', 'pa'),
+  async (_req, res) => {
+    try {
+      const rows = await query(
+        `SELECT s.name, s.role, d.report_date, d.goals, d.mid_progress,
+                d.mid_issues, d.eod_completed, d.eod_unfinished, d.eod_hours
+           FROM ops.report_subscribers s
+      LEFT JOIN ops.daily_reports d
+             ON d.subscriber_id = s.id
+            AND d.report_date = (now() AT TIME ZONE s.timezone)::date
+          WHERE s.active = true`
+      );
+      if (rows.length === 0) {
+        return res.json({ summary: 'No active subscribers yet. Add teammates in the Team tab.' });
+      }
+      const prompt =
+        'Produce a 3-4 sentence standup-style brief for a manager based on this team data. ' +
+        'Flag blockers, missing reports, and hours worked.\n\n' +
+        JSON.stringify(rows, null, 2);
+      const upstream = await fetch(N8N_AGENT_URL, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ text: prompt, user_email: 'teamscope-dashboard' }),
+      });
+      const data = await upstream.json().catch(() => ({} as any));
+      res.json({
+        summary: data?.classification?.suggested_response || '(no summary)',
+        rows: rows.length,
+      });
+    } catch (e) {
+      res.status(500).json({ error: (e as Error).message });
+    }
+  }
+);
+
 // ---------- Messages ---------------------------------------------- //
 app.get('/api/messages/recent', async (req, res) => {
   const limit = Math.min(100, Math.max(1, Number(req.query.limit ?? 30)));

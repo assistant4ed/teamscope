@@ -193,7 +193,8 @@ app.get('/api/reports/recent', async (req, res) => {
   try {
     const rows = await query(
       `SELECT d.id, d.subscriber_id, s.name AS subscriber_name, s.role AS subscriber_role,
-              d.report_date, d.goals,
+              to_char(d.report_date, 'YYYY-MM-DD') AS report_date,
+              d.goals,
               d.mid_progress, d.mid_issues, d.mid_changes,
               d.eod_completed, d.eod_unfinished, d.eod_hours, d.updated_at
          FROM ops.daily_reports d

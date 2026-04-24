@@ -11,7 +11,7 @@ interface Report {
   subscriber_id: string;
   subscriber_name: string;
   subscriber_role: string | null;
-  report_date: string;
+  report_date: string | null;
   goals: string | null;
   mid_progress: string | null;
   mid_issues: string | null;
@@ -22,7 +22,35 @@ interface Report {
   updated_at: string;
 }
 
-const todayISO = () => new Date().toISOString().slice(0, 10);
+interface SubscriberRef {
+  id: string; name: string;
+  role: string | null; active: boolean;
+}
+
+// Use the viewer's local date, not UTC — a boss in Singapore should
+// see their 02:00 SGT log under "Today", not "Yesterday".
+const todayLocalISO = () => {
+  const d = new Date();
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+};
+
+// Accept either "YYYY-MM-DD" or an ISO timestamp; always return a
+// stable YYYY-MM-DD or null. Guards against the legacy date
+// serialisation that made rows show up as "Invalid Date".
+function toISODate(raw: string | null | undefined): string | null {
+  if (!raw) return null;
+  if (/^\d{4}-\d{2}-\d{2}$/.test(raw)) return raw;
+  const d = new Date(raw);
+  if (isNaN(d.getTime())) return null;
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+}
+
+function formatDateLabel(raw: string | null): string {
+  const iso = toISODate(raw);
+  if (!iso) return 'No date';
+  return new Date(iso + 'T00:00:00').toLocaleDateString(undefined,
+    { weekday: 'long', month: 'short', day: 'numeric' });
+}
 
 export default function Reports() {
   const [reports, setReports] = useState<Report[]>([]);
@@ -35,6 +63,7 @@ export default function Reports() {
   // report_id → count of cards already imported. Drives the button state
   // so re-clicks (or a reload) can't double-create.
   const [importedById, setImportedById] = useState<Map<string, number>>(new Map());
+  const [subscribers, setSubscribers] = useState<SubscriberRef[]>([]);
 
   async function load() {
     setLoading(true);
@@ -55,6 +84,13 @@ export default function Reports() {
       setImportedById(m);
     } catch {/* non-fatal; button just defaults to "Import" state */}
   }
+  // Subscribers live independently of the reports window so every active
+  // teammate shows up in the filter — even if they haven't filed yet.
+  useEffect(() => {
+    apiGet<{ subscribers: SubscriberRef[] }>('/api/team')
+      .then(d => setSubscribers(d.subscribers))
+      .catch(() => {/* dropdown falls back to the derive-from-reports list */});
+  }, []);
   useEffect(() => { load(); }, [days]);
 
   async function generateSummary() {
@@ -66,15 +102,22 @@ export default function Reports() {
     finally { setGenLoading(false); }
   }
 
-  const today = todayISO();
-  const todayReports = reports.filter(r => r.report_date === today);
+  const today = todayLocalISO();
+  const todayReports = reports.filter(r => toISODate(r.report_date) === today);
   const todayFiled = todayReports.filter(r =>
     r.goals || r.mid_progress || r.eod_completed).length;
+  // Dropdown = every active subscriber. If the /api/team fetch hasn't
+  // landed yet, fall back to deriving from reports so the control is
+  // never empty.
   const subs = useMemo(() => {
+    if (subscribers.length > 0) {
+      return subscribers.filter(s => s.active).map<[string, string]>(s => [s.id, s.name]);
+    }
     const m = new Map<string, string>();
     reports.forEach(r => m.set(r.subscriber_id, r.subscriber_name));
     return Array.from(m.entries());
-  }, [reports]);
+  }, [subscribers, reports]);
+  const activeSubCount = subscribers.filter(s => s.active).length || todayReports.length;
   const totalIssues = todayReports.filter(r => r.mid_issues).length;
   const totalHours = todayReports.reduce((s, r) => s + (Number(r.eod_hours) || 0), 0);
 
@@ -85,11 +128,18 @@ export default function Reports() {
   const byDate = useMemo(() => {
     const m = new Map<string, Report[]>();
     filtered.forEach(r => {
-      const arr = m.get(r.report_date) ?? [];
+      // Normalise to YYYY-MM-DD or '__nodate' so malformed/null rows still
+      // render instead of collapsing under an "Invalid Date" heading.
+      const key = toISODate(r.report_date) ?? '__nodate';
+      const arr = m.get(key) ?? [];
       arr.push(r);
-      m.set(r.report_date, arr);
+      m.set(key, arr);
     });
-    return Array.from(m.entries()).sort((a, b) => b[0].localeCompare(a[0]));
+    return Array.from(m.entries()).sort((a, b) => {
+      if (a[0] === '__nodate') return 1;
+      if (b[0] === '__nodate') return -1;
+      return b[0].localeCompare(a[0]);
+    });
   }, [filtered]);
 
   return (
@@ -139,7 +189,7 @@ export default function Reports() {
         <StatCard
           label="Active subscribers"
           icon={<UserIcon className="w-4 h-4 text-indigo-500" />}
-          value={todayReports.length}
+          value={activeSubCount}
           sub="receiving prompts"
         />
         <StatCard
@@ -200,8 +250,7 @@ export default function Reports() {
           {byDate.map(([date, rows]) => (
             <section key={date}>
               <h3 className="text-xs uppercase tracking-widest text-slate-500 font-bold mb-3 px-1">
-                {new Date(date + 'T00:00:00').toLocaleDateString(undefined,
-                  { weekday: 'long', month: 'short', day: 'numeric' })}
+                {date === '__nodate' ? 'No date recorded' : formatDateLabel(date)}
                 {date === today && <span className="ml-2 text-indigo-600">· Today</span>}
               </h3>
               <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-3">

@@ -403,8 +403,11 @@ app.post('/api/team/subscribers',
   }
 );
 
-// AI-generated summary of today's reports (sent through the same
-// n8n agent webhook so formatting + tone stay consistent).
+// AI-generated summary of today's reports. Calls Anthropic directly with
+// a dedicated summarizer prompt — does NOT go through the router (which
+// would flag the structured request as a potential prompt injection).
+const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY || '';
+
 app.post('/api/agent/summary',
   requireRole('boss', 'pa'),
   async (_req, res) => {
@@ -421,20 +424,37 @@ app.post('/api/agent/summary',
       if (rows.length === 0) {
         return res.json({ summary: 'No active subscribers yet. Add teammates in the Team tab.' });
       }
-      const prompt =
-        'Produce a 3-4 sentence standup-style brief for a manager based on this team data. ' +
-        'Flag blockers, missing reports, and hours worked.\n\n' +
-        JSON.stringify(rows, null, 2);
-      const upstream = await fetch(N8N_AGENT_URL, {
+      if (!ANTHROPIC_API_KEY) {
+        return res.json({ summary: '(ANTHROPIC_API_KEY not configured on Railway)' });
+      }
+      const system =
+        "You are a concise executive operations analyst producing a standup brief. " +
+        "Given raw daily-report rows, write 3-4 sentences: who filed what, any blockers " +
+        "or missing slots, and total hours logged. Name people explicitly. Plain prose, " +
+        "no markdown.";
+      const userMessage =
+        "Today's report data (one row per active subscriber; null fields mean that " +
+        "slot hasn't been filled yet):\n\n" + JSON.stringify(rows, null, 2);
+      const upstream = await fetch('https://api.anthropic.com/v1/messages', {
         method: 'POST',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ text: prompt, user_email: 'teamscope-dashboard' }),
+        headers: {
+          'content-type': 'application/json',
+          'anthropic-version': '2023-06-01',
+          'x-api-key': ANTHROPIC_API_KEY,
+        },
+        body: JSON.stringify({
+          model: 'claude-sonnet-4-6',
+          max_tokens: 400,
+          system,
+          messages: [{ role: 'user', content: userMessage }],
+        }),
       });
       const data = await upstream.json().catch(() => ({} as any));
-      res.json({
-        summary: data?.classification?.suggested_response || '(no summary)',
-        rows: rows.length,
-      });
+      const text =
+        data?.content?.[0]?.text ||
+        data?.error?.message ||
+        '(Claude returned nothing — check ANTHROPIC_API_KEY.)';
+      res.json({ summary: text, rows: rows.length });
     } catch (e) {
       res.status(500).json({ error: (e as Error).message });
     }

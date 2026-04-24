@@ -3,6 +3,7 @@ import { apiGet } from '../auth';
 import {
   RefreshCw, MessageSquare, Send, Check, AlertTriangle, Bot,
   Kanban, Users, ArrowRight, Edit3, Trash2, UserPlus, UserMinus,
+  ArrowDownLeft, ArrowUpRight,
 } from 'lucide-react';
 
 interface Action {
@@ -43,15 +44,27 @@ interface BoardEvent {
 interface Subscriber {
   id: string; name: string; role: string | null;
   timezone: string; active: boolean;
+  telegram_chat_id?: number;
 }
 
-type Tab = 'board' | 'actions' | 'classifications';
+interface TelegramMsg {
+  id: string;
+  chat_id: number;
+  text: string;
+  direction: 'in' | 'out';
+  ts: string;
+  subscriber_name: string | null;
+  subscriber_role: string | null;
+}
+
+type Tab = 'board' | 'actions' | 'classifications' | 'telegram';
 
 export default function Activity() {
   const [tab, setTab] = useState<Tab>('board');
   const [actions, setActions] = useState<Action[]>([]);
   const [clas, setClas] = useState<Classification[]>([]);
   const [events, setEvents] = useState<BoardEvent[]>([]);
+  const [messages, setMessages] = useState<TelegramMsg[]>([]);
   const [subs, setSubs] = useState<Subscriber[]>([]);
   const [filterSub, setFilterSub] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
@@ -80,9 +93,19 @@ export default function Activity() {
       } else if (tab === 'actions') {
         const r = await apiGet<{ actions: Action[] }>('/api/agent/actions?limit=100');
         setActions(r.actions);
-      } else {
+      } else if (tab === 'classifications') {
         const r = await apiGet<{ classifications: Classification[] }>('/api/agent/classifications?limit=100');
         setClas(r.classifications);
+      } else {
+        // Telegram log. Filter by chat_id, not subscriber_id, so unmapped
+        // chats keep showing up until someone adds them as a subscriber.
+        const qs = new URLSearchParams({ limit: '200' });
+        if (filterSub) {
+          const s = subs.find(x => x.id === filterSub);
+          if (s?.telegram_chat_id) qs.set('chat_id', String(s.telegram_chat_id));
+        }
+        const r = await apiGet<{ messages: TelegramMsg[] }>(`/api/messages/recent?${qs}`);
+        setMessages(r.messages);
       }
     } finally { setLoading(false); }
   }
@@ -99,7 +122,7 @@ export default function Activity() {
           </p>
         </div>
         <div className="flex items-center gap-2 flex-wrap">
-          {tab === 'board' && (
+          {(tab === 'board' || tab === 'telegram') && (
             <label className="inline-flex items-center gap-2 bg-white border border-slate-200 rounded-lg px-2 py-1 text-xs">
               <Users className="w-3.5 h-3.5 text-slate-400" />
               <select value={filterSub ?? ''} onChange={e => setFilterSub(e.target.value || null)}
@@ -113,6 +136,7 @@ export default function Activity() {
           )}
           <div className="inline-flex bg-white border border-slate-200 rounded-lg p-0.5">
             <TabBtn active={tab==='board'} onClick={() => setTab('board')}>Board</TabBtn>
+            <TabBtn active={tab==='telegram'} onClick={() => setTab('telegram')}>Telegram</TabBtn>
             <TabBtn active={tab==='actions'} onClick={() => setTab('actions')}>AI Actions</TabBtn>
             <TabBtn active={tab==='classifications'} onClick={() => setTab('classifications')}>Classifications</TabBtn>
           </div>
@@ -126,10 +150,73 @@ export default function Activity() {
       {tab === 'board' && (
         <BoardEventsList events={events} subsById={subsById} />
       )}
+      {tab === 'telegram' && <TelegramList messages={messages} />}
       {tab === 'actions' && <ActionsList items={actions} />}
       {tab === 'classifications' && <ClassificationsList items={clas} />}
     </div>
   );
+}
+
+// ---------- Telegram messages list --------------------------------- //
+export function TelegramList({ messages }: { messages: TelegramMsg[] }) {
+  if (messages.length === 0) return <Empty>No Telegram messages yet.</Empty>;
+  const groups = new Map<string, TelegramMsg[]>();
+  for (const m of messages) {
+    const d = new Date(m.ts).toDateString();
+    const arr = groups.get(d) || [];
+    arr.push(m);
+    groups.set(d, arr);
+  }
+  return (
+    <div className="space-y-5">
+      {[...groups.entries()].map(([day, items]) => (
+        <section key={day}>
+          <h3 className="text-xs font-semibold text-slate-500 uppercase tracking-wider mb-2">
+            {tgDateLabel(new Date(day))}
+          </h3>
+          <ul className="bg-white border border-slate-200 rounded-xl overflow-hidden divide-y divide-slate-100">
+            {items.map(m => <TelegramRow key={m.id} m={m} />)}
+          </ul>
+        </section>
+      ))}
+    </div>
+  );
+}
+
+function TelegramRow({ m }: { m: TelegramMsg }) {
+  const isIn = m.direction === 'in';
+  const who = m.subscriber_name || `chat ${m.chat_id}`;
+  const when = new Date(m.ts).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+  return (
+    <li className="px-4 py-3 flex items-start gap-3 hover:bg-slate-50">
+      <div className={`w-8 h-8 rounded-full grid place-items-center flex-shrink-0
+        ${isIn ? 'bg-indigo-100 text-indigo-700' : 'bg-slate-100 text-slate-600'}`}>
+        {isIn
+          ? <ArrowDownLeft className="w-4 h-4" />
+          : <ArrowUpRight className="w-4 h-4" />}
+      </div>
+      <div className="flex-1 min-w-0">
+        <div className="flex items-center gap-2 text-xs text-slate-500 mb-0.5">
+          <span className="font-medium text-slate-700">
+            {isIn ? who : '@edpapabot'}
+          </span>
+          <span>{isIn ? '→ bot' : `→ ${who}`}</span>
+          <span className="ml-auto">{when}</span>
+        </div>
+        <div className="text-sm text-slate-800 whitespace-pre-wrap break-words">
+          {m.text || <em className="text-slate-400">(no text — probably a media message)</em>}
+        </div>
+      </div>
+    </li>
+  );
+}
+
+function tgDateLabel(d: Date): string {
+  const today = new Date(); today.setHours(0, 0, 0, 0);
+  const yesterday = new Date(today); yesterday.setDate(today.getDate() - 1);
+  if (d.toDateString() === today.toDateString()) return 'Today';
+  if (d.toDateString() === yesterday.toDateString()) return 'Yesterday';
+  return d.toLocaleDateString(undefined, { weekday: 'short', month: 'short', day: 'numeric' });
 }
 
 const TabBtn = ({ active, onClick, children }: {

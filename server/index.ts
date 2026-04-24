@@ -1741,13 +1741,39 @@ app.get('/api/activity', async (req, res) => {
 });
 
 // ---------- Messages ---------------------------------------------- //
+// Raw Telegram message log (both directions). LEFT JOINs the subscriber
+// table so consumers can render a name instead of a raw numeric chat_id;
+// unknown chats (Ed's own DMs to test bots, stray group chats, etc.)
+// still show up, just without a name.
 app.get('/api/messages/recent', async (req, res) => {
-  const limit = Math.min(100, Math.max(1, Number(req.query.limit ?? 30)));
+  const limit = Math.min(500, Math.max(1, Number(req.query.limit ?? 50)));
+  const chatIdRaw = (req.query.chat_id as string | undefined)?.trim() || null;
+  // Reject non-numeric chat_ids early — filter-by-subscriber-id path
+  // in the UI already resolves to a numeric chat_id, so anything else
+  // is user error, not a wild chat we want to surface.
+  if (chatIdRaw && !/^-?\d+$/.test(chatIdRaw)) {
+    return res.status(400).json({ error: 'chat_id must be numeric' });
+  }
+  const params: unknown[] = [];
+  let where = '';
+  if (chatIdRaw) {
+    params.push(chatIdRaw);
+    where = `WHERE m.chat_id = $${params.length}`;
+  }
+  params.push(limit);
+  // messages.chat_id is `text`, report_subscribers.telegram_chat_id is
+  // `bigint` — cast on the subscriber side so the join planner can still
+  // use the subscriber's PK index.
   try {
     const rows = await query(
-      `SELECT id, chat_id, text, direction, ts
-         FROM ops.messages ORDER BY ts DESC LIMIT $1`,
-      [limit]
+      `SELECT m.id, m.chat_id, m.text, m.direction, m.ts,
+              s.name AS subscriber_name, s.role AS subscriber_role
+         FROM ops.messages m
+    LEFT JOIN ops.report_subscribers s ON s.telegram_chat_id::text = m.chat_id
+        ${where}
+        ORDER BY m.ts DESC
+        LIMIT $${params.length}`,
+      params
     );
     res.json({ messages: rows });
   } catch (e) {

@@ -3,6 +3,7 @@ import {
   ArrowLeft, Save, PauseCircle, PlayCircle, Trash2, Send, Check,
   Loader2, AlertTriangle, ExternalLink, Sun, Clock, Moon,
   Calendar, Kanban, MessageSquare, Zap,
+  ArrowDownLeft, ArrowUpRight, MessageCircle,
 } from 'lucide-react';
 import { apiFetch, apiGet, Me } from '../auth';
 
@@ -30,6 +31,11 @@ interface Card {
 }
 interface Assignee { card_id: string; subscriber_id: string }
 interface TemplateMap { [slot: string]: { text: string; updated_at: string } }
+interface TelegramMsg {
+  id: string; chat_id: number; text: string;
+  direction: 'in' | 'out'; ts: string;
+  subscriber_name: string | null;
+}
 
 // Shared time format helpers (Postgres `time` is "HH:MM:SS", HTML input wants "HH:MM").
 const toHHMM = (v: string | undefined) => (v ?? '').slice(0, 5);
@@ -57,6 +63,7 @@ export default function Member({ me, subscriberId, onBack }: {
   const [cards, setCards] = useState<Card[]>([]);
   const [columns, setColumns] = useState<Map<string, Column>>(new Map());
   const [templates, setTemplates] = useState<TemplateMap | null>(null);
+  const [messages, setMessages] = useState<TelegramMsg[]>([]);
   const [loading, setLoading] = useState(true);
   const [err, setErr] = useState<string | null>(null);
 
@@ -91,6 +98,17 @@ export default function Member({ me, subscriberId, onBack }: {
     } catch {/* ditto */}
   }, [subscriberId]);
 
+  // Fetched separately because it needs the resolved chat_id and is
+  // cheap enough to re-pull on every member switch.
+  useEffect(() => {
+    if (!sub?.telegram_chat_id) return;
+    apiGet<{ messages: TelegramMsg[] }>(
+      `/api/messages/recent?chat_id=${sub.telegram_chat_id}&limit=30`
+    )
+      .then(d => setMessages(d.messages))
+      .catch(() => setMessages([]));
+  }, [sub?.telegram_chat_id]);
+
   useEffect(() => { load(); }, [load]);
 
   if (loading && !sub) {
@@ -117,9 +135,52 @@ export default function Member({ me, subscriberId, onBack }: {
             onChanged={load} onDeleted={onBack} />
         </div>
         <RecentReportsCard reports={reports} />
+        <TelegramMessagesCard messages={messages} />
         <AssignedCardsCard cards={cards} columns={columns} />
       </div>
     </div>
+  );
+}
+
+function TelegramMessagesCard({ messages }: { messages: TelegramMsg[] }) {
+  return (
+    <Card title={`Recent Telegram messages (${messages.length})`}
+      icon={<MessageCircle className="w-4 h-4 text-indigo-500" />}>
+      {messages.length === 0 ? (
+        <p className="text-sm text-slate-400">
+          No Telegram history with this chat_id yet.
+        </p>
+      ) : (
+        <ul className="divide-y divide-slate-100 max-h-96 overflow-y-auto">
+          {messages.map(m => {
+            const isIn = m.direction === 'in';
+            return (
+              <li key={m.id} className="py-2.5 flex items-start gap-2.5">
+                <div className={`w-6 h-6 rounded-full grid place-items-center flex-shrink-0 mt-0.5
+                  ${isIn ? 'bg-indigo-100 text-indigo-700' : 'bg-slate-100 text-slate-600'}`}>
+                  {isIn
+                    ? <ArrowDownLeft className="w-3 h-3" />
+                    : <ArrowUpRight className="w-3 h-3" />}
+                </div>
+                <div className="flex-1 min-w-0">
+                  <div className="text-[11px] text-slate-500 mb-0.5">
+                    {isIn ? 'from member' : 'from @edpapabot'}
+                    <span className="ml-2">
+                      {new Date(m.ts).toLocaleString(undefined,
+                        { month: 'short', day: 'numeric',
+                          hour: '2-digit', minute: '2-digit' })}
+                    </span>
+                  </div>
+                  <div className="text-sm text-slate-700 whitespace-pre-wrap break-words">
+                    {m.text || <em className="text-slate-400">(no text)</em>}
+                  </div>
+                </div>
+              </li>
+            );
+          })}
+        </ul>
+      )}
+    </Card>
   );
 }
 

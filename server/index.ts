@@ -628,6 +628,398 @@ app.post('/api/team/subscribers/:id/test-ping',
   }
 );
 
+// ---------- Leave / public holidays --------------------------------- //
+app.get('/api/team/subscribers/:id/leave',
+  requireRole('boss', 'pa'),
+  async (req, res) => {
+    try {
+      const rows = await query(
+        `SELECT to_char(leave_date, 'YYYY-MM-DD') AS leave_date, kind, note,
+                created_by, created_at
+           FROM ops.subscriber_leave_days
+          WHERE subscriber_id = $1::uuid
+          ORDER BY leave_date DESC`,
+        [String(req.params.id)]
+      );
+      res.json({ leave: rows });
+    } catch (e) {
+      res.status(pgErrorStatus(e)).json({ error: (e as Error).message });
+    }
+  }
+);
+
+app.post('/api/team/subscribers/:id/leave',
+  requireRole('boss'),
+  async (req, res) => {
+    const date = String(req.body?.leave_date || '');
+    const kind = String(req.body?.kind || 'leave');
+    const note = req.body?.note ? String(req.body.note).slice(0, 200) : null;
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) {
+      return res.status(400).json({ error: 'leave_date must be YYYY-MM-DD' });
+    }
+    if (!['leave', 'sick', 'unpaid', 'public_holiday', 'other'].includes(kind)) {
+      return res.status(400).json({ error: 'invalid kind' });
+    }
+    try {
+      const rows = await query(
+        `INSERT INTO ops.subscriber_leave_days
+           (subscriber_id, leave_date, kind, note, created_by)
+         VALUES ($1::uuid, $2::date, $3, $4, $5)
+         ON CONFLICT (subscriber_id, leave_date) DO UPDATE
+           SET kind = EXCLUDED.kind, note = EXCLUDED.note
+         RETURNING to_char(leave_date, 'YYYY-MM-DD') AS leave_date, kind, note`,
+        [String(req.params.id), date, kind, note, req.user!.email]
+      );
+      res.json({ leave: rows[0] });
+    } catch (e) {
+      res.status(pgErrorStatus(e)).json({ error: (e as Error).message });
+    }
+  }
+);
+
+app.delete('/api/team/subscribers/:id/leave/:date',
+  requireRole('boss'),
+  async (req, res) => {
+    const date = String(req.params.date);
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) {
+      return res.status(400).json({ error: 'date must be YYYY-MM-DD' });
+    }
+    try {
+      const rows = await query(
+        `DELETE FROM ops.subscriber_leave_days
+          WHERE subscriber_id = $1::uuid AND leave_date = $2::date
+        RETURNING to_char(leave_date, 'YYYY-MM-DD') AS leave_date`,
+        [String(req.params.id), date]
+      );
+      if (rows.length === 0) return res.status(404).json({ error: 'not_found' });
+      res.json({ deleted: rows[0] });
+    } catch (e) {
+      res.status(pgErrorStatus(e)).json({ error: (e as Error).message });
+    }
+  }
+);
+
+app.get('/api/config/public-holidays', async (_req, res) => {
+  try {
+    const rows = await query(
+      `SELECT to_char(holiday_date, 'YYYY-MM-DD') AS holiday_date, name, country
+         FROM ops.public_holidays ORDER BY holiday_date DESC LIMIT 200`
+    );
+    res.json({ holidays: rows });
+  } catch (e) {
+    res.status(pgErrorStatus(e)).json({ error: (e as Error).message });
+  }
+});
+
+app.post('/api/config/public-holidays',
+  requireRole('boss'),
+  async (req, res) => {
+    const date = String(req.body?.holiday_date || '');
+    const name = String(req.body?.name || '').trim();
+    const country = String(req.body?.country || 'SG').slice(0, 4);
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(date) || !name) {
+      return res.status(400).json({ error: 'holiday_date + name required' });
+    }
+    try {
+      const rows = await query(
+        `INSERT INTO ops.public_holidays (holiday_date, name, country, created_by)
+         VALUES ($1::date, $2, $3, $4)
+         ON CONFLICT (holiday_date) DO UPDATE SET name = EXCLUDED.name, country = EXCLUDED.country
+         RETURNING to_char(holiday_date, 'YYYY-MM-DD') AS holiday_date, name, country`,
+        [date, name, country, req.user!.email]
+      );
+      res.json({ holiday: rows[0] });
+    } catch (e) {
+      res.status(pgErrorStatus(e)).json({ error: (e as Error).message });
+    }
+  }
+);
+
+app.delete('/api/config/public-holidays/:date',
+  requireRole('boss'),
+  async (req, res) => {
+    const date = String(req.params.date);
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) {
+      return res.status(400).json({ error: 'date must be YYYY-MM-DD' });
+    }
+    try {
+      const rows = await query(
+        `DELETE FROM ops.public_holidays WHERE holiday_date = $1::date
+        RETURNING to_char(holiday_date, 'YYYY-MM-DD') AS holiday_date, name`,
+        [date]
+      );
+      if (rows.length === 0) return res.status(404).json({ error: 'not_found' });
+      res.json({ deleted: rows[0] });
+    } catch (e) {
+      res.status(pgErrorStatus(e)).json({ error: (e as Error).message });
+    }
+  }
+);
+
+// ---------- Streak / missed-slots / monthly summary ---------------- //
+// "Day reported" = date is in subscriber.working_days, not leave/PH,
+// and has at least one non-null slot field in daily_reports.
+app.get('/api/team/subscribers/:id/streak',
+  requireRole('boss', 'pa'),
+  async (req, res) => {
+    const id = String(req.params.id);
+    try {
+      const subs = await query<{ working_days: number[] }>(
+        `SELECT working_days FROM ops.report_subscribers WHERE id = $1::uuid`, [id]);
+      if (subs.length === 0) return res.status(404).json({ error: 'not_found' });
+      const wd = subs[0].working_days ?? [1, 2, 3, 4, 5];
+
+      // Streak: walk backwards from today; non-working/leave/PH days are
+      // "skip" (don't break streak); a working day with no report breaks it.
+      const win = await query<{ dt: string; off: boolean; reported: boolean }>(
+        `WITH dates AS (
+           SELECT d::date AS dt FROM generate_series((now() - interval '60 days')::date, now()::date, interval '1 day') d
+         )
+         SELECT to_char(dt, 'YYYY-MM-DD') AS dt,
+                (NOT (EXTRACT(isodow FROM dt)::int = ANY($2::int[]))
+                 OR EXISTS (SELECT 1 FROM ops.subscriber_leave_days l
+                             WHERE l.subscriber_id = $1::uuid AND l.leave_date = dt)
+                 OR EXISTS (SELECT 1 FROM ops.public_holidays h
+                             WHERE h.holiday_date = dt)) AS off,
+                EXISTS (
+                  SELECT 1 FROM ops.daily_reports r
+                   WHERE r.subscriber_id = $1::uuid AND r.report_date = dt
+                     AND (r.goals IS NOT NULL OR r.mid_progress IS NOT NULL
+                       OR r.eod_completed IS NOT NULL OR r.eod_unfinished IS NOT NULL
+                       OR r.eod_hours IS NOT NULL)
+                ) AS reported
+           FROM dates ORDER BY dt DESC`,
+        [id, wd]
+      );
+      let current = 0;
+      for (const d of win) {
+        if (d.off) continue;
+        if (d.reported) current++;
+        else break;
+      }
+      // Last 30 days metrics
+      const last30 = win.slice(0, 30);
+      const missed30 = last30.filter(d => !d.off && !d.reported).length;
+      // Longest streak in window
+      let longest = 0, run = 0;
+      for (const d of [...win].reverse()) {
+        if (d.off) continue;
+        if (d.reported) { run++; if (run > longest) longest = run; }
+        else run = 0;
+      }
+      res.json({ current, longest_30d: longest, missed_30d: missed30 });
+    } catch (e) {
+      res.status(pgErrorStatus(e)).json({ error: (e as Error).message });
+    }
+  }
+);
+
+app.get('/api/missed-slots',
+  requireRole('boss', 'pa'),
+  async (req, res) => {
+    const dateRaw = String(req.query.date || '');
+    const date = /^\d{4}-\d{2}-\d{2}$/.test(dateRaw)
+      ? dateRaw
+      : new Date(Date.now() - 86400_000).toISOString().slice(0, 10);
+    try {
+      const rows = await query<{
+        id: string; name: string; reported: boolean;
+        slot_morning_done: boolean; slot_midday_done: boolean; slot_eod_done: boolean;
+        is_off: boolean;
+      }>(
+        `SELECT s.id, s.name,
+                (NOT (EXTRACT(isodow FROM $1::date)::int = ANY(s.working_days))
+                 OR EXISTS (SELECT 1 FROM ops.subscriber_leave_days l
+                             WHERE l.subscriber_id = s.id AND l.leave_date = $1::date)
+                 OR EXISTS (SELECT 1 FROM ops.public_holidays h
+                             WHERE h.holiday_date = $1::date)) AS is_off,
+                COALESCE(r.goals IS NOT NULL OR r.mid_progress IS NOT NULL OR r.eod_completed IS NOT NULL, false) AS reported,
+                COALESCE(r.goals IS NOT NULL, false) AS slot_morning_done,
+                COALESCE(r.mid_progress IS NOT NULL, false) AS slot_midday_done,
+                COALESCE(r.eod_completed IS NOT NULL OR r.eod_hours IS NOT NULL, false) AS slot_eod_done
+           FROM ops.report_subscribers s
+      LEFT JOIN ops.daily_reports r ON r.subscriber_id = s.id AND r.report_date = $1::date
+          WHERE s.active = true
+          ORDER BY s.name`,
+        [date]
+      );
+      const summary = rows.map(r => {
+        const missing: string[] = [];
+        if (!r.is_off) {
+          if (!r.slot_morning_done) missing.push('morning');
+          if (!r.slot_midday_done) missing.push('midday');
+          if (!r.slot_eod_done) missing.push('eod');
+        }
+        return {
+          subscriber_id: r.id, name: r.name,
+          is_off: r.is_off, missing_slots: missing,
+          fully_reported: !r.is_off && missing.length === 0,
+        };
+      });
+      res.json({ date, subscribers: summary });
+    } catch (e) {
+      res.status(pgErrorStatus(e)).json({ error: (e as Error).message });
+    }
+  }
+);
+
+app.post('/api/missed-slots/digest',
+  requireRole('boss'),
+  async (req, res) => {
+    const dateRaw = String(req.body?.date || '');
+    const date = /^\d{4}-\d{2}-\d{2}$/.test(dateRaw)
+      ? dateRaw
+      : new Date(Date.now() - 86400_000).toISOString().slice(0, 10);
+    try {
+      const rows = await query<{
+        name: string; missing: string[]; is_off: boolean;
+      }>(
+        `SELECT s.name, s.telegram_chat_id, s.working_days,
+                ARRAY_REMOVE(ARRAY[
+                  CASE WHEN r.goals IS NULL THEN 'morning' END,
+                  CASE WHEN r.mid_progress IS NULL THEN 'midday' END,
+                  CASE WHEN r.eod_completed IS NULL AND r.eod_hours IS NULL THEN 'eod' END
+                ], NULL) AS missing,
+                (NOT (EXTRACT(isodow FROM $1::date)::int = ANY(s.working_days))
+                 OR EXISTS (SELECT 1 FROM ops.subscriber_leave_days l
+                             WHERE l.subscriber_id = s.id AND l.leave_date = $1::date)
+                 OR EXISTS (SELECT 1 FROM ops.public_holidays h
+                             WHERE h.holiday_date = $1::date)) AS is_off
+           FROM ops.report_subscribers s
+      LEFT JOIN ops.daily_reports r ON r.subscriber_id = s.id AND r.report_date = $1::date
+          WHERE s.active = true
+          ORDER BY s.name`,
+        [date]
+      );
+      const lines: string[] = [];
+      for (const r of rows) {
+        if (r.is_off) continue;
+        if (r.missing && r.missing.length > 0) {
+          lines.push(`• *${escapeMarkdown(r.name)}* — missed: ${r.missing.join(', ')}`);
+        }
+      }
+      // Find boss chat_id from ALLOWED_USERS or env. Use TELEGRAM_ALLOWED_CHAT_IDS
+      // first non-empty value, else fall back to first whitelisted boss.
+      const allowedChats = (process.env.TELEGRAM_ALLOWED_CHAT_IDS || '')
+        .split(',').map(s => s.trim()).filter(Boolean);
+      const bossChatId = allowedChats[0] || '5246139725';
+      const text = lines.length === 0
+        ? `✅ *${date}* — every active member reported, nothing missed.`
+        : `📋 *Missed-slot digest — ${date}*\n\n${lines.join('\n')}`;
+      const outcome = await sendTelegramMessage(Number(bossChatId), text);
+      res.json({ date, missing_count: lines.length, telegram_outcome: outcome });
+    } catch (e) {
+      res.status(pgErrorStatus(e)).json({ error: (e as Error).message });
+    }
+  }
+);
+
+app.post('/api/team/subscribers/:id/monthly-summary',
+  requireRole('boss', 'pa'),
+  async (req, res) => {
+    const id = String(req.params.id);
+    const monthRaw = (req.query.month as string | undefined)
+      || new Date().toISOString().slice(0, 7);
+    if (!/^\d{4}-\d{2}$/.test(monthRaw)) {
+      return res.status(400).json({ error: 'month must be YYYY-MM' });
+    }
+    if (!ANTHROPIC_API_KEY) {
+      return res.status(503).json({ error: 'ANTHROPIC_API_KEY not configured' });
+    }
+    const periodStart = `${monthRaw}-01`;
+    // last day of month
+    const [y, m] = monthRaw.split('-').map(Number);
+    const lastDay = new Date(Date.UTC(y, m, 0)).getUTCDate();
+    const periodEnd = `${monthRaw}-${String(lastDay).padStart(2, '0')}`;
+    try {
+      const subs = await query<{ name: string; role: string | null }>(
+        `SELECT name, role FROM ops.report_subscribers WHERE id = $1::uuid`, [id]);
+      if (subs.length === 0) return res.status(404).json({ error: 'subscriber_not_found' });
+      const sub = subs[0];
+
+      const reports = await query(
+        `SELECT to_char(report_date, 'YYYY-MM-DD') AS date,
+                goals, mid_progress, mid_issues, mid_changes,
+                eod_completed, eod_unfinished, eod_hours
+           FROM ops.daily_reports
+          WHERE subscriber_id = $1::uuid
+            AND report_date BETWEEN $2::date AND $3::date
+          ORDER BY report_date`,
+        [id, periodStart, periodEnd]
+      );
+      const cards = await query(
+        `SELECT c.title, c.priority, c.done_at IS NOT NULL AS done,
+                col.name AS column_name
+           FROM ops.kanban_cards c
+           JOIN ops.kanban_assignees a ON a.card_id = c.id
+      LEFT JOIN ops.kanban_columns col ON col.id = c.column_id
+          WHERE a.subscriber_id = $1::uuid
+            AND c.deleted_at IS NULL
+            AND c.created_at::date BETWEEN $2::date AND $3::date
+          ORDER BY c.created_at`,
+        [id, periodStart, periodEnd]
+      );
+      const periodCompute = await computeSalaryPeriod(id, periodStart, periodEnd);
+
+      const system =
+        "You are a senior ops manager writing a one-page monthly performance review. " +
+        "Plain prose, 4-6 short paragraphs, factual but warm. Cite dates and numbers. " +
+        "Cover: hours worked, days reported vs working days, recurring blockers if any, " +
+        "what was completed, what was unfinished, anything notable in the data.";
+      const userMessage =
+        `Subscriber: ${sub.name} (${sub.role ?? 'team'})\n` +
+        `Month: ${monthRaw} (${periodStart} – ${periodEnd})\n\n` +
+        `Compute: working_days=${periodCompute.working_days_in_period}, ` +
+        `days_reported=${periodCompute.days_reported}, days_missed=${periodCompute.days_missed}, ` +
+        `hours_reported=${periodCompute.hours_reported}, leave=${periodCompute.leave_days}, ` +
+        `public_holidays=${periodCompute.public_holidays}.\n\n` +
+        `Daily reports JSON:\n${JSON.stringify(reports, null, 2)}\n\n` +
+        `Kanban cards JSON:\n${JSON.stringify(cards, null, 2)}\n\n` +
+        `Write the monthly review.`;
+      const upstream = await fetch('https://api.anthropic.com/v1/messages', {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          'anthropic-version': '2023-06-01',
+          'x-api-key': ANTHROPIC_API_KEY,
+        },
+        body: JSON.stringify({
+          model: 'claude-haiku-4-5-20251001',
+          max_tokens: 1500,
+          system,
+          messages: [{ role: 'user', content: userMessage }],
+        }),
+      });
+      const data = await upstream.json().catch(() => ({} as Record<string, unknown>));
+      if (!upstream.ok) {
+        return res.status(502).json({ error: 'anthropic_error', detail: data });
+      }
+      const summary =
+        (data as { content?: Array<{ text?: string }> })?.content?.[0]?.text
+        || '(empty summary)';
+
+      await query(
+        `INSERT INTO ops.monthly_summaries
+           (subscriber_id, period_start, period_end, summary, generated_by)
+         VALUES ($1::uuid, $2::date, $3::date, $4, $5)
+         ON CONFLICT (subscriber_id, period_start) DO UPDATE
+           SET summary = EXCLUDED.summary,
+               generated_at = now(),
+               generated_by = EXCLUDED.generated_by`,
+        [id, periodStart, periodEnd, summary, req.user!.email]
+      );
+      res.json({
+        subscriber_id: id, month: monthRaw,
+        period_start: periodStart, period_end: periodEnd,
+        summary, period: periodCompute,
+        report_rows: reports.length, card_rows: cards.length,
+      });
+    } catch (e) {
+      res.status(pgErrorStatus(e)).json({ error: (e as Error).message });
+    }
+  }
+);
+
 // ---------- Salary --------------------------------------------------- //
 // Per-subscriber rate config + period compute + payment log.
 
@@ -760,6 +1152,8 @@ interface SalaryPeriodSummary {
   period_end: string;
   config: { payment_type: string; rate: number; currency: string } | null;
   working_days_in_period: number;
+  leave_days: number;
+  public_holidays: number;
   days_reported: number;
   days_missed: number;
   hours_reported: number;
@@ -789,14 +1183,32 @@ async function computeSalaryPeriod(subscriberId: string, from: string, to: strin
   const sub = subs[0];
   const workingDays = sub.working_days ?? [1, 2, 3, 4, 5];
 
-  // Working days in window (matches subscriber's working_days)
-  const wdRow = await query<{ n: number }>(
-    `SELECT COUNT(*)::int AS n
-       FROM generate_series($1::date, $2::date, interval '1 day') d
-      WHERE EXTRACT(isodow FROM d)::int = ANY($3::int[])`,
-    [from, to, workingDays]
+  // Working days in window (matches subscriber's working_days),
+  // minus subscriber-specific leave AND global public holidays.
+  const wdRow = await query<{ n: number; leave_count: number; ph_count: number }>(
+    `WITH dates AS (
+       SELECT d::date AS dt FROM generate_series($1::date, $2::date, interval '1 day') d
+        WHERE EXTRACT(isodow FROM d)::int = ANY($3::int[])
+     )
+     SELECT COUNT(*) FILTER (
+              WHERE NOT EXISTS (
+                SELECT 1 FROM ops.subscriber_leave_days l
+                 WHERE l.subscriber_id = $4::uuid AND l.leave_date = dates.dt)
+                AND NOT EXISTS (
+                SELECT 1 FROM ops.public_holidays h
+                 WHERE h.holiday_date = dates.dt)
+            )::int AS n,
+            (SELECT COUNT(*)::int FROM ops.subscriber_leave_days l
+              WHERE l.subscriber_id = $4::uuid
+                AND l.leave_date BETWEEN $1::date AND $2::date) AS leave_count,
+            (SELECT COUNT(*)::int FROM ops.public_holidays h
+              WHERE h.holiday_date BETWEEN $1::date AND $2::date) AS ph_count
+       FROM dates`,
+    [from, to, workingDays, subscriberId]
   );
   const workingDaysInPeriod = wdRow[0]?.n ?? 0;
+  const leaveCount = wdRow[0]?.leave_count ?? 0;
+  const phCount = wdRow[0]?.ph_count ?? 0;
 
   // Days the subscriber actually reported (any non-null slot)
   const repRow = await query<{ days_reported: number; hours_reported: string | null }>(
@@ -850,6 +1262,8 @@ async function computeSalaryPeriod(subscriberId: string, from: string, to: strin
     period_end: to,
     config: paymentType ? { payment_type: paymentType, rate, currency } : null,
     working_days_in_period: workingDaysInPeriod,
+    leave_days: leaveCount,
+    public_holidays: phCount,
     days_reported: daysReported,
     days_missed: Math.max(0, workingDaysInPeriod - daysReported),
     hours_reported: hoursReported,
@@ -1624,7 +2038,7 @@ app.post('/api/agent/analyze-image', async (req, res) => {
       "Output STRICT JSON only:\n" +
       '{\n' +
       '  "description": "<3-6 sentences describing what is in the image>",\n' +
-      '  "intent": "answer" | "report_self" | "plan_self" | "delegate" | "research" | "context_attach" | "chatter" | "ambiguous",\n' +
+      '  "intent": "answer" | "report_self" | "plan_self" | "delegate" | "research" | "receipt" | "context_attach" | "chatter" | "ambiguous",\n' +
       '  "confidence": 0..1,\n' +
       '  "summary": "<one short line>",\n' +
       '  "reply": "<what the bot should DM back, under 240 chars>",\n' +
@@ -1635,11 +2049,13 @@ app.post('/api/agent/analyze-image', async (req, res) => {
       '- { "type": "create_kanban_cards", "cards": [<the same card shape>, ...] }\n' +
       '- { "type": "log_report", "slot": "morning|midday|eod", "field": "goals|mid_progress|eod_completed|eod_unfinished", "value": "<cleaned text>" }\n' +
       '- { "type": "create_research_task", "title": "RESEARCH: <topic>", "brief": "<one-line scope>" }\n' +
+      '- { "type": "create_finance_task", "vendor": "<merchant>", "amount": <number>, "currency": "<3-letter>", "date": "<YYYY-MM-DD or null>", "category": "<short>" }\n' +
       '- null (for answer/chatter/ambiguous/context_attach)\n\n' +
       "Rules:\n" +
-      "- 'context_attach' is special-image: a screenshot/reference picture related to other ongoing work. " +
-      "  In this case set action to null and put the description into the reply, e.g. 'Saw the hairstyle reference — attached to the salon brief.' (Boss decides where to attach it manually.)\n" +
-      "- A receipt / invoice → research or delegate (boss approval) for finance follow-up.\n" +
+      "- 'receipt' = an actual receipt or invoice photo. Extract vendor, amount, currency, date " +
+      "from the visible text. Use create_finance_task. If multiple amounts, pick the GRAND TOTAL.\n" +
+      "- 'context_attach' is reference imagery (screenshots, mood boards, hairstyle samples) — " +
+      "  set action to null; boss attaches manually.\n" +
       "- A whiteboard / meeting notes → plan_self (one card per action item).\n" +
       "- A photo of a thing-to-buy → delegate to PA if the caption implies action; otherwise context_attach.\n" +
       "- assignee_name MUST be one of the allowed names verbatim. First-name match counts.\n" +

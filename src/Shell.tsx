@@ -36,7 +36,7 @@ export default function Shell({ me }: { me: Me }) {
     <Member me={me} subscriberId={memberId}
       onBack={() => { setMemberId(null); setTab('team'); }} />
   ) : {
-    dashboard: <Dashboard />,
+    dashboard: <Dashboard me={me} />,
     board:     <Board me={me} />,
     agent:     <Agent me={me} />,
     tasks:     <Tasks me={me} />,

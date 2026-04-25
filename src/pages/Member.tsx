@@ -4,7 +4,7 @@ import {
   Loader2, AlertTriangle, ExternalLink, Sun, Clock, Moon,
   Calendar, Kanban, MessageSquare, Zap,
   ArrowDownLeft, ArrowUpRight, MessageCircle,
-  DollarSign, X,
+  DollarSign, X, Plane, FileBarChart, Flame, Copy,
 } from 'lucide-react';
 import { apiFetch, apiGet, Me } from '../auth';
 
@@ -138,10 +138,81 @@ export default function Member({ me, subscriberId, onBack }: {
             onChanged={load} onDeleted={onBack} />
         </div>
         <RecentReportsCard reports={reports} />
+        <MonthlyReviewCard sub={sub} />
         <TelegramMessagesCard messages={messages} />
         <AssignedCardsCard cards={cards} columns={columns} />
       </div>
     </div>
+  );
+}
+
+function MonthlyReviewCard({ sub }: { sub: Subscriber }) {
+  const today = new Date();
+  const defaultMonth = `${today.getFullYear()}-${String(today.getMonth() + 1).padStart(2, '0')}`;
+  const [month, setMonth] = useState(defaultMonth);
+  const [busy, setBusy] = useState(false);
+  const [summary, setSummary] = useState<string | null>(null);
+  const [err, setErr] = useState<string | null>(null);
+  const [copied, setCopied] = useState(false);
+
+  async function generate() {
+    setBusy(true); setErr(null); setSummary(null);
+    try {
+      const res = await apiFetch(
+        `/api/team/subscribers/${sub.id}/monthly-summary?month=${month}`,
+        { method: 'POST' }
+      );
+      const body = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error((body as {error?: string}).error || `HTTP ${res.status}`);
+      setSummary((body as { summary: string }).summary);
+    } catch (e) { setErr((e as Error).message); }
+    finally { setBusy(false); }
+  }
+
+  async function copy() {
+    if (!summary) return;
+    await navigator.clipboard.writeText(summary).catch(() => {});
+    setCopied(true);
+    setTimeout(() => setCopied(false), 1500);
+  }
+
+  return (
+    <Card title="Monthly review" icon={<FileBarChart className="w-4 h-4 text-indigo-500" />}>
+      <p className="text-xs text-slate-500 mb-3">
+        Claude reads {sub.name}'s daily reports + assigned board cards for the
+        chosen month and writes a one-page review.
+      </p>
+      <div className="flex items-center gap-2 mb-3">
+        <input type="month" value={month} onChange={e => setMonth(e.target.value)}
+          className="border border-slate-200 rounded-lg px-3 py-2 text-sm" />
+        <button onClick={generate} disabled={busy}
+          className="inline-flex items-center gap-1.5 px-3 py-2 text-sm font-medium
+                     bg-slate-900 hover:bg-slate-800 disabled:opacity-40 text-white rounded-lg">
+          {busy ? <Loader2 className="w-4 h-4 animate-spin" /> : <FileBarChart className="w-4 h-4" />}
+          Generate review
+        </button>
+      </div>
+      {err && (
+        <div className="text-xs text-rose-700 bg-rose-50 border border-rose-200 rounded-lg p-2">
+          {err}
+        </div>
+      )}
+      {summary && (
+        <div>
+          <div className="bg-slate-50 border border-slate-200 rounded-lg p-3 text-sm
+                          text-slate-700 leading-relaxed whitespace-pre-line max-h-96 overflow-y-auto">
+            {summary}
+          </div>
+          <div className="mt-2 flex items-center gap-2">
+            <button onClick={copy}
+              className="inline-flex items-center gap-1.5 text-xs font-medium
+                         text-slate-600 hover:text-slate-900 px-2 py-1 rounded">
+              <Copy className="w-3.5 h-3.5" /> {copied ? 'Copied' : 'Copy'}
+            </button>
+          </div>
+        </div>
+      )}
+    </Card>
   );
 }
 
@@ -162,6 +233,8 @@ interface SalaryPayment {
 }
 interface SalaryPeriod {
   working_days_in_period: number;
+  leave_days?: number;
+  public_holidays?: number;
   days_reported: number;
   days_missed: number;
   hours_reported: number;
@@ -171,15 +244,24 @@ interface SalaryPeriod {
   currency: string;
   config: SalaryConfig | null;
 }
+interface LeaveDay {
+  leave_date: string; kind: string; note: string | null; created_by: string | null;
+}
+interface Streak {
+  current: number; longest_30d: number; missed_30d: number;
+}
 
 function SalaryCard({ sub, isBoss }: { sub: Subscriber; isBoss: boolean }) {
   const [config, setConfig] = useState<SalaryConfig | null>(null);
   const [payments, setPayments] = useState<SalaryPayment[]>([]);
   const [period, setPeriod] = useState<SalaryPeriod | null>(null);
+  const [streak, setStreak] = useState<Streak | null>(null);
+  const [leaveDays, setLeaveDays] = useState<LeaveDay[]>([]);
   const [from, setFrom] = useState(thirtyDaysAgo());
   const [to, setTo] = useState(todayLocalISO());
   const [editing, setEditing] = useState(false);
   const [paying, setPaying] = useState(false);
+  const [managingLeave, setManagingLeave] = useState(false);
   const [err, setErr] = useState<string | null>(null);
 
   const loadAll = useCallback(async () => {
@@ -195,6 +277,14 @@ function SalaryCard({ sub, isBoss }: { sub: Subscriber; isBoss: boolean }) {
       );
       setPeriod(p);
     } catch (e) { setErr(String(e)); }
+    try {
+      const s = await apiGet<Streak>(`/api/team/subscribers/${sub.id}/streak`);
+      setStreak(s);
+    } catch {/* silent */}
+    try {
+      const l = await apiGet<{ leave: LeaveDay[] }>(`/api/team/subscribers/${sub.id}/leave`);
+      setLeaveDays(l.leave);
+    } catch {/* silent */}
   }, [sub.id, from, to]);
 
   useEffect(() => { loadAll(); }, [loadAll]);
@@ -218,6 +308,13 @@ function SalaryCard({ sub, isBoss }: { sub: Subscriber; isBoss: boolean }) {
             {config.payment_type === 'hourly'       && 'per reported hour'}
             {config.payment_type === 'daily_rate'   && 'per reported day'}
           </span>
+          {streak && (
+            <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full
+                             bg-amber-50 text-amber-800 text-xs font-medium border border-amber-200">
+              <Flame className="w-3 h-3" />
+              {streak.current}d streak · {streak.missed_30d} missed in 30d
+            </span>
+          )}
           {config.updated_at && (
             <span className="text-[11px] text-slate-400">
               · updated {new Date(config.updated_at).toLocaleDateString()}
@@ -262,7 +359,7 @@ function SalaryCard({ sub, isBoss }: { sub: Subscriber; isBoss: boolean }) {
       {err && <div className="text-xs text-rose-700 bg-rose-50 border border-rose-200 rounded-lg p-2 mb-3">{err}</div>}
 
       {isBoss && (
-        <div className="flex items-center gap-2 mb-4">
+        <div className="flex items-center gap-2 mb-4 flex-wrap">
           <button onClick={() => setEditing(true)}
             className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium
                        bg-slate-900 hover:bg-slate-800 text-white rounded-lg">
@@ -275,6 +372,16 @@ function SalaryCard({ sub, isBoss }: { sub: Subscriber; isBoss: boolean }) {
               <Check className="w-3.5 h-3.5" /> Mark paid
             </button>
           )}
+          <button onClick={() => setManagingLeave(true)}
+            className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium
+                       bg-white border border-slate-200 hover:border-slate-300 text-slate-700 rounded-lg">
+            <Plane className="w-3.5 h-3.5" /> Leave & holidays
+            {(period?.leave_days ?? 0) > 0 && (
+              <span className="ml-1 px-1.5 rounded-full bg-amber-100 text-amber-800 text-[10px]">
+                {period?.leave_days} in window
+              </span>
+            )}
+          </button>
         </div>
       )}
 
@@ -311,7 +418,117 @@ function SalaryCard({ sub, isBoss }: { sub: Subscriber; isBoss: boolean }) {
           onDone={() => { setPaying(false); loadAll(); }}
           onClose={() => setPaying(false)} />
       )}
+      {managingLeave && isBoss && (
+        <LeaveManagerModal sub={sub} leaveDays={leaveDays}
+          onDone={() => loadAll()}
+          onClose={() => setManagingLeave(false)} />
+      )}
     </Card>
+  );
+}
+
+function LeaveManagerModal({ sub, leaveDays, onDone, onClose }: {
+  sub: Subscriber;
+  leaveDays: LeaveDay[];
+  onDone: () => void;
+  onClose: () => void;
+}) {
+  const [draftDate, setDraftDate] = useState('');
+  const [kind, setKind] = useState('leave');
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+  const [days, setDays] = useState(leaveDays);
+
+  useEffect(() => { setDays(leaveDays); }, [leaveDays]);
+
+  async function add() {
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(draftDate)) { setErr('Pick a date'); return; }
+    setBusy(true); setErr(null);
+    try {
+      const res = await apiFetch(`/api/team/subscribers/${sub.id}/leave`, {
+        method: 'POST',
+        body: JSON.stringify({ leave_date: draftDate, kind }),
+      });
+      if (!res.ok) {
+        const b = await res.json().catch(() => ({}));
+        throw new Error((b as { error?: string }).error || `HTTP ${res.status}`);
+      }
+      const fresh = await apiGet<{ leave: LeaveDay[] }>(`/api/team/subscribers/${sub.id}/leave`);
+      setDays(fresh.leave);
+      setDraftDate('');
+      onDone();
+    } catch (e) { setErr((e as Error).message); }
+    finally { setBusy(false); }
+  }
+
+  async function remove(d: string) {
+    setBusy(true); setErr(null);
+    try {
+      await apiFetch(`/api/team/subscribers/${sub.id}/leave/${d}`, { method: 'DELETE' });
+      const fresh = await apiGet<{ leave: LeaveDay[] }>(`/api/team/subscribers/${sub.id}/leave`);
+      setDays(fresh.leave);
+      onDone();
+    } catch (e) { setErr((e as Error).message); }
+    finally { setBusy(false); }
+  }
+
+  return (
+    <div className="fixed inset-0 z-50 bg-slate-900/40 grid place-items-center p-4"
+         onMouseDown={e => { if (e.target === e.currentTarget) onClose(); }}>
+      <div className="bg-white rounded-2xl w-full max-w-md shadow-2xl overflow-hidden max-h-[92vh] flex flex-col">
+        <header className="flex items-center justify-between px-5 py-3 border-b border-slate-100">
+          <h3 className="text-base font-bold text-slate-900">{sub.name} · Leave & holidays</h3>
+          <button onClick={onClose} className="text-slate-400 hover:text-slate-600">
+            <X className="w-5 h-5" />
+          </button>
+        </header>
+        <div className="p-5 space-y-3 overflow-y-auto">
+          <p className="text-xs text-slate-500">
+            Days marked here are excluded from missed-slot count and salary deductions.
+          </p>
+          <div className="flex items-center gap-2">
+            <input type="date" value={draftDate} onChange={e => setDraftDate(e.target.value)}
+              className="flex-1 border border-slate-200 rounded-lg px-3 py-2 text-sm" />
+            <select value={kind} onChange={e => setKind(e.target.value)}
+              className="border border-slate-200 rounded-lg px-2 py-2 text-sm bg-white">
+              <option value="leave">Leave</option>
+              <option value="sick">Sick</option>
+              <option value="unpaid">Unpaid</option>
+              <option value="public_holiday">Public holiday</option>
+              <option value="other">Other</option>
+            </select>
+            <button onClick={add} disabled={busy || !draftDate}
+              className="px-3 py-2 text-sm font-medium bg-slate-900 hover:bg-slate-800
+                         disabled:opacity-40 text-white rounded-lg">
+              Add
+            </button>
+          </div>
+          {err && <div className="text-xs text-rose-700 bg-rose-50 border border-rose-200 rounded-lg p-2">{err}</div>}
+          {days.length === 0 ? (
+            <p className="text-sm text-slate-400 italic">No leave days yet.</p>
+          ) : (
+            <ul className="divide-y divide-slate-100">
+              {days.map(d => (
+                <li key={d.leave_date} className="py-2 flex items-center justify-between text-sm">
+                  <span className="text-slate-800">{d.leave_date}</span>
+                  <span className="text-xs text-slate-500">{d.kind}</span>
+                  <button onClick={() => remove(d.leave_date)} disabled={busy}
+                    className="p-1 text-slate-300 hover:text-rose-600 hover:bg-rose-50 rounded">
+                    <Trash2 className="w-3.5 h-3.5" />
+                  </button>
+                </li>
+              ))}
+            </ul>
+          )}
+        </div>
+        <footer className="px-5 py-3 border-t border-slate-100 bg-slate-50 flex justify-end">
+          <button onClick={onClose}
+            className="px-3 py-1.5 text-sm text-slate-600 hover:bg-slate-100 rounded-lg">
+            Done
+          </button>
+        </footer>
+      </div>
+    </div>
   );
 }
 

@@ -1,6 +1,9 @@
 import React, { useEffect, useState } from 'react';
-import { apiGet } from '../auth';
-import { CheckCircle2, AlertCircle, Clock, Users, ListChecks } from 'lucide-react';
+import { apiFetch, apiGet, Me } from '../auth';
+import {
+  CheckCircle2, AlertCircle, Clock, Users, ListChecks,
+  AlertTriangle, Send, Loader2,
+} from 'lucide-react';
 
 interface TodayReport {
   name: string;
@@ -32,15 +35,39 @@ interface Data {
   subs: Sub[];
 }
 
-export default function Dashboard() {
+interface MissedSubscriber {
+  subscriber_id: string; name: string;
+  is_off: boolean; missing_slots: string[]; fully_reported: boolean;
+}
+
+export default function Dashboard({ me }: { me: Me }) {
   const [data, setData] = useState<Data | null>(null);
   const [err, setErr] = useState<string | null>(null);
+  const [missed, setMissed] = useState<MissedSubscriber[] | null>(null);
+  const [missedDate, setMissedDate] = useState<string>('');
+  const [digestBusy, setDigestBusy] = useState(false);
+  const [digestResult, setDigestResult] = useState<string | null>(null);
 
   useEffect(() => {
     apiGet<Data>('/api/dashboard')
       .then(setData)
       .catch(e => setErr(String(e)));
+    apiGet<{ date: string; subscribers: MissedSubscriber[] }>('/api/missed-slots')
+      .then(d => { setMissed(d.subscribers); setMissedDate(d.date); })
+      .catch(() => {/* silent */});
   }, []);
+
+  async function dmDigest() {
+    setDigestBusy(true); setDigestResult(null);
+    try {
+      const res = await apiFetch('/api/missed-slots/digest', { method: 'POST' });
+      const body = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error((body as {error?: string}).error || `HTTP ${res.status}`);
+      setDigestResult(`Sent · ${(body as {missing_count:number}).missing_count} flagged`);
+      setTimeout(() => setDigestResult(null), 4000);
+    } catch (e) { setDigestResult(`Failed: ${(e as Error).message}`); }
+    finally { setDigestBusy(false); }
+  }
 
   if (err) return <div className="p-8 text-red-600">{err}</div>;
   if (!data) return <div className="p-8 text-slate-400">Loading…</div>;
@@ -60,6 +87,38 @@ export default function Dashboard() {
         <Card icon={<ListChecks className="w-5 h-5 text-indigo-600" />} label="Open tasks" value={data.pending.length} />
         <Card icon={<Clock className="w-5 h-5 text-amber-600" />} label="Recent actions" value={data.recentActions.length} />
       </div>
+
+      {missed && missed.some(m => !m.is_off && !m.fully_reported) && (
+        <div className="mb-8 bg-white border border-amber-200 rounded-xl p-5">
+          <div className="flex items-center justify-between mb-3 flex-wrap gap-2">
+            <div className="flex items-center gap-2">
+              <AlertTriangle className="w-5 h-5 text-amber-600" />
+              <h2 className="text-sm font-semibold text-slate-700 uppercase tracking-wider">
+                Yesterday's misses ({missedDate})
+              </h2>
+            </div>
+            {me.role === 'boss' && (
+              <button onClick={dmDigest} disabled={digestBusy}
+                className="inline-flex items-center gap-1.5 text-xs font-medium
+                           bg-slate-900 hover:bg-slate-800 text-white rounded-lg px-3 py-1.5
+                           disabled:opacity-40">
+                {digestBusy ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Send className="w-3.5 h-3.5" />}
+                {digestResult || 'DM me the digest'}
+              </button>
+            )}
+          </div>
+          <ul className="space-y-1 text-sm">
+            {missed.filter(m => !m.is_off && !m.fully_reported).map(m => (
+              <li key={m.subscriber_id} className="flex items-center justify-between py-1">
+                <span className="text-slate-800">{m.name}</span>
+                <span className="text-xs text-amber-700">
+                  missed: {m.missing_slots.join(', ')}
+                </span>
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
 
       {/* Two columns: today's reports + pending tasks */}
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">

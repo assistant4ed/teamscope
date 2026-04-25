@@ -237,7 +237,9 @@ type RouteAction =
   | { type: 'log_report'; slot: 'morning' | 'midday' | 'eod';
       field: 'goals' | 'mid_progress' | 'eod_completed' | 'eod_unfinished';
       value: string }
-  | { type: 'create_research_task'; title: string; brief: string };
+  | { type: 'create_research_task'; title: string; brief: string }
+  | { type: 'create_finance_task'; vendor: string; amount: number;
+      currency: string; date?: string | null; category?: string };
 
 interface RouteResult {
   intent: RouteIntent;
@@ -285,6 +287,15 @@ function SmartRouterPanel({ me }: { me: Me }) {
         }
       } else if (result.action.type === 'create_research_task') {
         await postCreateCard(`RESEARCH: ${result.action.title} — ${result.action.brief}`, null);
+      } else if (result.action.type === 'create_finance_task') {
+        const a = result.action;
+        await postCreateCard(
+          `Pay ${a.vendor} ${a.currency} ${a.amount}` +
+          (a.date ? ` (receipt ${a.date})` : '') +
+          (a.category ? ` — ${a.category}` : '') +
+          ' high priority',
+          null
+        );
       } else if (result.action.type === 'log_report') {
         // No upsert endpoint yet — copy text into clipboard for the
         // boss to paste into Reports → slot inline editor.
@@ -423,6 +434,17 @@ function ActionPlanCard({ action, onApply, applyState }: {
         </>
       );
     }
+    if (action.type === 'create_finance_task') {
+      return (
+        <>Receipt — pay <b>{action.vendor}</b> <b>{action.currency} {action.amount.toLocaleString()}</b>
+          {action.date && <> · dated {action.date}</>}
+          {action.category && <> · {action.category}</>}
+          <div className="text-slate-500 text-xs mt-0.5">
+            Creates a high-priority Today card for finance follow-up.
+          </div>
+        </>
+      );
+    }
     return (
       <>Surface a research task: <b>{action.title}</b>
         <div className="text-slate-500 text-xs mt-0.5">{action.brief}</div>
@@ -431,9 +453,10 @@ function ActionPlanCard({ action, onApply, applyState }: {
   })();
 
   const icon =
-    action.type === 'create_kanban_card'  ? <Kanban className="w-3.5 h-3.5" /> :
-    action.type === 'create_kanban_cards' ? <Kanban className="w-3.5 h-3.5" /> :
-    action.type === 'log_report'          ? <FileText className="w-3.5 h-3.5" /> :
+    action.type === 'create_kanban_card'   ? <Kanban className="w-3.5 h-3.5" /> :
+    action.type === 'create_kanban_cards'  ? <Kanban className="w-3.5 h-3.5" /> :
+    action.type === 'log_report'           ? <FileText className="w-3.5 h-3.5" /> :
+    action.type === 'create_finance_task'  ? <FileText className="w-3.5 h-3.5" /> :
     <Search className="w-3.5 h-3.5" />;
 
   const isLogReport = action.type === 'log_report';
@@ -630,6 +653,14 @@ function ImageRouterPanel({ me }: { me: Me }) {
         }
       } else if (result.action.type === 'create_research_task') {
         await postCardFromText(`RESEARCH: ${result.action.title} — ${result.action.brief}`);
+      } else if (result.action.type === 'create_finance_task') {
+        const a = result.action;
+        await postCardFromText(
+          `Pay ${a.vendor} ${a.currency} ${a.amount}` +
+          (a.date ? ` (receipt ${a.date})` : '') +
+          (a.category ? ` — ${a.category}` : '') +
+          ' high priority'
+        );
       }
       setApplyState('done');
     } catch (e) { setErr((e as Error).message); setApplyState('idle'); }

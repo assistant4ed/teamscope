@@ -339,7 +339,8 @@ function AddSubscriberModal({ onDone, onClose }: { onDone: () => void; onClose: 
   }
 
   return (
-    <div className="fixed inset-0 z-50 bg-slate-900/40 grid place-items-center p-4">
+    <div className="fixed inset-0 z-50 bg-slate-900/40 grid place-items-center p-4"
+         onMouseDown={e => { if (e.target === e.currentTarget) onClose(); }}>
       <form onSubmit={submit}
         className="bg-white rounded-2xl p-6 w-full max-w-md space-y-4 shadow-2xl">
         <div className="flex items-center justify-between">

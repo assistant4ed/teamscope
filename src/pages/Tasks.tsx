@@ -407,8 +407,27 @@ function PromoteModal({ task, columns, subscribers, onDone, onClose }: {
   );
 }
 
+// CDN Tailwind JIT can't see dynamic class names like `bg-${color}-50`,
+// so we map to static class strings here. Adding a new tone? Add it
+// to both maps; never compose Tailwind class names from runtime values.
+const TAG_CLS: Record<string, string> = {
+  amber:   'bg-amber-50 text-amber-700',
+  indigo:  'bg-indigo-50 text-indigo-700',
+  blue:    'bg-blue-50 text-blue-700',
+  emerald: 'bg-emerald-50 text-emerald-700',
+  rose:    'bg-rose-50 text-rose-700',
+  slate:   'bg-slate-100 text-slate-700',
+};
+const ACTION_CLS: Record<string, string> = {
+  indigo:  'bg-indigo-50 text-indigo-700 hover:bg-indigo-100',
+  emerald: 'bg-emerald-50 text-emerald-700 hover:bg-emerald-100',
+  amber:   'bg-amber-50 text-amber-700 hover:bg-amber-100',
+  rose:    'bg-rose-50 text-rose-700 hover:bg-rose-100',
+  slate:   'bg-slate-100 text-slate-700 hover:bg-slate-200',
+};
+
 const Tag = ({ color, children }: { color: string; children: React.ReactNode }) => (
-  <span className={`px-2 py-0.5 rounded-full bg-${color}-50 text-${color}-700`}>
+  <span className={`px-2 py-0.5 rounded-full ${TAG_CLS[color] ?? TAG_CLS.slate}`}>
     {children}
   </span>
 );
@@ -419,7 +438,7 @@ const ActionBtn = ({ onClick, busy, icon, label, color }: {
 }) => (
   <button onClick={onClick} disabled={busy}
     className={`inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-sm font-medium
-      bg-${color}-50 text-${color}-700 hover:bg-${color}-100 disabled:opacity-50 transition`}>
+      disabled:opacity-50 transition ${ACTION_CLS[color] ?? ACTION_CLS.slate}`}>
     {icon}{busy ? '…' : label}
   </button>
 );

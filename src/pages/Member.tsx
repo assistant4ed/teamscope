@@ -291,6 +291,17 @@ function SalaryCard({ sub, isBoss }: { sub: Subscriber; isBoss: boolean }) {
 
   return (
     <Card title="Salary" icon={<DollarSign className="w-4 h-4 text-emerald-500" />}>
+      {/* Streak chip always renders when data is in — even for members
+          without configured salary terms (interns, new joiners). */}
+      {streak && (
+        <div className="mb-3">
+          <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full
+                           bg-amber-50 text-amber-800 text-xs font-medium border border-amber-200">
+            <Flame className="w-3 h-3" />
+            {streak.current}d streak · {streak.missed_30d} missed in 30d
+          </span>
+        </div>
+      )}
       {!config ? (
         <p className="text-sm text-slate-500 mb-3">
           No salary terms configured.{!isBoss && ' Ask the boss to set one.'}
@@ -308,13 +319,6 @@ function SalaryCard({ sub, isBoss }: { sub: Subscriber; isBoss: boolean }) {
             {config.payment_type === 'hourly'       && 'per reported hour'}
             {config.payment_type === 'daily_rate'   && 'per reported day'}
           </span>
-          {streak && (
-            <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full
-                             bg-amber-50 text-amber-800 text-xs font-medium border border-amber-200">
-              <Flame className="w-3 h-3" />
-              {streak.current}d streak · {streak.missed_30d} missed in 30d
-            </span>
-          )}
           {config.updated_at && (
             <span className="text-[11px] text-slate-400">
               · updated {new Date(config.updated_at).toLocaleDateString()}
@@ -341,7 +345,7 @@ function SalaryCard({ sub, isBoss }: { sub: Subscriber; isBoss: boolean }) {
           <input type="date" value={to} onChange={e => setTo(e.target.value)}
             className="border border-slate-200 rounded px-2 py-0.5 text-xs bg-white" />
         </div>
-        {period && (
+        {period && config && (
           <div className="text-right">
             <div className="text-xs text-slate-500">Net due</div>
             <div className="text-lg font-bold text-slate-900">

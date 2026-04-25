@@ -583,6 +583,7 @@ interface ImageRouteResult {
   summary: string;
   reply: string;
   action: RouteAction | null;
+  image_url?: string | null;
 }
 
 function ImageRouterPanel({ me }: { me: Me }) {
@@ -643,23 +644,27 @@ function ImageRouterPanel({ me }: { me: Me }) {
   async function applyAction() {
     if (!result?.action) return;
     setApplyState('busy'); setErr(null);
+    // Append the persisted image URL so the resulting card's text
+    // carries a clickable reference back to the original.
+    const imageTag = result.image_url ? ` [image: ${result.image_url}]` : '';
     try {
       // Reuse the SmartRouter apply path: the actions are identical shapes.
       if (result.action.type === 'create_kanban_card') {
-        await postCardFromText(buildCardPrompt(result.action));
+        await postCardFromText(buildCardPrompt(result.action) + imageTag);
       } else if (result.action.type === 'create_kanban_cards') {
         for (const c of result.action.cards) {
-          await postCardFromText(buildCardPrompt(c));
+          await postCardFromText(buildCardPrompt(c) + imageTag);
         }
       } else if (result.action.type === 'create_research_task') {
-        await postCardFromText(`RESEARCH: ${result.action.title} — ${result.action.brief}`);
+        await postCardFromText(`RESEARCH: ${result.action.title} — ${result.action.brief}${imageTag}`);
       } else if (result.action.type === 'create_finance_task') {
         const a = result.action;
         await postCardFromText(
           `Pay ${a.vendor} ${a.currency} ${a.amount}` +
           (a.date ? ` (receipt ${a.date})` : '') +
           (a.category ? ` — ${a.category}` : '') +
-          ' high priority'
+          ' high priority' +
+          imageTag
         );
       }
       setApplyState('done');
@@ -723,8 +728,17 @@ function ImageRouterPanel({ me }: { me: Me }) {
                 </span>
               </div>
               <div className="text-xs text-slate-600 whitespace-pre-line">
-                <b className="text-slate-800">What Claude saw:</b> {result.description}
+                <b className="text-slate-800">What Gemini saw:</b> {result.description}
               </div>
+              {result.image_url && (
+                <div className="text-[11px] text-slate-500">
+                  Saved to Cloudflare Images:{' '}
+                  <a href={result.image_url} target="_blank" rel="noreferrer"
+                    className="text-indigo-600 hover:text-indigo-800 underline break-all">
+                    {result.image_url}
+                  </a>
+                </div>
+              )}
               {result.reply && (
                 <blockquote className="text-xs text-slate-600 bg-slate-50 border-l-2 border-slate-300 pl-2.5 py-1.5">
                   <div className="font-semibold text-slate-500 uppercase tracking-wider text-[10px] mb-0.5">

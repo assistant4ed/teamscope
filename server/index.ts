@@ -34,6 +34,14 @@ const {
   // notifier becomes a no-op if the token is missing.
   TELEGRAM_BOT_TOKEN = '',
   APP_URL = '',
+  // Image-pipeline credentials — all optional. Without GEMINI_API_KEY
+  // the image analyzer falls back to no-vision-available; without the
+  // CF_IMAGES_* trio the analyzer skips persistence and just returns
+  // the description.
+  GEMINI_API_KEY = '',
+  CLOUDFLARE_ACCOUNT_ID = '',
+  CF_IMAGES_TOKEN = '',
+  CF_IMAGES_ACCOUNT_HASH = '',
 } = process.env;
 
 if (!SUPABASE_DB_URL) {
@@ -1969,11 +1977,91 @@ app.post('/api/agent/create-card', async (req, res) => {
   }
 });
 
+// Upload to Cloudflare Images so the bytes survive past the Telegram
+// retention window. Returns the public imagedelivery.net URL. All env
+// vars are optional — when any are missing this returns null and the
+// caller just omits image_url.
+async function uploadToCloudflareImages(
+  buffer: Buffer, mediaType: string, fileName = 'upload.jpg'
+): Promise<string | null> {
+  if (!CLOUDFLARE_ACCOUNT_ID || !CF_IMAGES_TOKEN || !CF_IMAGES_ACCOUNT_HASH) {
+    return null;
+  }
+  try {
+    const form = new FormData();
+    form.append('file', new Blob([new Uint8Array(buffer)], { type: mediaType }), fileName);
+    const upstream = await fetch(
+      `https://api.cloudflare.com/client/v4/accounts/${CLOUDFLARE_ACCOUNT_ID}/images/v1`,
+      {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${CF_IMAGES_TOKEN}` },
+        body: form,
+      }
+    );
+    const data = await upstream.json().catch(() => ({} as Record<string, unknown>));
+    if (!upstream.ok) {
+      console.error('[teamscope] cf-images upload failed:', upstream.status,
+        JSON.stringify(data).slice(0, 200));
+      return null;
+    }
+    const id = (data as { result?: { id?: string } })?.result?.id;
+    if (!id) {
+      console.error('[teamscope] cf-images: no id in response');
+      return null;
+    }
+    return `https://imagedelivery.net/${CF_IMAGES_ACCOUNT_HASH}/${id}/public`;
+  } catch (e) {
+    console.error('[teamscope] cf-images upload error:', (e as Error).message);
+    return null;
+  }
+}
+
+// Vision analysis via Gemini 2.5 Flash. Returns the raw text Claude/Gemini
+// emitted; caller is responsible for JSON-extracting if a structured
+// response was requested.
+async function analyzeImageWithGemini(
+  base64: string, mediaType: string,
+  systemPrompt: string, userText: string
+): Promise<string | null> {
+  if (!GEMINI_API_KEY) return null;
+  try {
+    const upstream = await fetch(
+      `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${GEMINI_API_KEY}`,
+      {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          system_instruction: { parts: [{ text: systemPrompt }] },
+          contents: [{
+            parts: [
+              { inline_data: { mime_type: mediaType, data: base64 } },
+              { text: userText },
+            ],
+          }],
+        }),
+      }
+    );
+    const data = await upstream.json().catch(() => ({} as Record<string, unknown>));
+    if (!upstream.ok) {
+      console.error('[teamscope] gemini error:', upstream.status,
+        JSON.stringify(data).slice(0, 300));
+      return null;
+    }
+    const parts = (data as { candidates?: Array<{ content?: { parts?: Array<{ text?: string }> } }> })
+      ?.candidates?.[0]?.content?.parts;
+    return parts?.[0]?.text || null;
+  } catch (e) {
+    console.error('[teamscope] gemini call failed:', (e as Error).message);
+    return null;
+  }
+}
+
 // Read an image and route it just like a text message — same intent
 // taxonomy, same action shapes. Used by n8n when a Telegram photo
 // arrives, and by the Agent page test panel. Accepts whichever input
 // form the caller has cheapest: a Telegram file_id, a URL, or a raw
-// base64 blob.
+// base64 blob. Vision goes through Gemini 2.5 Flash; the bytes are
+// also uploaded to Cloudflare Images so the link is permanent.
 app.post('/api/agent/analyze-image', async (req, res) => {
   const b = req.body || {};
   const fileId   = (b.telegram_file_id as string | undefined)?.trim();
@@ -1984,12 +2072,13 @@ app.post('/api/agent/analyze-image', async (req, res) => {
   if (!fileId && !url && !b64In) {
     return res.status(400).json({ error: 'one of telegram_file_id, url, base64 required' });
   }
-  if (!ANTHROPIC_API_KEY) {
-    return res.status(503).json({ error: 'ANTHROPIC_API_KEY not configured' });
+  if (!GEMINI_API_KEY) {
+    return res.status(503).json({ error: 'GEMINI_API_KEY not configured' });
   }
 
   try {
     let base64: string;
+    let buffer: Buffer;
     let mediaType: string = (b.media_type as string | undefined) || 'image/jpeg';
 
     if (fileId) {
@@ -2006,21 +2095,21 @@ app.post('/api/agent/analyze-image', async (req, res) => {
         `https://api.telegram.org/file/bot${TELEGRAM_BOT_TOKEN}/${meta.result.file_path}`
       );
       if (!file.ok) return res.status(502).json({ error: 'telegram_download_failed', status: file.status });
-      const buf = Buffer.from(await file.arrayBuffer());
-      base64 = buf.toString('base64');
+      buffer = Buffer.from(await file.arrayBuffer());
+      base64 = buffer.toString('base64');
       mediaType = file.headers.get('content-type') || guessMediaType(meta.result.file_path) || 'image/jpeg';
     } else if (url) {
       const f = await fetch(url);
       if (!f.ok) return res.status(502).json({ error: 'url_fetch_failed', status: f.status });
-      const buf = Buffer.from(await f.arrayBuffer());
-      base64 = buf.toString('base64');
+      buffer = Buffer.from(await f.arrayBuffer());
+      base64 = buffer.toString('base64');
       mediaType = f.headers.get('content-type') || guessMediaType(url) || 'image/jpeg';
-      // strip charset suffix etc.
       mediaType = mediaType.split(';')[0].trim();
     } else {
       base64 = b64In!;
+      buffer = Buffer.from(base64, 'base64');
     }
-    // Cap payload — Anthropic limits image bytes too. ~5MB after b64 ≈ 7M chars.
+    // Cap payload at ~5MB raw / 7M base64 chars.
     if (base64.length > 7_500_000) {
       return res.status(413).json({ error: 'image_too_large' });
     }
@@ -2062,35 +2151,24 @@ app.post('/api/agent/analyze-image', async (req, res) => {
       `- today is ${today} (UTC). Resolve relative dates.\n` +
       "Allowed assignee names:\n" + subsList;
 
-    const userContent: Array<Record<string, unknown>> = [
-      { type: 'image', source: { type: 'base64', media_type: mediaType, data: base64 } },
-    ];
     const captionLine = captionRaw
       ? `\n\nUser's caption: "${captionRaw}"`
       : '\n\n(No caption attached.)';
     const senderLine = senderName ? `Sender: ${senderName}` : 'Sender: unknown';
-    userContent.push({ type: 'text', text: `${senderLine}${captionLine}\n\nWhat should the bot do with this image?` });
+    const userText = `${senderLine}${captionLine}\n\nWhat should the bot do with this image?`;
 
-    const upstream = await fetch('https://api.anthropic.com/v1/messages', {
-      method: 'POST',
-      headers: {
-        'content-type': 'application/json',
-        'anthropic-version': '2023-06-01',
-        'x-api-key': ANTHROPIC_API_KEY,
-      },
-      body: JSON.stringify({
-        model: 'claude-sonnet-4-6',
-        max_tokens: 800,
-        system,
-        messages: [{ role: 'user', content: userContent }],
-      }),
-    });
-    const data = await upstream.json().catch(() => ({} as Record<string, unknown>));
-    if (!upstream.ok) {
-      return res.status(502).json({ error: 'anthropic_error', detail: data });
+    // Vision + CF upload run in parallel — the upload is best-effort
+    // (image_url stays null on failure) so we don't gate the response
+    // on its success.
+    const [rawText, imageUrl] = await Promise.all([
+      analyzeImageWithGemini(base64, mediaType, system, userText),
+      uploadToCloudflareImages(buffer, mediaType, fileId ? `${fileId}.jpg` : 'upload.jpg'),
+    ]);
+
+    if (!rawText) {
+      return res.status(502).json({ error: 'gemini_error', image_url: imageUrl });
     }
-    const raw = (data as { content?: Array<{ text?: string }> })?.content?.[0]?.text || '';
-    const parsed = extractJson(raw);
+    const parsed = extractJson(rawText) as Record<string, unknown> | null;
     if (!parsed) {
       return res.status(200).json({
         intent: 'chatter', confidence: 0,
@@ -2098,11 +2176,29 @@ app.post('/api/agent/analyze-image', async (req, res) => {
         summary: '(image received)',
         reply: 'Got the image — not sure what to do with it. Tell me?',
         action: null,
-        parse_error: 'claude returned non-JSON',
-        raw_preview: raw.slice(0, 200),
+        image_url: imageUrl,
+        parse_error: 'gemini returned non-JSON',
+        raw_preview: rawText.slice(0, 200),
       });
     }
-    res.json(parsed);
+
+    // If the model proposed an action that supports a description /
+    // notes field, embed the image link so the boss's downstream card
+    // carries a clickable reference to the original.
+    if (imageUrl && parsed.action && typeof parsed.action === 'object') {
+      const action = parsed.action as Record<string, unknown>;
+      const link = `\n\nImage: ${imageUrl}`;
+      if (action.type === 'create_kanban_card') {
+        action.description = `${(action.description as string) || ''}${link}`.trim();
+      } else if (action.type === 'create_kanban_cards' && Array.isArray(action.cards) && action.cards.length > 0) {
+        const c0 = action.cards[0] as Record<string, unknown>;
+        c0.description = `${(c0.description as string) || ''}${link}`.trim();
+      } else if (action.type === 'create_finance_task') {
+        action.notes = `${(action.notes as string) || ''}${link}`.trim();
+      }
+    }
+
+    res.json({ ...parsed, image_url: imageUrl });
   } catch (e) {
     res.status(pgErrorStatus(e)).json({ error: (e as Error).message });
   }

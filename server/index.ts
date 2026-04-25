@@ -307,6 +307,15 @@ app.patch('/api/reports/:id',
         vals.push(b[k] === '' ? null : b[k]);
       }
     }
+    // report_date can also move (e.g. n8n bound a late reply to a stale session).
+    if (b.report_date !== undefined) {
+      const d = String(b.report_date);
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(d)) {
+        return res.status(400).json({ error: 'report_date must be YYYY-MM-DD' });
+      }
+      sets.push(`report_date = $${sets.length + 1}::date`);
+      vals.push(d);
+    }
     if (sets.length === 0) return res.status(400).json({ error: 'no fields to update' });
     vals.push(id);
     try {
@@ -368,6 +377,10 @@ app.get('/api/reports/recent', async (req, res) => {
 app.get('/api/tasks', async (req, res) => {
   const user = req.user!;
   const scope = (req.query.scope as string) || (user.role === 'pa' ? 'mine' : 'all');
+  // kind filter — defaults to 'approval' so the n8n master router's
+  // 'clarification' rows (transient bot-asks-user-back state) don't
+  // clutter the queue. Pass &kind=all to see every kind.
+  const kindParam = ((req.query.kind as string) || 'approval').toLowerCase();
   try {
     let sql = `SELECT pa.correlation_id, pa.kind, pa.status, pa.asked_of,
                       pa.created_at, pa.resolved_at, pa.payload,
@@ -377,6 +390,7 @@ app.get('/api/tasks', async (req, res) => {
             LEFT JOIN ops.messages m ON m.id = pa.message_id
             LEFT JOIN ops.profiles p ON p.id = pa.profile_id
                 WHERE pa.status IN ('pending','pa_review','in_progress')`;
+    if (kindParam !== 'all') sql += ` AND pa.kind = '${kindParam.replace(/'/g, '')}'`;
     if (scope === 'mine' && user.role === 'pa') sql += ` AND pa.asked_of = 'pa'`;
     sql += ` ORDER BY pa.created_at DESC LIMIT 100`;
 

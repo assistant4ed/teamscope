@@ -313,6 +313,10 @@ const ReportCard = ({ r, isBoss, importedCount, onChanged }: {
 }) => {
   const [confirmDel, setConfirmDel] = useState(false);
   const [delBusy, setDelBusy] = useState(false);
+  const [editingDate, setEditingDate] = useState(false);
+  const [draftDate, setDraftDate] = useState(toISODate(r.report_date) ?? '');
+  const [dateBusy, setDateBusy] = useState(false);
+  const [dateErr, setDateErr] = useState<string | null>(null);
   const progress =
     [r.goals, r.mid_progress, r.eod_completed].filter(Boolean).length / 3;
   const statusColor =
@@ -343,6 +347,26 @@ const ReportCard = ({ r, isBoss, importedCount, onChanged }: {
     finally { setDelBusy(false); }
   }
 
+  async function commitDate() {
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(draftDate)) {
+      setDateErr('Pick a valid date'); return;
+    }
+    setDateBusy(true); setDateErr(null);
+    try {
+      const res = await apiFetch(`/api/reports/${r.id}`, {
+        method: 'PATCH',
+        body: JSON.stringify({ report_date: draftDate }),
+      });
+      if (!res.ok) {
+        const body = await res.json().catch(() => ({}));
+        throw new Error(body.error || `HTTP ${res.status}`);
+      }
+      setEditingDate(false);
+      onChanged();
+    } catch (e) { setDateErr((e as Error).message); }
+    finally { setDateBusy(false); }
+  }
+
   return (
     <article className="bg-white border border-slate-200 rounded-3xl p-5 shadow-sm hover:shadow-md transition">
       <header className="flex items-start justify-between gap-3 mb-4">
@@ -359,6 +383,13 @@ const ReportCard = ({ r, isBoss, importedCount, onChanged }: {
             </span>
           )}
           <span className={`block w-2 h-2 rounded-full ${statusColor}`} title={`${Math.round(progress*100)}% filed`} />
+          {isBoss && !editingDate && (
+            <button onClick={() => { setDraftDate(toISODate(r.report_date) ?? ''); setEditingDate(true); }}
+              title="Move this report to a different date"
+              className="p-1 text-slate-300 hover:text-indigo-600 hover:bg-indigo-50 rounded">
+              <CalendarIcon className="w-3.5 h-3.5" />
+            </button>
+          )}
           {isBoss && !confirmDel && (
             <button onClick={() => setConfirmDel(true)}
               title="Delete this report row"
@@ -368,6 +399,25 @@ const ReportCard = ({ r, isBoss, importedCount, onChanged }: {
           )}
         </div>
       </header>
+      {editingDate && (
+        <div className="mb-3 -mt-2 flex items-center gap-2 text-xs text-indigo-800
+                        bg-indigo-50 border border-indigo-200 rounded-lg px-2 py-1.5">
+          <CalendarIcon className="w-3.5 h-3.5" />
+          <span>Move to:</span>
+          <input type="date" value={draftDate} onChange={e => setDraftDate(e.target.value)}
+            className="border border-indigo-200 rounded px-2 py-0.5 bg-white" />
+          <button onClick={commitDate} disabled={dateBusy}
+            className="ml-1 px-2 py-0.5 text-xs font-medium bg-indigo-600 hover:bg-indigo-700
+                       disabled:opacity-40 text-white rounded">
+            {dateBusy ? '…' : 'Move'}
+          </button>
+          <button onClick={() => { setEditingDate(false); setDateErr(null); }}
+            className="px-2 py-0.5 text-xs text-slate-600 hover:bg-slate-200 rounded">
+            Cancel
+          </button>
+          {dateErr && <span className="text-rose-600">{dateErr}</span>}
+        </div>
+      )}
       {isBoss && confirmDel && (
         <div className="mb-3 -mt-2 flex items-center gap-2 text-xs text-rose-700
                         bg-rose-50 border border-rose-200 rounded-lg px-2 py-1.5">

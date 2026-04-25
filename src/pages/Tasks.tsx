@@ -27,7 +27,9 @@ export default function Tasks({ me }: { me: Me }) {
   const [subs, setSubs] = useState<Subscriber[]>([]);
   const [loading, setLoading] = useState(true);
   const [err, setErr] = useState<string | null>(null);
-  const [scope, setScope] = useState<'all' | 'mine'>(me.role === 'pa' ? 'mine' : 'all');
+  const [scope, setScope] = useState<'approval' | 'all' | 'mine'>(
+    me.role === 'pa' ? 'mine' : 'approval'
+  );
   const [busy, setBusy] = useState<string | null>(null);
   const [promote, setPromote] = useState<Task | null>(null);
   const [hideEmpty, setHideEmpty] = useState(true);
@@ -41,7 +43,13 @@ export default function Tasks({ me }: { me: Me }) {
   async function load() {
     setLoading(true);
     try {
-      const d = await apiGet<{ tasks: Task[] }>(`/api/tasks?scope=${scope}`);
+      // Map UI scope → API params. 'approval' = real boss-approval tasks
+      // only (no clarification chatter); 'all' = every kind; 'mine' = PA's
+      // own bucket.
+      const params = scope === 'approval' ? 'kind=approval&scope=all'
+        : scope === 'mine' ? 'scope=mine&kind=all'
+        : 'scope=all&kind=all';
+      const d = await apiGet<{ tasks: Task[] }>(`/api/tasks?${params}`);
       setTasks(d.tasks);
       setErr(null);
     } catch (e) { setErr(String(e)); }
@@ -117,7 +125,13 @@ export default function Tasks({ me }: { me: Me }) {
             </button>
           )}
           <div className="inline-flex bg-white border border-slate-200 rounded-lg p-0.5">
+            <button onClick={() => setScope('approval')}
+              title="Only real boss-approval tasks; hides chatter clarifications"
+              className={`px-3 py-1 text-sm rounded ${scope==='approval'?'bg-slate-900 text-white':'text-slate-600'}`}>
+              Approvals
+            </button>
             <button onClick={() => setScope('all')}
+              title="All kinds, including clarification chatter"
               className={`px-3 py-1 text-sm rounded ${scope==='all'?'bg-slate-900 text-white':'text-slate-600'}`}>
               All
             </button>

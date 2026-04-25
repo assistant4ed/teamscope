@@ -2,7 +2,7 @@ import React, { useState, useRef, useEffect } from 'react';
 import { apiPost, apiFetch, Me } from '../auth';
 import {
   Send, Loader2, Bot, User as UserIcon, ChevronDown, ChevronUp, FlaskConical,
-  Kanban, Check,
+  Kanban, Check, Compass, Copy, RotateCcw, FileText, Search, MessageSquare,
 } from 'lucide-react';
 
 interface Classification {
@@ -71,6 +71,7 @@ export default function Agent({ me }: { me: Me }) {
           Send a task. Claude classifies + routes to PA / Manus / auto-execute.
           Same brain as <code>@edpapabot</code>, without Telegram.
         </p>
+        {canUseClassifier && <SmartRouterPanel me={me} />}
         {canUseClassifier && <ReportClassifierPanel />}
         <SendToBoardPanel />
       </div>
@@ -211,6 +212,257 @@ const Tag = ({ color, children }: { color: string; children: React.ReactNode }) 
   };
   return <span className={`px-2 py-0.5 rounded-full ${cls[color] || cls.slate}`}>{children}</span>;
 };
+
+// ---------- Smart Router ------------------------------------------ //
+// Reads any message, classifies intent, and proposes one concrete
+// action the boss can apply with a click. This is the canonical flow
+// going forward — n8n calls the same /api/agent/route-message endpoint
+// from Telegram so the bot does the same thing whether you're typing
+// here or DM'ing it.
+
+type RouteIntent =
+  'answer' | 'report_self' | 'plan_self' | 'delegate'
+  | 'research' | 'status_query' | 'chatter' | 'ambiguous';
+
+interface RouteCard {
+  title: string; description?: string;
+  assignee_name?: string | null; priority?: string;
+  due_date?: string | null;
+}
+type RouteAction =
+  | ({ type: 'create_kanban_card' } & RouteCard)
+  | { type: 'create_kanban_cards'; cards: RouteCard[] }
+  | { type: 'log_report'; slot: 'morning' | 'midday' | 'eod';
+      field: 'goals' | 'mid_progress' | 'eod_completed' | 'eod_unfinished';
+      value: string }
+  | { type: 'create_research_task'; title: string; brief: string };
+
+interface RouteResult {
+  intent: RouteIntent;
+  confidence: number;
+  summary: string;
+  reply: string;
+  action: RouteAction | null;
+}
+
+function SmartRouterPanel({ me }: { me: Me }) {
+  const [open, setOpen] = useState(false);
+  const [text, setText] = useState('');
+  const [senderName, setSenderName] = useState((me.email || '').split('@')[0] || 'me');
+  const [busy, setBusy] = useState(false);
+  const [result, setResult] = useState<RouteResult | null>(null);
+  const [err, setErr] = useState<string | null>(null);
+  const [applyState, setApplyState] = useState<'idle' | 'busy' | 'done'>('idle');
+
+  async function route() {
+    if (!text.trim() || busy) return;
+    setBusy(true); setErr(null); setResult(null); setApplyState('idle');
+    try {
+      const res = await apiFetch('/api/agent/route-message', {
+        method: 'POST',
+        body: JSON.stringify({ text, sender_name: senderName, sender_role: me.role }),
+      });
+      const body = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error((body as {error?: string}).error || `HTTP ${res.status}`);
+      setResult(body as RouteResult);
+    } catch (e) { setErr((e as Error).message); }
+    finally { setBusy(false); }
+  }
+
+  async function applyAction() {
+    if (!result?.action) return;
+    setApplyState('busy'); setErr(null);
+    try {
+      if (result.action.type === 'create_kanban_card') {
+        await postCreateCard(text, result.action.assignee_name);
+      } else if (result.action.type === 'create_kanban_cards') {
+        for (const c of result.action.cards) {
+          // Re-derive a per-card prompt so the backend can resolve
+          // assignee/due. Using the card's own title keeps it simple.
+          await postCreateCard(c.title, c.assignee_name);
+        }
+      } else if (result.action.type === 'create_research_task') {
+        await postCreateCard(`RESEARCH: ${result.action.title} — ${result.action.brief}`, null);
+      } else if (result.action.type === 'log_report') {
+        // No upsert endpoint yet — copy text into clipboard for the
+        // boss to paste into Reports → slot inline editor.
+        await navigator.clipboard.writeText(result.action.value).catch(() => {});
+      }
+      setApplyState('done');
+    } catch (e) { setErr((e as Error).message); setApplyState('idle'); }
+  }
+
+  async function postCreateCard(text: string, assigneeName: string | null | undefined) {
+    const res = await apiFetch('/api/agent/create-card', {
+      method: 'POST',
+      body: JSON.stringify({ text }),
+    });
+    if (!res.ok) {
+      const body = await res.json().catch(() => ({}));
+      throw new Error((body as {error?: string}).error || `HTTP ${res.status}`);
+    }
+    void assigneeName; // create-card re-extracts assignee from the text itself
+  }
+
+  const intentColor: Record<RouteIntent, string> = {
+    answer:       'bg-sky-100 text-sky-800 border-sky-200',
+    report_self:  'bg-emerald-100 text-emerald-800 border-emerald-200',
+    plan_self:    'bg-indigo-100 text-indigo-800 border-indigo-200',
+    delegate:     'bg-amber-100 text-amber-800 border-amber-200',
+    research:     'bg-purple-100 text-purple-800 border-purple-200',
+    status_query: 'bg-slate-100 text-slate-700 border-slate-200',
+    chatter:      'bg-slate-100 text-slate-600 border-slate-200',
+    ambiguous:    'bg-rose-100 text-rose-800 border-rose-200',
+  };
+
+  return (
+    <div className="mt-3">
+      <button onClick={() => setOpen(v => !v)}
+        className="inline-flex items-center gap-1.5 text-xs font-medium
+                   text-indigo-700 hover:text-indigo-900">
+        <Compass className="w-3.5 h-3.5" />
+        Smart router
+        {open ? <ChevronUp className="w-3 h-3" /> : <ChevronDown className="w-3 h-3" />}
+      </button>
+      {open && (
+        <div className="mt-3 bg-slate-50 border border-slate-200 rounded-xl p-4 space-y-3">
+          <p className="text-xs text-slate-500">
+            Reads a message the way @edpapabot does on Telegram, picks one of
+            8 intents, and proposes a single concrete action you can apply
+            with a click.
+          </p>
+          <div className="flex gap-2">
+            <input value={senderName} onChange={e => setSenderName(e.target.value)}
+              placeholder="sender"
+              className="w-32 border border-slate-200 rounded-lg px-2 py-2 text-sm bg-white" />
+            <textarea value={text} onChange={e => setText(e.target.value)}
+              rows={2}
+              placeholder='e.g. "my schedule today: A, B, C" · "tell Andrea to ship the deck Friday"'
+              className="flex-1 border border-slate-200 rounded-lg px-3 py-2 text-sm" />
+            <button onClick={route} disabled={busy || !text.trim()}
+              className="px-3 py-2 text-sm font-medium bg-slate-900 hover:bg-slate-800
+                         disabled:opacity-40 text-white rounded-lg self-stretch">
+              {busy ? <Loader2 className="w-4 h-4 animate-spin" /> : 'Route'}
+            </button>
+          </div>
+          {err && <div className="text-xs text-rose-700 bg-rose-50 border border-rose-200 rounded-lg p-2">{err}</div>}
+          {result && (
+            <div className="bg-white border border-slate-200 rounded-lg p-3 space-y-3">
+              <div className="flex items-center gap-2 flex-wrap">
+                <span className={`px-2 py-0.5 rounded-full border text-xs font-semibold ${intentColor[result.intent]}`}>
+                  {result.intent}
+                </span>
+                <span className="text-xs text-slate-500">
+                  conf {Math.round((result.confidence ?? 0) * 100)}%
+                </span>
+                <button onClick={() => { setText(text); setResult(null); setApplyState('idle'); }}
+                  title="Edit and re-route"
+                  className="ml-auto text-xs text-slate-400 hover:text-slate-700 inline-flex items-center gap-1">
+                  <RotateCcw className="w-3 h-3" /> redo
+                </button>
+              </div>
+              <div className="text-sm text-slate-700 italic">"{result.summary}"</div>
+              {result.reply && (
+                <blockquote className="text-xs text-slate-600 bg-slate-50 border-l-2 border-slate-300 pl-2.5 py-1.5">
+                  <div className="font-semibold text-slate-500 uppercase tracking-wider text-[10px] mb-0.5">
+                    Bot would reply:
+                  </div>
+                  {result.reply}
+                </blockquote>
+              )}
+              <ActionPlanCard action={result.action}
+                onApply={applyAction} applyState={applyState} />
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function ActionPlanCard({ action, onApply, applyState }: {
+  action: RouteAction | null;
+  onApply: () => void;
+  applyState: 'idle' | 'busy' | 'done';
+}) {
+  if (!action) {
+    return (
+      <div className="text-xs text-slate-500 bg-slate-50 border border-dashed border-slate-200 rounded-lg p-2 inline-flex items-center gap-1.5">
+        <MessageSquare className="w-3.5 h-3.5" />
+        Reply only — nothing to record.
+      </div>
+    );
+  }
+
+  const summary = (() => {
+    if (action.type === 'create_kanban_card') {
+      return (
+        <>Create a Today card: <b>{action.title}</b>
+        {action.assignee_name && <> · assigned to <b>{action.assignee_name}</b></>}
+        {action.priority && action.priority !== 'medium' && <> · {action.priority}</>}
+        {action.due_date && <> · due {action.due_date}</>}</>
+      );
+    }
+    if (action.type === 'create_kanban_cards') {
+      return (
+        <>Create {action.cards.length} Today cards:
+          <ul className="list-disc ml-5 mt-1">
+            {action.cards.map((c, i) => (
+              <li key={i}><b>{c.title}</b>{c.assignee_name && <> → {c.assignee_name}</>}</li>
+            ))}
+          </ul>
+        </>
+      );
+    }
+    if (action.type === 'log_report') {
+      return (
+        <>Record into <b>{action.field}</b> on the {action.slot} slot:
+          <div className="mt-1 italic">"{action.value}"</div>
+        </>
+      );
+    }
+    return (
+      <>Surface a research task: <b>{action.title}</b>
+        <div className="text-slate-500 text-xs mt-0.5">{action.brief}</div>
+      </>
+    );
+  })();
+
+  const icon =
+    action.type === 'create_kanban_card'  ? <Kanban className="w-3.5 h-3.5" /> :
+    action.type === 'create_kanban_cards' ? <Kanban className="w-3.5 h-3.5" /> :
+    action.type === 'log_report'          ? <FileText className="w-3.5 h-3.5" /> :
+    <Search className="w-3.5 h-3.5" />;
+
+  const isLogReport = action.type === 'log_report';
+  const applyLabel =
+    applyState === 'done'  ? (isLogReport ? '✓ Copied' : '✓ Applied') :
+    applyState === 'busy'  ? 'Applying…' :
+    isLogReport            ? 'Copy text' :
+    'Apply';
+
+  return (
+    <div className="bg-indigo-50 border border-indigo-200 rounded-lg p-3 text-sm space-y-2">
+      <div className="flex items-start gap-2 text-indigo-900">
+        <div className="mt-0.5">{icon}</div>
+        <div className="flex-1">{summary}</div>
+      </div>
+      <div className="flex items-center gap-2">
+        <button onClick={onApply} disabled={applyState === 'busy' || applyState === 'done'}
+          className="inline-flex items-center gap-1.5 px-3 py-1 text-xs font-medium
+                     bg-indigo-600 hover:bg-indigo-700 disabled:opacity-50 text-white rounded-lg">
+          {applyState === 'busy' && <Loader2 className="w-3.5 h-3.5 animate-spin" />}
+          {applyState === 'done' && <Check className="w-3.5 h-3.5" />}
+          {applyState === 'idle' && (isLogReport ? <Copy className="w-3.5 h-3.5" /> : <Check className="w-3.5 h-3.5" />)}
+          {applyLabel}
+        </button>
+        {isLogReport && applyState === 'done' && (
+          <span className="text-xs text-slate-500">paste into Reports page → slot editor</span>
+        )}
+      </div>
+    </div>
+  );
+}
 
 // Quick natural-language card creation. Anyone authed can use this —
 // intent is the same flow n8n will call when a boss Telegram-messages

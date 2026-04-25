@@ -754,81 +754,189 @@ app.post('/api/agent/classify-report', async (req, res) => {
   }
 });
 
-// Generalised classifier for any Telegram message — wider than
-// /api/agent/classify-report (which is bound to a known slot prompt).
-// n8n should call this BEFORE writing to ops.pending_actions and branch
-// on `kind` so chatter/self-plans never become tasks in the queue.
-app.post('/api/agent/triage-message', async (req, res) => {
-  const text = ((req.body?.text as string) || '').trim().slice(0, 2000);
-  const senderName = ((req.body?.sender_name as string) || '').trim().slice(0, 80);
-  if (!text) return res.status(400).json({ error: 'text required' });
-  if (!ANTHROPIC_API_KEY) {
-    return res.status(503).json({ error: 'ANTHROPIC_API_KEY not configured' });
-  }
+// Canonical message-routing endpoint. Reads any Telegram-style message,
+// returns a single intent + a concrete action the caller can execute
+// directly. n8n should call this on every inbound DM; the web Agent
+// page uses it to power its Smart Router panel.
+app.post('/api/agent/route-message', async (req, res) => {
   try {
-    const subs = await query<{ name: string; active: boolean }>(
-      `SELECT name, active FROM ops.report_subscribers WHERE active = true`
-    );
-    const subsList = subs.map(s => `- ${s.name}`).join('\n') || '(none)';
-
-    const system =
-      "You triage messages a human sent to a Telegram bot connected to a personal-ops system. " +
-      "Output STRICT JSON only (no prose, no fences):\n" +
-      '{\n' +
-      '  "kind": "task_for_member" | "self_plan" | "report_slot" | "question" | "chatter",\n' +
-      '  "confidence": <float 0..1>,\n' +
-      '  "summary": "<one short line, plain prose>",\n' +
-      '  "self_plan": { "goals": [string, ...] },         // only when kind=="self_plan"\n' +
-      '  "task_for_member": { "assignee_name": <one of the allowed names>, "title": "<imperative>", "details": "<one line or empty>" }\n' +
-      '                                                  // only when kind=="task_for_member"\n' +
-      '}\n\n' +
-      "Rules:\n" +
-      "- self_plan: the sender is describing THEIR OWN day/work — e.g. 'my schedule of today: X, Y', 'todo for me: A B C', 'I plan to ...'. Extract goals as a list.\n" +
-      "- task_for_member: the sender wants someone else to do something — must be able to name a member. If no clear assignee, prefer self_plan or chatter.\n" +
-      "- report_slot: the message looks like a structured daily-report reply (hours worked, completed today, etc.) without being addressed at someone.\n" +
-      "- question: a clarifying question to the bot ('what is it', 'who is X').\n" +
-      "- chatter: small talk, reactions, empty/nonsense, or anything not actionable.\n" +
-      "- omit self_plan / task_for_member entirely when not applicable; never put empty objects.\n" +
-      "- assignee_name MUST match one of the allowed names verbatim; first-name mention counts if unambiguous.\n\n" +
-      "Allowed assignee names:\n" + subsList;
-
-    const userMessage = senderName
-      ? `Sender: ${senderName}\n\nMessage:\n${text}`
-      : `Message:\n${text}`;
-
-    const upstream = await fetch('https://api.anthropic.com/v1/messages', {
-      method: 'POST',
-      headers: {
-        'content-type': 'application/json',
-        'anthropic-version': '2023-06-01',
-        'x-api-key': ANTHROPIC_API_KEY,
-      },
-      body: JSON.stringify({
-        model: 'claude-sonnet-4-6',
-        max_tokens: 500,
-        system,
-        messages: [{ role: 'user', content: userMessage }],
-      }),
-    });
-    const data = await upstream.json().catch(() => ({} as Record<string, unknown>));
-    if (!upstream.ok) {
-      return res.status(502).json({ error: 'anthropic_error', detail: data });
-    }
-    const raw = (data as { content?: Array<{ text?: string }> })?.content?.[0]?.text || '';
-    const parsed = extractJson(raw);
-    if (!parsed) {
-      return res.status(200).json({
-        kind: 'chatter', confidence: 0,
-        summary: text.slice(0, 160),
-        parse_error: 'claude returned non-JSON',
-        raw_preview: raw.slice(0, 200),
-      });
-    }
-    res.json(parsed);
+    const out = await routeMessage(req.body);
+    res.json(out);
   } catch (e) {
-    res.status(pgErrorStatus(e)).json({ error: (e as Error).message });
+    const status = (e as { status?: number })?.status ?? pgErrorStatus(e);
+    res.status(status).json({ error: (e as Error).message });
   }
 });
+
+// Legacy shape — kept so n8n's existing wiring keeps working until
+// migrated. Maps the new router output to the older flat schema.
+// Prefer /api/agent/route-message in any new integration.
+app.post('/api/agent/triage-message', async (req, res) => {
+  try {
+    const r = await routeMessage(req.body);
+    const intent = r.intent;
+    const kind: string =
+      intent === 'delegate'      ? 'task_for_member' :
+      intent === 'plan_self'     ? 'self_plan'       :
+      intent === 'report_self'   ? 'report_slot'     :
+      intent === 'ambiguous'     ? 'question'        :
+      intent === 'status_query'  ? 'question'        :
+      intent === 'answer'        ? 'question'        :
+                                   'chatter';
+    const out: Record<string, unknown> = {
+      kind, confidence: r.confidence, summary: r.summary,
+    };
+    if (r.action?.type === 'create_kanban_card') {
+      out.task_for_member = {
+        assignee_name: r.action.assignee_name ?? null,
+        title: r.action.title,
+        details: r.action.description ?? '',
+      };
+    } else if (r.action?.type === 'create_kanban_cards') {
+      out.self_plan = { goals: r.action.cards.map(c => c.title) };
+    }
+    res.json(out);
+  } catch (e) {
+    const status = (e as { status?: number })?.status ?? pgErrorStatus(e);
+    res.status(status).json({ error: (e as Error).message });
+  }
+});
+
+// ---------- Shared router implementation --------------------------- //
+type RouteAction =
+  | { type: 'create_kanban_card'; title: string; description?: string;
+      assignee_name?: string | null; priority?: string; due_date?: string | null }
+  | { type: 'create_kanban_cards'; cards: Array<{
+      title: string; description?: string;
+      assignee_name?: string | null; priority?: string; due_date?: string | null;
+    }> }
+  | { type: 'log_report'; slot: 'morning' | 'midday' | 'eod';
+      field: 'goals' | 'mid_progress' | 'eod_completed' | 'eod_unfinished';
+      value: string }
+  | { type: 'create_research_task'; title: string; brief: string };
+
+interface RouteResult {
+  intent: 'answer' | 'report_self' | 'plan_self' | 'delegate'
+        | 'research' | 'status_query' | 'chatter' | 'ambiguous';
+  confidence: number;
+  summary: string;
+  reply: string;
+  action: RouteAction | null;
+  parse_error?: string;
+  raw_preview?: string;
+}
+
+async function routeMessage(body: Record<string, unknown> | undefined): Promise<RouteResult> {
+  const text = String((body?.text as string) || '').trim().slice(0, 2000);
+  const senderName = String((body?.sender_name as string) || '').trim().slice(0, 80);
+  const senderRole = String((body?.sender_role as string) || '').trim().slice(0, 40);
+  if (!text) {
+    const err = new Error('text required') as Error & { status: number };
+    err.status = 400;
+    throw err;
+  }
+  if (!ANTHROPIC_API_KEY) {
+    const err = new Error('ANTHROPIC_API_KEY not configured') as Error & { status: number };
+    err.status = 503;
+    throw err;
+  }
+
+  // Pull live context: subscribers (for delegate matches) and the three
+  // current slot prompts (so report_self vs plan_self is judgeable).
+  const [subs, tpls] = await Promise.all([
+    query<{ name: string }>(
+      `SELECT name FROM ops.report_subscribers WHERE active = true ORDER BY name`
+    ),
+    query<{ slot: string; template_text: string }>(
+      `SELECT slot, template_text FROM ops.report_prompt_templates`
+    ),
+  ]);
+  const subsList = subs.map(s => `- ${s.name}`).join('\n') || '(none)';
+  const tplBySlot: Record<string, string> = {};
+  for (const t of tpls) tplBySlot[t.slot] = t.template_text;
+  const today = new Date().toISOString().slice(0, 10);
+
+  const system =
+    "You are the intent router for a personal-ops Telegram bot. Read one message and pick a single intent " +
+    "from the list, then return STRICT JSON only — no prose, no fences.\n\n" +
+    "Intents:\n" +
+    "- answer: sender is asking a factual question the bot should answer with text (no record needed).\n" +
+    "- report_self: sender is filing daily-report content for themselves (hours worked, what got done, blockers).\n" +
+    "- plan_self: sender is listing THEIR OWN goals/todos for the day. Each item becomes a card.\n" +
+    "- delegate: sender wants a named team member to do something. Must be able to match a name from the list.\n" +
+    "- research: sender wants deep work / a research task done (often phrased 'find X', 'research Y'). Surface as a research task; don't attempt to execute.\n" +
+    "- status_query: sender is asking about the state of something tracked (a card, a member's progress, recent reports).\n" +
+    "- chatter: small talk, reactions, fragments, ack messages.\n" +
+    "- ambiguous: not enough info to act — bot should reply asking for clarification.\n\n" +
+    "Output schema:\n" +
+    '{\n' +
+    '  "intent": "<one of the above>",\n' +
+    '  "confidence": <float 0..1>,\n' +
+    '  "summary": "<one short line>",\n' +
+    '  "reply": "<what the bot should DM back to the sender — keep under 240 chars, plain prose>",\n' +
+    '  "action": <object or null>\n' +
+    '}\n\n' +
+    "Action shapes (exactly one or null; omit when not applicable):\n" +
+    '- { "type": "create_kanban_card", "title": "<imperative>", "description": "<optional>", "assignee_name": "<from allowed list or null>", "priority": "low|medium|high|urgent", "due_date": "<YYYY-MM-DD or null>" }\n' +
+    '- { "type": "create_kanban_cards", "cards": [<the same card shape>, ...] }   // for plan_self when multiple goals were listed\n' +
+    '- { "type": "log_report", "slot": "morning|midday|eod", "field": "goals|mid_progress|eod_completed|eod_unfinished", "value": "<cleaned text>" }\n' +
+    '- { "type": "create_research_task", "title": "RESEARCH: <topic>", "brief": "<one-line scope>" }\n' +
+    '- null  (for answer/chatter/ambiguous/status_query)\n\n' +
+    "Rules:\n" +
+    "- assignee_name MUST be one of the allowed names below, verbatim. First-name mention is enough if unambiguous. If no name in the message, set null.\n" +
+    `- today is ${today} (UTC). Resolve relative dates like 'tomorrow', 'Friday', 'next week' to YYYY-MM-DD.\n` +
+    "- For report_self pick the slot by content: hours/done/unfinished → eod; what's-done-since-morning → midday; goals/plan → morning. Field maps: goals→morning, mid_progress→midday, eod_completed→eod (or eod_unfinished if framed as 'unfinished').\n" +
+    "- plan_self vs report_self: if the message lists tasks they intend to do today, prefer plan_self (creates board cards). Use report_self only when it reads like a status update against today's work.\n" +
+    "- Be conservative — if the message could be either delegate or chatter, prefer chatter.\n\n" +
+    "Allowed assignee names:\n" + subsList + "\n\n" +
+    "Current bot slot prompts (for context — DO NOT echo them):\n" +
+    `MORNING: ${(tplBySlot.morning || '(default)').slice(0, 200)}\n` +
+    `MIDDAY:  ${(tplBySlot.midday  || '(default)').slice(0, 200)}\n` +
+    `EOD:     ${(tplBySlot.eod     || '(default)').slice(0, 200)}`;
+
+  const userMessage =
+    `Sender: ${senderName || 'unknown'}${senderRole ? ` (${senderRole})` : ''}\n\nMessage:\n${text}`;
+
+  const upstream = await fetch('https://api.anthropic.com/v1/messages', {
+    method: 'POST',
+    headers: {
+      'content-type': 'application/json',
+      'anthropic-version': '2023-06-01',
+      'x-api-key': ANTHROPIC_API_KEY,
+    },
+    body: JSON.stringify({
+      model: 'claude-sonnet-4-6',
+      max_tokens: 700,
+      system,
+      messages: [{ role: 'user', content: userMessage }],
+    }),
+  });
+  const data = await upstream.json().catch(() => ({} as Record<string, unknown>));
+  if (!upstream.ok) {
+    const err = new Error('anthropic_error: ' + JSON.stringify(data).slice(0, 200)) as Error & { status: number };
+    err.status = 502;
+    throw err;
+  }
+  const raw = (data as { content?: Array<{ text?: string }> })?.content?.[0]?.text || '';
+  const parsed = extractJson(raw) as Partial<RouteResult> | null;
+  if (!parsed || !parsed.intent) {
+    return {
+      intent: 'chatter', confidence: 0,
+      summary: text.slice(0, 160),
+      reply: 'Got it.',
+      action: null,
+      parse_error: 'claude returned non-JSON',
+      raw_preview: raw.slice(0, 200),
+    };
+  }
+  return {
+    intent: parsed.intent,
+    confidence: typeof parsed.confidence === 'number' ? parsed.confidence : 0.5,
+    summary: parsed.summary || text.slice(0, 160),
+    reply: parsed.reply || 'Got it.',
+    action: (parsed.action ?? null) as RouteAction | null,
+  };
+}
 
 // Boss-only retroactive cleanup of the AI-classified queue.
 // Phase 1: cancel anything with no origin_text (media/forwards/system msgs).

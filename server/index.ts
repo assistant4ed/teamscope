@@ -1294,6 +1294,149 @@ app.post('/api/agent/create-card', async (req, res) => {
   }
 });
 
+// Read an image and route it just like a text message — same intent
+// taxonomy, same action shapes. Used by n8n when a Telegram photo
+// arrives, and by the Agent page test panel. Accepts whichever input
+// form the caller has cheapest: a Telegram file_id, a URL, or a raw
+// base64 blob.
+app.post('/api/agent/analyze-image', async (req, res) => {
+  const b = req.body || {};
+  const fileId   = (b.telegram_file_id as string | undefined)?.trim();
+  const url      = (b.url as string | undefined)?.trim();
+  const b64In    = (b.base64 as string | undefined)?.trim();
+  const captionRaw = ((b.caption as string | undefined) || '').trim().slice(0, 1000);
+  const senderName = ((b.sender_name as string | undefined) || '').trim().slice(0, 80);
+  if (!fileId && !url && !b64In) {
+    return res.status(400).json({ error: 'one of telegram_file_id, url, base64 required' });
+  }
+  if (!ANTHROPIC_API_KEY) {
+    return res.status(503).json({ error: 'ANTHROPIC_API_KEY not configured' });
+  }
+
+  try {
+    let base64: string;
+    let mediaType: string = (b.media_type as string | undefined) || 'image/jpeg';
+
+    if (fileId) {
+      if (!TELEGRAM_BOT_TOKEN) {
+        return res.status(503).json({ error: 'TELEGRAM_BOT_TOKEN required for telegram_file_id' });
+      }
+      const meta = await fetch(
+        `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/getFile?file_id=${encodeURIComponent(fileId)}`
+      ).then(r => r.json() as Promise<{ ok: boolean; result?: { file_path?: string }; description?: string }>);
+      if (!meta.ok || !meta.result?.file_path) {
+        return res.status(502).json({ error: 'telegram_getfile_failed', detail: meta.description || meta });
+      }
+      const file = await fetch(
+        `https://api.telegram.org/file/bot${TELEGRAM_BOT_TOKEN}/${meta.result.file_path}`
+      );
+      if (!file.ok) return res.status(502).json({ error: 'telegram_download_failed', status: file.status });
+      const buf = Buffer.from(await file.arrayBuffer());
+      base64 = buf.toString('base64');
+      mediaType = file.headers.get('content-type') || guessMediaType(meta.result.file_path) || 'image/jpeg';
+    } else if (url) {
+      const f = await fetch(url);
+      if (!f.ok) return res.status(502).json({ error: 'url_fetch_failed', status: f.status });
+      const buf = Buffer.from(await f.arrayBuffer());
+      base64 = buf.toString('base64');
+      mediaType = f.headers.get('content-type') || guessMediaType(url) || 'image/jpeg';
+      // strip charset suffix etc.
+      mediaType = mediaType.split(';')[0].trim();
+    } else {
+      base64 = b64In!;
+    }
+    // Cap payload — Anthropic limits image bytes too. ~5MB after b64 ≈ 7M chars.
+    if (base64.length > 7_500_000) {
+      return res.status(413).json({ error: 'image_too_large' });
+    }
+
+    const subs = await query<{ name: string }>(
+      `SELECT name FROM ops.report_subscribers WHERE active = true ORDER BY name`
+    );
+    const subsList = subs.map(s => `- ${s.name}`).join('\n') || '(none)';
+    const today = new Date().toISOString().slice(0, 10);
+
+    const system =
+      "You are the image-aware intent router for a personal-ops Telegram bot. " +
+      "The user just sent an image (with optional caption). Look at the image " +
+      "and decide what to do, using the same intent taxonomy as the text router. " +
+      "Output STRICT JSON only:\n" +
+      '{\n' +
+      '  "description": "<3-6 sentences describing what is in the image>",\n' +
+      '  "intent": "answer" | "report_self" | "plan_self" | "delegate" | "research" | "context_attach" | "chatter" | "ambiguous",\n' +
+      '  "confidence": 0..1,\n' +
+      '  "summary": "<one short line>",\n' +
+      '  "reply": "<what the bot should DM back, under 240 chars>",\n' +
+      '  "action": <one of the typed actions below, or null>\n' +
+      '}\n\n' +
+      "Action shapes:\n" +
+      '- { "type": "create_kanban_card", "title": "<imperative>", "description": "<image summary + caption>", "assignee_name": "<from list or null>", "priority": "low|medium|high|urgent", "due_date": "<YYYY-MM-DD or null>" }\n' +
+      '- { "type": "create_kanban_cards", "cards": [<the same card shape>, ...] }\n' +
+      '- { "type": "log_report", "slot": "morning|midday|eod", "field": "goals|mid_progress|eod_completed|eod_unfinished", "value": "<cleaned text>" }\n' +
+      '- { "type": "create_research_task", "title": "RESEARCH: <topic>", "brief": "<one-line scope>" }\n' +
+      '- null (for answer/chatter/ambiguous/context_attach)\n\n' +
+      "Rules:\n" +
+      "- 'context_attach' is special-image: a screenshot/reference picture related to other ongoing work. " +
+      "  In this case set action to null and put the description into the reply, e.g. 'Saw the hairstyle reference — attached to the salon brief.' (Boss decides where to attach it manually.)\n" +
+      "- A receipt / invoice → research or delegate (boss approval) for finance follow-up.\n" +
+      "- A whiteboard / meeting notes → plan_self (one card per action item).\n" +
+      "- A photo of a thing-to-buy → delegate to PA if the caption implies action; otherwise context_attach.\n" +
+      "- assignee_name MUST be one of the allowed names verbatim. First-name match counts.\n" +
+      `- today is ${today} (UTC). Resolve relative dates.\n` +
+      "Allowed assignee names:\n" + subsList;
+
+    const userContent: Array<Record<string, unknown>> = [
+      { type: 'image', source: { type: 'base64', media_type: mediaType, data: base64 } },
+    ];
+    const captionLine = captionRaw
+      ? `\n\nUser's caption: "${captionRaw}"`
+      : '\n\n(No caption attached.)';
+    const senderLine = senderName ? `Sender: ${senderName}` : 'Sender: unknown';
+    userContent.push({ type: 'text', text: `${senderLine}${captionLine}\n\nWhat should the bot do with this image?` });
+
+    const upstream = await fetch('https://api.anthropic.com/v1/messages', {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        'anthropic-version': '2023-06-01',
+        'x-api-key': ANTHROPIC_API_KEY,
+      },
+      body: JSON.stringify({
+        model: 'claude-sonnet-4-6',
+        max_tokens: 800,
+        system,
+        messages: [{ role: 'user', content: userContent }],
+      }),
+    });
+    const data = await upstream.json().catch(() => ({} as Record<string, unknown>));
+    if (!upstream.ok) {
+      return res.status(502).json({ error: 'anthropic_error', detail: data });
+    }
+    const raw = (data as { content?: Array<{ text?: string }> })?.content?.[0]?.text || '';
+    const parsed = extractJson(raw);
+    if (!parsed) {
+      return res.status(200).json({
+        intent: 'chatter', confidence: 0,
+        description: 'Could not parse vision response.',
+        summary: '(image received)',
+        reply: 'Got the image — not sure what to do with it. Tell me?',
+        action: null,
+        parse_error: 'claude returned non-JSON',
+        raw_preview: raw.slice(0, 200),
+      });
+    }
+    res.json(parsed);
+  } catch (e) {
+    res.status(pgErrorStatus(e)).json({ error: (e as Error).message });
+  }
+});
+
+function guessMediaType(path: string): string | null {
+  const m = path.toLowerCase().match(/\.(jpe?g|png|gif|webp)(?:\?|$)/);
+  if (!m) return null;
+  return m[1] === 'jpg' ? 'image/jpeg' : `image/${m[1]}`;
+}
+
 // Pull the first JSON object out of Claude's reply, even if wrapped
 // in prose or a fenced code block. Returns null if nothing parses.
 function extractJson(raw: string): Record<string, unknown> | null {

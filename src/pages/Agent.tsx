@@ -3,6 +3,7 @@ import { apiPost, apiFetch, Me } from '../auth';
 import {
   Send, Loader2, Bot, User as UserIcon, ChevronDown, ChevronUp, FlaskConical,
   Kanban, Check, Compass, Copy, RotateCcw, FileText, Search, MessageSquare,
+  Image as ImageIcon, X as XIcon,
 } from 'lucide-react';
 
 interface Classification {
@@ -72,6 +73,7 @@ export default function Agent({ me }: { me: Me }) {
           Same brain as <code>@edpapabot</code>, without Telegram.
         </p>
         {canUseClassifier && <SmartRouterPanel me={me} />}
+        {canUseClassifier && <ImageRouterPanel me={me} />}
         {canUseClassifier && <ReportClassifierPanel />}
         <SendToBoardPanel />
       </div>
@@ -546,6 +548,187 @@ function SendToBoardPanel() {
       )}
     </div>
   );
+}
+
+// Drop or paste an image, send it to the same intent router that
+// powers /api/agent/route-message but with vision. Same shape result;
+// boss can apply the proposed action or shrug it off.
+interface ImageRouteResult {
+  description: string;
+  intent: string;
+  confidence: number;
+  summary: string;
+  reply: string;
+  action: RouteAction | null;
+}
+
+function ImageRouterPanel({ me }: { me: Me }) {
+  const [open, setOpen] = useState(false);
+  const [preview, setPreview] = useState<string | null>(null);
+  const [base64, setBase64] = useState<string | null>(null);
+  const [mediaType, setMediaType] = useState<string>('image/jpeg');
+  const [caption, setCaption] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [result, setResult] = useState<ImageRouteResult | null>(null);
+  const [err, setErr] = useState<string | null>(null);
+  const [applyState, setApplyState] = useState<'idle' | 'busy' | 'done'>('idle');
+
+  function pick(file: File) {
+    if (!file.type.startsWith('image/')) {
+      setErr('Not an image file'); return;
+    }
+    if (file.size > 5 * 1024 * 1024) {
+      setErr('Image too large (max 5 MB)'); return;
+    }
+    setErr(null);
+    const reader = new FileReader();
+    reader.onload = () => {
+      const dataUrl = String(reader.result);
+      setPreview(dataUrl);
+      const [meta, b64] = dataUrl.split(',');
+      const mt = (meta.match(/data:(.*?);base64/) ?? ['', 'image/jpeg'])[1];
+      setMediaType(mt);
+      setBase64(b64);
+      setResult(null); setApplyState('idle');
+    };
+    reader.readAsDataURL(file);
+  }
+
+  function clear() {
+    setPreview(null); setBase64(null); setResult(null); setApplyState('idle'); setErr(null);
+  }
+
+  async function analyze() {
+    if (!base64 || busy) return;
+    setBusy(true); setErr(null); setResult(null); setApplyState('idle');
+    try {
+      const res = await apiFetch('/api/agent/analyze-image', {
+        method: 'POST',
+        body: JSON.stringify({
+          base64, media_type: mediaType,
+          caption: caption || undefined,
+          sender_name: (me.email || '').split('@')[0],
+        }),
+      });
+      const body = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error((body as {error?: string}).error || `HTTP ${res.status}`);
+      setResult(body as ImageRouteResult);
+    } catch (e) { setErr((e as Error).message); }
+    finally { setBusy(false); }
+  }
+
+  async function applyAction() {
+    if (!result?.action) return;
+    setApplyState('busy'); setErr(null);
+    try {
+      // Reuse the SmartRouter apply path: the actions are identical shapes.
+      if (result.action.type === 'create_kanban_card') {
+        await postCardFromText(buildCardPrompt(result.action));
+      } else if (result.action.type === 'create_kanban_cards') {
+        for (const c of result.action.cards) {
+          await postCardFromText(buildCardPrompt(c));
+        }
+      } else if (result.action.type === 'create_research_task') {
+        await postCardFromText(`RESEARCH: ${result.action.title} — ${result.action.brief}`);
+      }
+      setApplyState('done');
+    } catch (e) { setErr((e as Error).message); setApplyState('idle'); }
+  }
+
+  return (
+    <div className="mt-3">
+      <button onClick={() => setOpen(v => !v)}
+        className="inline-flex items-center gap-1.5 text-xs font-medium
+                   text-indigo-700 hover:text-indigo-900">
+        <ImageIcon className="w-3.5 h-3.5" />
+        Image router
+        {open ? <ChevronUp className="w-3 h-3" /> : <ChevronDown className="w-3 h-3" />}
+      </button>
+      {open && (
+        <div className="mt-3 bg-slate-50 border border-slate-200 rounded-xl p-4 space-y-3">
+          <p className="text-xs text-slate-500">
+            Drop or pick an image — Claude vision describes it and proposes
+            the same intents/actions as text messages. Same endpoint n8n will
+            call when a Telegram photo arrives.
+          </p>
+          {!preview ? (
+            <label className="block border-2 border-dashed border-slate-300 rounded-lg p-6 text-center
+                              text-sm text-slate-500 hover:border-indigo-400 hover:bg-white cursor-pointer">
+              <ImageIcon className="w-6 h-6 mx-auto text-slate-400 mb-1" />
+              Click to select an image (jpg, png, webp · max 5 MB)
+              <input type="file" accept="image/*" className="hidden"
+                onChange={e => e.target.files?.[0] && pick(e.target.files[0])} />
+            </label>
+          ) : (
+            <div className="relative">
+              <img src={preview} alt="preview"
+                className="max-h-48 rounded-lg border border-slate-200 mx-auto" />
+              <button onClick={clear}
+                className="absolute -top-2 -right-2 bg-white border border-slate-300 rounded-full p-1
+                           text-slate-500 hover:text-rose-600 shadow">
+                <XIcon className="w-3 h-3" />
+              </button>
+            </div>
+          )}
+          <input value={caption} onChange={e => setCaption(e.target.value)}
+            placeholder="Optional caption (what should Claude pay attention to?)"
+            className="w-full border border-slate-200 rounded-lg px-3 py-2 text-sm" />
+          <button onClick={analyze} disabled={busy || !base64}
+            className="px-3 py-2 text-sm font-medium bg-slate-900 hover:bg-slate-800
+                       disabled:opacity-40 text-white rounded-lg inline-flex items-center gap-1.5">
+            {busy ? <Loader2 className="w-4 h-4 animate-spin" /> : <Compass className="w-4 h-4" />}
+            Analyze image
+          </button>
+          {err && <div className="text-xs text-rose-700 bg-rose-50 border border-rose-200 rounded-lg p-2">{err}</div>}
+          {result && (
+            <div className="bg-white border border-slate-200 rounded-lg p-3 space-y-3">
+              <div className="flex items-center gap-2 flex-wrap">
+                <span className="px-2 py-0.5 rounded-full border text-xs font-semibold
+                                 bg-indigo-50 text-indigo-800 border-indigo-200">
+                  {result.intent}
+                </span>
+                <span className="text-xs text-slate-500">
+                  conf {Math.round((result.confidence ?? 0) * 100)}%
+                </span>
+              </div>
+              <div className="text-xs text-slate-600 whitespace-pre-line">
+                <b className="text-slate-800">What Claude saw:</b> {result.description}
+              </div>
+              {result.reply && (
+                <blockquote className="text-xs text-slate-600 bg-slate-50 border-l-2 border-slate-300 pl-2.5 py-1.5">
+                  <div className="font-semibold text-slate-500 uppercase tracking-wider text-[10px] mb-0.5">
+                    Bot would reply:
+                  </div>
+                  {result.reply}
+                </blockquote>
+              )}
+              <ActionPlanCard action={result.action}
+                onApply={applyAction} applyState={applyState} />
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+async function postCardFromText(text: string): Promise<void> {
+  const res = await apiFetch('/api/agent/create-card', {
+    method: 'POST',
+    body: JSON.stringify({ text }),
+  });
+  if (!res.ok) {
+    const body = await res.json().catch(() => ({}));
+    throw new Error((body as {error?: string}).error || `HTTP ${res.status}`);
+  }
+}
+
+function buildCardPrompt(c: { title: string; assignee_name?: string | null; priority?: string; due_date?: string | null }): string {
+  const bits = [c.title];
+  if (c.assignee_name) bits.push(`for ${c.assignee_name}`);
+  if (c.priority && c.priority !== 'medium') bits.push(`(${c.priority} priority)`);
+  if (c.due_date) bits.push(`by ${c.due_date}`);
+  return bits.join(' ');
 }
 
 // Lets a boss/PA paste a hypothetical Telegram reply and see how the

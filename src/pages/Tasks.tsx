@@ -2,6 +2,7 @@ import React, { useEffect, useState } from 'react';
 import { apiGet, apiFetch, apiPost, Me } from '../auth';
 import {
   CheckCircle2, PlayCircle, XCircle, RefreshCw, Kanban, X,
+  EyeOff, Eye, Sparkles, AlertTriangle,
 } from 'lucide-react';
 
 interface Task {
@@ -29,6 +30,13 @@ export default function Tasks({ me }: { me: Me }) {
   const [scope, setScope] = useState<'all' | 'mine'>(me.role === 'pa' ? 'mine' : 'all');
   const [busy, setBusy] = useState<string | null>(null);
   const [promote, setPromote] = useState<Task | null>(null);
+  const [hideEmpty, setHideEmpty] = useState(true);
+  const [tidyBusy, setTidyBusy] = useState(false);
+  const [tidyResult, setTidyResult] = useState<{
+    empty_cancelled: number; chatter_cancelled: number; kept: number;
+    self_plans: Array<{ correlation_id: string; summary: string }>;
+  } | null>(null);
+  const selfPlanIds = new Set(tidyResult?.self_plans.map(s => s.correlation_id) ?? []);
 
   async function load() {
     setLoading(true);
@@ -62,6 +70,24 @@ export default function Tasks({ me }: { me: Me }) {
     finally { setBusy(null); }
   }
 
+  async function runTidy() {
+    setTidyBusy(true); setErr(null);
+    try {
+      const r = await apiPost<{
+        empty_cancelled: number; chatter_cancelled: number; kept: number;
+        self_plans: Array<{ correlation_id: string; summary: string }>;
+      }>('/api/tasks/cleanup', {});
+      setTidyResult(r);
+      await load();
+    } catch (e) { setErr(String(e)); }
+    finally { setTidyBusy(false); }
+  }
+
+  const visibleTasks = hideEmpty
+    ? tasks.filter(t => t.origin_text && t.origin_text.trim().length > 0)
+    : tasks;
+  const hiddenCount = tasks.length - visibleTasks.length;
+
   return (
     <div className="p-6 md:p-10 max-w-6xl mx-auto">
       <div className="flex items-center justify-between mb-6">
@@ -71,7 +97,25 @@ export default function Tasks({ me }: { me: Me }) {
             {me.role === 'pa' ? 'Your assignments from Ed.' : 'All pending & in-progress work.'}
           </p>
         </div>
-        <div className="flex items-center gap-2">
+        <div className="flex items-center gap-2 flex-wrap">
+          <button onClick={() => setHideEmpty(v => !v)}
+            title="Hide rows with no message body — usually media/forwards"
+            className={`inline-flex items-center gap-1.5 px-3 py-1 text-xs rounded-lg border
+              ${hideEmpty
+                ? 'bg-slate-900 text-white border-slate-900'
+                : 'bg-white text-slate-600 border-slate-200 hover:border-slate-300'}`}>
+            {hideEmpty ? <EyeOff className="w-3.5 h-3.5" /> : <Eye className="w-3.5 h-3.5" />}
+            {hideEmpty ? 'Hiding empty' : 'Show all'}
+          </button>
+          {me.role === 'boss' && (
+            <button onClick={runTidy} disabled={tidyBusy}
+              title="Use AI to cancel empty/chatter rows and flag self-plans for review"
+              className="inline-flex items-center gap-1.5 px-3 py-1 text-xs rounded-lg
+                         bg-indigo-50 text-indigo-700 hover:bg-indigo-100 disabled:opacity-50 border border-indigo-200">
+              <Sparkles className={`w-3.5 h-3.5 ${tidyBusy ? 'animate-pulse' : ''}`} />
+              {tidyBusy ? 'Tidying…' : 'Run AI tidy'}
+            </button>
+          )}
           <div className="inline-flex bg-white border border-slate-200 rounded-lg p-0.5">
             <button onClick={() => setScope('all')}
               className={`px-3 py-1 text-sm rounded ${scope==='all'?'bg-slate-900 text-white':'text-slate-600'}`}>
@@ -91,17 +135,43 @@ export default function Tasks({ me }: { me: Me }) {
 
       {err && <div className="mb-4 p-3 bg-red-50 border border-red-200 text-red-700 rounded-lg text-sm">{err}</div>}
 
-      {tasks.length === 0 && !loading && (
+      {tidyResult && (
+        <div className="mb-4 bg-emerald-50 border border-emerald-200 rounded-xl p-3 flex items-start gap-2 text-sm">
+          <Sparkles className="w-4 h-4 text-emerald-700 mt-0.5 flex-shrink-0" />
+          <div className="flex-1 text-emerald-800">
+            <b>AI tidy</b> — cancelled {tidyResult.empty_cancelled} empty
+            + {tidyResult.chatter_cancelled} chatter rows.
+            {tidyResult.self_plans.length > 0
+              ? <> Flagged {tidyResult.self_plans.length} as <i>your own plan</i> — review the amber rows below.</>
+              : <> {tidyResult.kept} task{tidyResult.kept === 1 ? '' : 's'} kept.</>}
+          </div>
+          <button onClick={() => setTidyResult(null)} className="text-emerald-500 hover:text-emerald-700">
+            <X className="w-4 h-4" />
+          </button>
+        </div>
+      )}
+
+      {hideEmpty && hiddenCount > 0 && (
+        <div className="mb-4 text-xs text-slate-500">
+          {hiddenCount} empty row{hiddenCount === 1 ? '' : 's'} hidden ·{' '}
+          <button onClick={() => setHideEmpty(false)} className="text-indigo-600 hover:text-indigo-800 underline">
+            show
+          </button>
+        </div>
+      )}
+
+      {visibleTasks.length === 0 && !loading && (
         <div className="py-16 text-center text-slate-400">
           Nothing to do. {scope === 'mine' ? 'No tasks assigned to you.' : 'Inbox is empty.'}
         </div>
       )}
 
       <ul className="space-y-3">
-        {tasks.map(t => (
+        {visibleTasks.map(t => (
           <TaskCard key={t.correlation_id}
             t={t} me={me} busy={busy} act={act}
             onPromote={() => setPromote(t)}
+            isSelfPlan={selfPlanIds.has(t.correlation_id)}
           />
         ))}
       </ul>
@@ -116,16 +186,25 @@ export default function Tasks({ me }: { me: Me }) {
   );
 }
 
-function TaskCard({ t, me, busy, act, onPromote }: {
+function TaskCard({ t, me, busy, act, onPromote, isSelfPlan = false }: {
   t: Task; me: Me;
   busy: string | null;
   act: (id: string, verb: 'claim' | 'complete' | 'cancel') => void;
   onPromote: () => void;
+  isSelfPlan?: boolean;
 }) {
   const canAct = me.role === 'pa' || me.role === 'boss';
 
   return (
-    <li className="bg-white border border-slate-200 rounded-xl p-5">
+    <li className={`bg-white rounded-xl p-5 border ${
+      isSelfPlan ? 'border-amber-300 bg-amber-50/40' : 'border-slate-200'
+    }`}>
+      {isSelfPlan && (
+        <div className="mb-3 flex items-center gap-1.5 text-xs text-amber-800 bg-amber-100 border border-amber-200 rounded-lg px-2.5 py-1 w-fit">
+          <AlertTriangle className="w-3.5 h-3.5" />
+          Looks like your own plan — Promote to card to track on the Board, or Cancel.
+        </div>
+      )}
       <div className="flex items-start justify-between gap-4">
         <div className="flex-1 min-w-0">
           <div className="flex items-center gap-2 text-xs text-slate-400 mb-1">

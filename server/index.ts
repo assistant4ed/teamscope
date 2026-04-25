@@ -754,6 +754,215 @@ app.post('/api/agent/classify-report', async (req, res) => {
   }
 });
 
+// Generalised classifier for any Telegram message — wider than
+// /api/agent/classify-report (which is bound to a known slot prompt).
+// n8n should call this BEFORE writing to ops.pending_actions and branch
+// on `kind` so chatter/self-plans never become tasks in the queue.
+app.post('/api/agent/triage-message', async (req, res) => {
+  const text = ((req.body?.text as string) || '').trim().slice(0, 2000);
+  const senderName = ((req.body?.sender_name as string) || '').trim().slice(0, 80);
+  if (!text) return res.status(400).json({ error: 'text required' });
+  if (!ANTHROPIC_API_KEY) {
+    return res.status(503).json({ error: 'ANTHROPIC_API_KEY not configured' });
+  }
+  try {
+    const subs = await query<{ name: string; active: boolean }>(
+      `SELECT name, active FROM ops.report_subscribers WHERE active = true`
+    );
+    const subsList = subs.map(s => `- ${s.name}`).join('\n') || '(none)';
+
+    const system =
+      "You triage messages a human sent to a Telegram bot connected to a personal-ops system. " +
+      "Output STRICT JSON only (no prose, no fences):\n" +
+      '{\n' +
+      '  "kind": "task_for_member" | "self_plan" | "report_slot" | "question" | "chatter",\n' +
+      '  "confidence": <float 0..1>,\n' +
+      '  "summary": "<one short line, plain prose>",\n' +
+      '  "self_plan": { "goals": [string, ...] },         // only when kind=="self_plan"\n' +
+      '  "task_for_member": { "assignee_name": <one of the allowed names>, "title": "<imperative>", "details": "<one line or empty>" }\n' +
+      '                                                  // only when kind=="task_for_member"\n' +
+      '}\n\n' +
+      "Rules:\n" +
+      "- self_plan: the sender is describing THEIR OWN day/work — e.g. 'my schedule of today: X, Y', 'todo for me: A B C', 'I plan to ...'. Extract goals as a list.\n" +
+      "- task_for_member: the sender wants someone else to do something — must be able to name a member. If no clear assignee, prefer self_plan or chatter.\n" +
+      "- report_slot: the message looks like a structured daily-report reply (hours worked, completed today, etc.) without being addressed at someone.\n" +
+      "- question: a clarifying question to the bot ('what is it', 'who is X').\n" +
+      "- chatter: small talk, reactions, empty/nonsense, or anything not actionable.\n" +
+      "- omit self_plan / task_for_member entirely when not applicable; never put empty objects.\n" +
+      "- assignee_name MUST match one of the allowed names verbatim; first-name mention counts if unambiguous.\n\n" +
+      "Allowed assignee names:\n" + subsList;
+
+    const userMessage = senderName
+      ? `Sender: ${senderName}\n\nMessage:\n${text}`
+      : `Message:\n${text}`;
+
+    const upstream = await fetch('https://api.anthropic.com/v1/messages', {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        'anthropic-version': '2023-06-01',
+        'x-api-key': ANTHROPIC_API_KEY,
+      },
+      body: JSON.stringify({
+        model: 'claude-sonnet-4-6',
+        max_tokens: 500,
+        system,
+        messages: [{ role: 'user', content: userMessage }],
+      }),
+    });
+    const data = await upstream.json().catch(() => ({} as Record<string, unknown>));
+    if (!upstream.ok) {
+      return res.status(502).json({ error: 'anthropic_error', detail: data });
+    }
+    const raw = (data as { content?: Array<{ text?: string }> })?.content?.[0]?.text || '';
+    const parsed = extractJson(raw);
+    if (!parsed) {
+      return res.status(200).json({
+        kind: 'chatter', confidence: 0,
+        summary: text.slice(0, 160),
+        parse_error: 'claude returned non-JSON',
+        raw_preview: raw.slice(0, 200),
+      });
+    }
+    res.json(parsed);
+  } catch (e) {
+    res.status(pgErrorStatus(e)).json({ error: (e as Error).message });
+  }
+});
+
+// Boss-only retroactive cleanup of the AI-classified queue.
+// Phase 1: cancel anything with no origin_text (media/forwards/system msgs).
+// Phase 2: ask Claude in ONE batched call to label the remaining text-bearing
+// pending rows; auto-cancel chatter/question, surface self_plan rows for
+// review, leave real tasks alone.
+app.post('/api/tasks/cleanup',
+  requireRole('boss'),
+  async (req, res) => {
+    try {
+      // ---------- Phase 1: empties ---------- //
+      // Catches three shapes: pa.message_id NULL, m.text NULL, or m.text whitespace-only.
+      const emptied = await query<{ correlation_id: string; profile_id: string | null }>(
+        `UPDATE ops.pending_actions pa
+            SET status = 'cancelled', resolved_at = now()
+           FROM (
+             SELECT pa2.correlation_id
+               FROM ops.pending_actions pa2
+          LEFT JOIN ops.messages m ON m.id = pa2.message_id
+              WHERE pa2.status IN ('pending', 'pa_review')
+                AND (m.text IS NULL OR length(trim(m.text)) = 0)
+           ) victims
+          WHERE pa.correlation_id = victims.correlation_id
+        RETURNING pa.correlation_id, pa.profile_id`
+      );
+      for (const row of emptied) {
+        await query(
+          `INSERT INTO ops.actions_log
+             (correlation_id, profile_id, domain, action, executor, outcome)
+           VALUES ($1, $2, 'queue', 'auto_cancel_empty', $3, 'cancelled')`,
+          [row.correlation_id, row.profile_id, req.user!.role]
+        ).catch(() => {/* log is best-effort */});
+      }
+
+      // ---------- Phase 2: triage with Claude ---------- //
+      const candidates = await query<{
+        correlation_id: string; profile_id: string | null;
+        origin_text: string;
+      }>(
+        `SELECT pa.correlation_id, pa.profile_id, m.text AS origin_text
+           FROM ops.pending_actions pa
+           JOIN ops.messages m ON m.id = pa.message_id
+          WHERE pa.status IN ('pending', 'pa_review')
+            AND m.text IS NOT NULL AND length(trim(m.text)) > 0
+          ORDER BY pa.created_at DESC
+          LIMIT 60`
+      );
+
+      let chatterCancelled = 0;
+      const selfPlans: Array<{ correlation_id: string; origin_text: string; summary: string }> = [];
+      let kept = 0;
+
+      if (candidates.length > 0 && ANTHROPIC_API_KEY) {
+        // One batched call so we don't hammer Anthropic.
+        const numbered = candidates
+          .map((c, i) => `${i + 1}. ${c.origin_text.replace(/\s+/g, ' ').slice(0, 200)}`)
+          .join('\n');
+
+        const system =
+          "You label messages from a Telegram personal-ops bot's queue. " +
+          "Each line is one message numbered 1..N. Output STRICT JSON ONLY:\n" +
+          '{ "items": [ { "n": <int>, "kind": "task" | "self_plan" | "chatter" | "question", "summary": "<short>" }, ... ] }\n\n' +
+          "Definitions:\n" +
+          "- task: a real instruction directed at someone other than the sender.\n" +
+          "- self_plan: the sender is describing their OWN day/work/todos.\n" +
+          "- question: a clarifying question to the bot.\n" +
+          "- chatter: small talk, reactions, fragments, or anything not actionable.\n\n" +
+          "Be strict — favour 'chatter' for ambiguous fragments like 'send to Ed 2', 'what is it', 'yes', 'ok'. " +
+          "Output one entry per input line, in input order.";
+
+        const upstream = await fetch('https://api.anthropic.com/v1/messages', {
+          method: 'POST',
+          headers: {
+            'content-type': 'application/json',
+            'anthropic-version': '2023-06-01',
+            'x-api-key': ANTHROPIC_API_KEY,
+          },
+          body: JSON.stringify({
+            model: 'claude-sonnet-4-6',
+            max_tokens: 1500,
+            system,
+            messages: [{ role: 'user', content: numbered }],
+          }),
+        });
+        const data = await upstream.json().catch(() => ({} as Record<string, unknown>));
+        const raw = (data as { content?: Array<{ text?: string }> })?.content?.[0]?.text || '';
+        const parsed = extractJson(raw) as { items?: Array<{ n: number; kind: string; summary: string }> } | null;
+        const items = parsed?.items ?? [];
+
+        for (const item of items) {
+          const idx = (item.n | 0) - 1;
+          if (idx < 0 || idx >= candidates.length) continue;
+          const cand = candidates[idx];
+          if (item.kind === 'chatter' || item.kind === 'question') {
+            await query(
+              `UPDATE ops.pending_actions
+                  SET status = 'cancelled', resolved_at = now()
+                WHERE correlation_id = $1`,
+              [cand.correlation_id]
+            );
+            await query(
+              `INSERT INTO ops.actions_log
+                 (correlation_id, profile_id, domain, action, executor, outcome)
+               VALUES ($1, $2, 'queue', 'auto_cancel_chatter', $3, $4)`,
+              [cand.correlation_id, cand.profile_id, req.user!.role, item.kind]
+            ).catch(() => {});
+            chatterCancelled++;
+          } else if (item.kind === 'self_plan') {
+            selfPlans.push({
+              correlation_id: cand.correlation_id,
+              origin_text: cand.origin_text,
+              summary: item.summary || cand.origin_text.slice(0, 120),
+            });
+            kept++;
+          } else {
+            kept++;
+          }
+        }
+      } else {
+        kept = candidates.length;
+      }
+
+      res.json({
+        empty_cancelled: emptied.length,
+        chatter_cancelled: chatterCancelled,
+        kept,
+        self_plans: selfPlans,
+      });
+    } catch (e) {
+      res.status(pgErrorStatus(e)).json({ error: (e as Error).message });
+    }
+  }
+);
+
 // Turn freeform text ("tell Andrea to prepare slides by Friday") into
 // a Kanban card. Claude extracts {title, description, assignee_name,
 // priority, due_date}, we match assignee_name to an active subscriber

@@ -291,9 +291,35 @@ app.post('/api/reports',
 // pipeline won't re-overwrite an edited slot within the same day
 // unless the subscriber sends a fresh Telegram reply.
 app.patch('/api/reports/:id',
-  requireRole('boss'),
   async (req, res) => {
     const id = String(req.params.id);
+    // Authorize: boss bypasses; otherwise the requester must be the
+    // row's owning subscriber (matched by email) AND the row must be
+    // less than 12 hours old.
+    if (req.user!.role !== 'boss') {
+      const owner = await query<{
+        owner_email: string | null; created_at: string;
+        age_hours: string;
+      }>(
+        `SELECT s.email AS owner_email, dr.created_at,
+                EXTRACT(EPOCH FROM (now() - dr.created_at)) / 3600 AS age_hours
+           FROM ops.daily_reports dr
+           JOIN ops.report_subscribers s ON s.id = dr.subscriber_id
+          WHERE dr.id = $1::uuid`,
+        [id]
+      );
+      if (owner.length === 0) return res.status(404).json({ error: 'not_found' });
+      const o = owner[0];
+      const isOwner = o.owner_email
+        && o.owner_email.toLowerCase() === req.user!.email.toLowerCase();
+      const within12h = Number(o.age_hours) < 12;
+      if (!isOwner) {
+        return res.status(403).json({ error: 'forbidden', reason: 'not_row_owner' });
+      }
+      if (!within12h) {
+        return res.status(403).json({ error: 'forbidden', reason: 'edit_window_closed_12h' });
+      }
+    }
     const b = req.body || {};
     const editable = [
       'goals', 'mid_progress', 'mid_issues', 'mid_changes',
@@ -357,10 +383,12 @@ app.get('/api/reports/recent', async (req, res) => {
   try {
     const rows = await query(
       `SELECT d.id, d.subscriber_id, s.name AS subscriber_name, s.role AS subscriber_role,
+              s.email AS subscriber_email,
               to_char(d.report_date, 'YYYY-MM-DD') AS report_date,
               d.goals,
               d.mid_progress, d.mid_issues, d.mid_changes,
-              d.eod_completed, d.eod_unfinished, d.eod_hours, d.updated_at
+              d.eod_completed, d.eod_unfinished, d.eod_hours,
+              d.created_at, d.updated_at
          FROM ops.daily_reports d
          JOIN ops.report_subscribers s ON s.id = d.subscriber_id
         WHERE d.report_date >= (now() - ($1 || ' days')::interval)::date
@@ -542,7 +570,7 @@ app.get('/api/agent/classifications', async (req, res) => {
 app.get('/api/team', async (_req, res) => {
   try {
     const [subscribers, profiles] = await Promise.all([
-      query(`SELECT id, telegram_chat_id, name, role, timezone,
+      query(`SELECT id, telegram_chat_id, name, role, timezone, email,
                     slot_morning, slot_midday, slot_eod, working_days, active, created_at
                FROM ops.report_subscribers ORDER BY active DESC, name`),
       query(`SELECT id, telegram_chat_id, name, role, timezone, active, created_at
@@ -600,6 +628,238 @@ app.post('/api/team/subscribers/:id/test-ping',
   }
 );
 
+// ---------- Salary --------------------------------------------------- //
+// Per-subscriber rate config + period compute + payment log.
+
+app.get('/api/team/subscribers/:id/salary',
+  requireRole('boss', 'pa'),
+  async (req, res) => {
+    const id = String(req.params.id);
+    try {
+      const [config, payments] = await Promise.all([
+        query<{ payment_type: string; rate: string; currency: string;
+                notes: string | null; updated_at: string; updated_by: string | null }>(
+          `SELECT payment_type, rate, currency, notes, updated_at, updated_by
+             FROM ops.subscriber_salary WHERE subscriber_id = $1`,
+          [id]
+        ),
+        query(
+          `SELECT id, period_start, period_end, days_reported, hours_reported,
+                  amount, currency, paid_at, paid_by, notes
+             FROM ops.salary_payments
+            WHERE subscriber_id = $1
+            ORDER BY paid_at DESC LIMIT 5`,
+          [id]
+        ),
+      ]);
+      res.json({ config: config[0] ?? null, recent_payments: payments });
+    } catch (e) {
+      res.status(pgErrorStatus(e)).json({ error: (e as Error).message });
+    }
+  }
+);
+
+app.put('/api/team/subscribers/:id/salary',
+  requireRole('boss'),
+  async (req, res) => {
+    const id = String(req.params.id);
+    const b = req.body || {};
+    const paymentType = String(b.payment_type || '');
+    if (!['monthly_base', 'hourly', 'daily_rate'].includes(paymentType)) {
+      return res.status(400).json({ error: 'payment_type must be monthly_base|hourly|daily_rate' });
+    }
+    const rate = Number(b.rate);
+    if (!Number.isFinite(rate) || rate < 0) {
+      return res.status(400).json({ error: 'rate must be a non-negative number' });
+    }
+    const currency = String(b.currency || 'SGD').toUpperCase().slice(0, 8);
+    const notes = b.notes ? String(b.notes).slice(0, 500) : null;
+    try {
+      const rows = await query(
+        `INSERT INTO ops.subscriber_salary
+           (subscriber_id, payment_type, rate, currency, notes, updated_by, updated_at)
+         VALUES ($1::uuid, $2, $3, $4, $5, $6, now())
+         ON CONFLICT (subscriber_id) DO UPDATE
+           SET payment_type = EXCLUDED.payment_type,
+               rate         = EXCLUDED.rate,
+               currency     = EXCLUDED.currency,
+               notes        = EXCLUDED.notes,
+               updated_by   = EXCLUDED.updated_by,
+               updated_at   = now()
+         RETURNING subscriber_id, payment_type, rate, currency, notes,
+                   updated_at, updated_by`,
+        [id, paymentType, rate, currency, notes, req.user!.email]
+      );
+      res.json({ config: rows[0] });
+    } catch (e) {
+      res.status(pgErrorStatus(e)).json({ error: (e as Error).message });
+    }
+  }
+);
+
+// Compute what's owed for a date window. Re-used by the Member page
+// preview and by the Mark Paid flow to suggest an amount.
+app.get('/api/salary/period',
+  requireRole('boss', 'pa'),
+  async (req, res) => {
+    const subscriberId = String(req.query.subscriber_id || '').trim();
+    const from = String(req.query.from || '').trim();
+    const to   = String(req.query.to   || '').trim();
+    if (!subscriberId) return res.status(400).json({ error: 'subscriber_id required' });
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(from) || !/^\d{4}-\d{2}-\d{2}$/.test(to)) {
+      return res.status(400).json({ error: 'from/to must be YYYY-MM-DD' });
+    }
+    try {
+      const summary = await computeSalaryPeriod(subscriberId, from, to);
+      res.json(summary);
+    } catch (e) {
+      res.status(pgErrorStatus(e)).json({ error: (e as Error).message });
+    }
+  }
+);
+
+app.post('/api/team/subscribers/:id/salary/pay',
+  requireRole('boss'),
+  async (req, res) => {
+    const id = String(req.params.id);
+    const b = req.body || {};
+    const periodStart = String(b.period_start || '');
+    const periodEnd   = String(b.period_end || '');
+    const amount = Number(b.amount);
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(periodStart) || !/^\d{4}-\d{2}-\d{2}$/.test(periodEnd)) {
+      return res.status(400).json({ error: 'period_start/period_end must be YYYY-MM-DD' });
+    }
+    if (!Number.isFinite(amount) || amount < 0) {
+      return res.status(400).json({ error: 'amount must be a non-negative number' });
+    }
+    const currency = String(b.currency || 'SGD').toUpperCase().slice(0, 8);
+    const notes = b.notes ? String(b.notes).slice(0, 500) : null;
+    try {
+      const summary = await computeSalaryPeriod(id, periodStart, periodEnd);
+      const rows = await query(
+        `INSERT INTO ops.salary_payments
+           (subscriber_id, period_start, period_end,
+            days_reported, hours_reported, amount, currency, paid_by, notes)
+         VALUES ($1::uuid, $2::date, $3::date, $4, $5, $6, $7, $8, $9)
+         RETURNING id, period_start, period_end, days_reported, hours_reported,
+                   amount, currency, paid_at, paid_by, notes`,
+        [id, periodStart, periodEnd,
+         summary.days_reported, summary.hours_reported,
+         amount, currency, req.user!.email, notes]
+      );
+      res.json({ payment: rows[0], computed: summary });
+    } catch (e) {
+      res.status(pgErrorStatus(e)).json({ error: (e as Error).message });
+    }
+  }
+);
+
+interface SalaryPeriodSummary {
+  subscriber_id: string;
+  period_start: string;
+  period_end: string;
+  config: { payment_type: string; rate: number; currency: string } | null;
+  working_days_in_period: number;
+  days_reported: number;
+  days_missed: number;
+  hours_reported: number;
+  amount_owed: number;
+  already_paid: number;
+  net_due: number;
+  currency: string;
+}
+
+async function computeSalaryPeriod(subscriberId: string, from: string, to: string): Promise<SalaryPeriodSummary> {
+  // Fetch subscriber config + working_days
+  const subs = await query<{
+    working_days: number[]; payment_type: string | null;
+    rate: string | null; currency: string | null;
+  }>(
+    `SELECT s.working_days,
+            sal.payment_type, sal.rate, sal.currency
+       FROM ops.report_subscribers s
+  LEFT JOIN ops.subscriber_salary sal ON sal.subscriber_id = s.id
+      WHERE s.id = $1::uuid`,
+    [subscriberId]
+  );
+  if (subs.length === 0) {
+    const err = new Error('subscriber_not_found') as Error & { status: number };
+    err.status = 404; throw err;
+  }
+  const sub = subs[0];
+  const workingDays = sub.working_days ?? [1, 2, 3, 4, 5];
+
+  // Working days in window (matches subscriber's working_days)
+  const wdRow = await query<{ n: number }>(
+    `SELECT COUNT(*)::int AS n
+       FROM generate_series($1::date, $2::date, interval '1 day') d
+      WHERE EXTRACT(isodow FROM d)::int = ANY($3::int[])`,
+    [from, to, workingDays]
+  );
+  const workingDaysInPeriod = wdRow[0]?.n ?? 0;
+
+  // Days the subscriber actually reported (any non-null slot)
+  const repRow = await query<{ days_reported: number; hours_reported: string | null }>(
+    `SELECT COUNT(*) FILTER (
+              WHERE goals IS NOT NULL OR mid_progress IS NOT NULL
+                 OR mid_issues IS NOT NULL OR mid_changes IS NOT NULL
+                 OR eod_completed IS NOT NULL OR eod_unfinished IS NOT NULL
+                 OR eod_hours IS NOT NULL
+            )::int AS days_reported,
+            COALESCE(SUM(eod_hours), 0)::numeric AS hours_reported
+       FROM ops.daily_reports
+      WHERE subscriber_id = $1::uuid
+        AND report_date BETWEEN $2::date AND $3::date`,
+    [subscriberId, from, to]
+  );
+  const daysReported = repRow[0]?.days_reported ?? 0;
+  const hoursReported = Number(repRow[0]?.hours_reported ?? 0);
+
+  // Already paid: sum of payments whose period overlaps [from,to]
+  const paidRow = await query<{ paid: string | null }>(
+    `SELECT COALESCE(SUM(amount), 0)::numeric AS paid
+       FROM ops.salary_payments
+      WHERE subscriber_id = $1::uuid
+        AND period_start <= $3::date AND period_end >= $2::date`,
+    [subscriberId, from, to]
+  );
+  const alreadyPaid = Number(paidRow[0]?.paid ?? 0);
+
+  const rate = sub.rate ? Number(sub.rate) : 0;
+  const currency = sub.currency || 'SGD';
+  const paymentType = sub.payment_type;
+
+  let amountOwed = 0;
+  if (paymentType === 'monthly_base') {
+    // If both endpoints are in the same calendar month and span the
+    // full month, treat as full monthly. Otherwise pro-rate by
+    // days_reported / max(working_days_in_period, 1).
+    const ratio = workingDaysInPeriod > 0
+      ? Math.min(1, daysReported / workingDaysInPeriod) : 0;
+    amountOwed = Math.round(rate * ratio * 100) / 100;
+  } else if (paymentType === 'hourly') {
+    amountOwed = Math.round(rate * hoursReported * 100) / 100;
+  } else if (paymentType === 'daily_rate') {
+    amountOwed = Math.round(rate * daysReported * 100) / 100;
+  }
+  // Else: no config — amount_owed stays 0.
+
+  return {
+    subscriber_id: subscriberId,
+    period_start: from,
+    period_end: to,
+    config: paymentType ? { payment_type: paymentType, rate, currency } : null,
+    working_days_in_period: workingDaysInPeriod,
+    days_reported: daysReported,
+    days_missed: Math.max(0, workingDaysInPeriod - daysReported),
+    hours_reported: hoursReported,
+    amount_owed: amountOwed,
+    already_paid: alreadyPaid,
+    net_due: Math.round((amountOwed - alreadyPaid) * 100) / 100,
+    currency,
+  };
+}
+
 // Update an existing subscriber's editable fields (boss only).
 app.patch('/api/team/subscribers/:id',
   requireRole('boss'),
@@ -607,7 +867,8 @@ app.patch('/api/team/subscribers/:id',
     const b = req.body || {};
     const allowed = ['name', 'role', 'timezone',
                      'slot_morning', 'slot_midday', 'slot_eod',
-                     'working_days', 'active', 'telegram_chat_id'] as const;
+                     'working_days', 'active', 'telegram_chat_id',
+                     'email'] as const;
     const sets: string[] = [];
     const vals: unknown[] = [];
     for (const k of allowed) {
@@ -656,7 +917,7 @@ app.get('/api/team/subscribers/:id',
     try {
       const [sub, reports] = await Promise.all([
         query(
-          `SELECT id, telegram_chat_id, name, role, timezone,
+          `SELECT id, telegram_chat_id, name, role, timezone, email,
                   slot_morning, slot_midday, slot_eod, working_days,
                   active, created_at, updated_at
              FROM ops.report_subscribers WHERE id = $1`,

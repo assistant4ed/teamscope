@@ -12,6 +12,7 @@ interface Report {
   subscriber_id: string;
   subscriber_name: string;
   subscriber_role: string | null;
+  subscriber_email?: string | null;
   report_date: string | null;
   goals: string | null;
   mid_progress: string | null;
@@ -20,6 +21,7 @@ interface Report {
   eod_completed: string | null;
   eod_unfinished: string | null;
   eod_hours: number | null;
+  created_at?: string;
   updated_at: string;
 }
 
@@ -273,12 +275,23 @@ export default function Reports({ me }: { me: Me }) {
                 {date === today && <span className="ml-2 text-indigo-600">· Today</span>}
               </h3>
               <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-3">
-                {rows.map(r => (
-                  <ReportCard key={r.id} r={r}
-                    isBoss={isBoss}
-                    importedCount={importedById.get(r.id) ?? 0}
-                    onChanged={() => load()} />
-                ))}
+                {rows.map(r => {
+                  const ageHours = r.created_at
+                    ? (Date.now() - new Date(r.created_at).getTime()) / 3_600_000
+                    : Infinity;
+                  const isOwner = !!r.subscriber_email
+                    && r.subscriber_email.toLowerCase() === me.email?.toLowerCase();
+                  const canEdit = isBoss || (isOwner && ageHours < 12);
+                  return (
+                    <ReportCard key={r.id} r={r}
+                      isBoss={isBoss}
+                      canEdit={canEdit}
+                      ownerEditWindowOpen={isOwner && ageHours < 12 && !isBoss}
+                      ageHours={ageHours}
+                      importedCount={importedById.get(r.id) ?? 0}
+                      onChanged={() => load()} />
+                  );
+                })}
               </div>
             </section>
           ))}
@@ -305,9 +318,12 @@ const StatCard = ({ label, icon, value, sub, tone = 'default' }: {
   </div>
 );
 
-const ReportCard = ({ r, isBoss, importedCount, onChanged }: {
+const ReportCard = ({ r, isBoss, canEdit, ownerEditWindowOpen, ageHours, importedCount, onChanged }: {
   r: Report;
   isBoss: boolean;
+  canEdit: boolean;
+  ownerEditWindowOpen: boolean;
+  ageHours: number;
   importedCount: number;
   onChanged: () => void;
 }) => {
@@ -435,9 +451,16 @@ const ReportCard = ({ r, isBoss, importedCount, onChanged }: {
         </div>
       )}
 
+      {ownerEditWindowOpen && (
+        <div className="mb-3 -mt-2 flex items-center gap-1.5 text-[11px] text-emerald-700
+                        bg-emerald-50 border border-emerald-200 rounded-lg px-2 py-1 w-fit">
+          <Clock className="w-3 h-3" />
+          You can edit your own slots for {Math.max(0, 12 - Math.floor(ageHours))}h more
+        </div>
+      )}
       <SlotRow icon={<Sun className="w-4 h-4 text-amber-500"/>} label="Morning goals"
         value={r.goals} slot="morning"
-        canEdit={isBoss} fieldName="goals"
+        canEdit={canEdit} fieldName="goals"
         onSave={v => patchField('goals', v)} />
       {r.goals && r.goals.trim() && (
         <ImportGoalsButton reportId={r.id} goals={r.goals}
@@ -447,12 +470,12 @@ const ReportCard = ({ r, isBoss, importedCount, onChanged }: {
       <SlotRow icon={<Clock className="w-4 h-4 text-sky-500"/>} label="Midday progress"
         value={r.mid_progress}
         issues={r.mid_issues} changes={r.mid_changes} slot="midday"
-        canEdit={isBoss} fieldName="mid_progress"
+        canEdit={canEdit} fieldName="mid_progress"
         onSave={v => patchField('mid_progress', v)} />
       <SlotRow icon={<Moon className="w-4 h-4 text-indigo-500"/>} label="End of day"
         value={r.eod_completed}
         unfinished={r.eod_unfinished} slot="eod" last
-        canEdit={isBoss} fieldName="eod_completed"
+        canEdit={canEdit} fieldName="eod_completed"
         onSave={v => patchField('eod_completed', v)} />
     </article>
   );

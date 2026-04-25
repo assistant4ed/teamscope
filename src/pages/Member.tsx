@@ -4,6 +4,7 @@ import {
   Loader2, AlertTriangle, ExternalLink, Sun, Clock, Moon,
   Calendar, Kanban, MessageSquare, Zap,
   ArrowDownLeft, ArrowUpRight, MessageCircle,
+  DollarSign, X,
 } from 'lucide-react';
 import { apiFetch, apiGet, Me } from '../auth';
 
@@ -11,6 +12,7 @@ import { apiFetch, apiGet, Me } from '../auth';
 interface Subscriber {
   id: string; telegram_chat_id: number; name: string;
   role: string | null; timezone: string;
+  email?: string | null;
   slot_morning: string; slot_midday: string; slot_eod: string;
   working_days: number[]; active: boolean;
   created_at: string; updated_at?: string;
@@ -129,6 +131,7 @@ export default function Member({ me, subscriberId, onBack }: {
       <div className="p-6 md:p-10 max-w-5xl mx-auto space-y-6">
         <MemberHeader sub={sub} onBack={onBack} />
         <ScheduleCard sub={sub} isBoss={isBoss} onSaved={load} />
+        <SalaryCard sub={sub} isBoss={isBoss} />
         <div className="grid gap-6 md:grid-cols-2">
           <TemplatesCard templates={templates} onOpenTeam={onBack} />
           <ActionsCard sub={sub} isBoss={isBoss}
@@ -140,6 +143,392 @@ export default function Member({ me, subscriberId, onBack }: {
       </div>
     </div>
   );
+}
+
+// ---------- Salary card --------------------------------------------- //
+interface SalaryConfig {
+  payment_type: 'monthly_base' | 'hourly' | 'daily_rate';
+  rate: string | number;
+  currency: string;
+  notes: string | null;
+  updated_at: string;
+  updated_by: string | null;
+}
+interface SalaryPayment {
+  id: string; period_start: string; period_end: string;
+  days_reported: number | null; hours_reported: string | null;
+  amount: string; currency: string;
+  paid_at: string; paid_by: string | null; notes: string | null;
+}
+interface SalaryPeriod {
+  working_days_in_period: number;
+  days_reported: number;
+  days_missed: number;
+  hours_reported: number;
+  amount_owed: number;
+  already_paid: number;
+  net_due: number;
+  currency: string;
+  config: SalaryConfig | null;
+}
+
+function SalaryCard({ sub, isBoss }: { sub: Subscriber; isBoss: boolean }) {
+  const [config, setConfig] = useState<SalaryConfig | null>(null);
+  const [payments, setPayments] = useState<SalaryPayment[]>([]);
+  const [period, setPeriod] = useState<SalaryPeriod | null>(null);
+  const [from, setFrom] = useState(thirtyDaysAgo());
+  const [to, setTo] = useState(todayLocalISO());
+  const [editing, setEditing] = useState(false);
+  const [paying, setPaying] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+
+  const loadAll = useCallback(async () => {
+    try {
+      const c = await apiGet<{ config: SalaryConfig | null; recent_payments: SalaryPayment[] }>(
+        `/api/team/subscribers/${sub.id}/salary`
+      );
+      setConfig(c.config); setPayments(c.recent_payments);
+    } catch {/* silent */}
+    try {
+      const p = await apiGet<SalaryPeriod>(
+        `/api/salary/period?subscriber_id=${sub.id}&from=${from}&to=${to}`
+      );
+      setPeriod(p);
+    } catch (e) { setErr(String(e)); }
+  }, [sub.id, from, to]);
+
+  useEffect(() => { loadAll(); }, [loadAll]);
+
+  return (
+    <Card title="Salary" icon={<DollarSign className="w-4 h-4 text-emerald-500" />}>
+      {!config ? (
+        <p className="text-sm text-slate-500 mb-3">
+          No salary terms configured.{!isBoss && ' Ask the boss to set one.'}
+        </p>
+      ) : (
+        <div className="text-sm text-slate-700 mb-4 flex items-center gap-3 flex-wrap">
+          <span className="px-2 py-0.5 rounded-full bg-emerald-50 text-emerald-700 text-xs font-medium">
+            {config.payment_type.replace('_', ' ')}
+          </span>
+          <span className="font-semibold text-slate-900">
+            {config.currency} {Number(config.rate).toLocaleString()}
+          </span>
+          <span className="text-xs text-slate-500">
+            {config.payment_type === 'monthly_base' && 'per month'}
+            {config.payment_type === 'hourly'       && 'per reported hour'}
+            {config.payment_type === 'daily_rate'   && 'per reported day'}
+          </span>
+          {config.updated_at && (
+            <span className="text-[11px] text-slate-400">
+              · updated {new Date(config.updated_at).toLocaleDateString()}
+            </span>
+          )}
+        </div>
+      )}
+
+      <div className="grid grid-cols-2 md:grid-cols-4 gap-2 mb-3 text-center">
+        <SalaryStat label="Working days" value={period?.working_days_in_period ?? '—'} />
+        <SalaryStat label="Days reported" value={period?.days_reported ?? '—'} />
+        <SalaryStat label="Hours reported" value={period?.hours_reported?.toFixed(1) ?? '—'} />
+        <SalaryStat label="Days missed"
+          value={period?.days_missed ?? '—'}
+          tone={period && period.days_missed > 0 ? 'rose' : 'default'} />
+      </div>
+
+      <div className="bg-slate-50 border border-slate-200 rounded-lg p-3 flex items-center justify-between gap-3 mb-3">
+        <div className="flex items-center gap-2 text-xs text-slate-600">
+          <span>Period:</span>
+          <input type="date" value={from} onChange={e => setFrom(e.target.value)}
+            className="border border-slate-200 rounded px-2 py-0.5 text-xs bg-white" />
+          <span>→</span>
+          <input type="date" value={to} onChange={e => setTo(e.target.value)}
+            className="border border-slate-200 rounded px-2 py-0.5 text-xs bg-white" />
+        </div>
+        {period && (
+          <div className="text-right">
+            <div className="text-xs text-slate-500">Net due</div>
+            <div className="text-lg font-bold text-slate-900">
+              {period.currency} {period.net_due.toLocaleString()}
+            </div>
+            {period.already_paid > 0 && (
+              <div className="text-[11px] text-slate-400">
+                of {period.amount_owed.toLocaleString()} (paid {period.already_paid.toLocaleString()})
+              </div>
+            )}
+          </div>
+        )}
+      </div>
+
+      {err && <div className="text-xs text-rose-700 bg-rose-50 border border-rose-200 rounded-lg p-2 mb-3">{err}</div>}
+
+      {isBoss && (
+        <div className="flex items-center gap-2 mb-4">
+          <button onClick={() => setEditing(true)}
+            className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium
+                       bg-slate-900 hover:bg-slate-800 text-white rounded-lg">
+            <DollarSign className="w-3.5 h-3.5" /> {config ? 'Edit salary' : 'Set salary'}
+          </button>
+          {config && period && period.net_due > 0 && (
+            <button onClick={() => setPaying(true)}
+              className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium
+                         bg-emerald-600 hover:bg-emerald-700 text-white rounded-lg">
+              <Check className="w-3.5 h-3.5" /> Mark paid
+            </button>
+          )}
+        </div>
+      )}
+
+      {payments.length > 0 && (
+        <div>
+          <h4 className="text-xs font-semibold text-slate-500 uppercase tracking-wider mb-2">
+            Recent payments
+          </h4>
+          <ul className="divide-y divide-slate-100 text-xs">
+            {payments.map(p => (
+              <li key={p.id} className="py-1.5 flex items-center justify-between">
+                <span className="text-slate-700">
+                  {p.period_start} → {p.period_end}
+                  {p.days_reported != null && <> · {p.days_reported}d</>}
+                </span>
+                <span className="font-semibold text-slate-800">
+                  {p.currency} {Number(p.amount).toLocaleString()}
+                </span>
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
+
+      {editing && isBoss && (
+        <SalaryEditModal sub={sub} initial={config}
+          onDone={() => { setEditing(false); loadAll(); }}
+          onClose={() => setEditing(false)} />
+      )}
+      {paying && isBoss && period && (
+        <SalaryPayModal sub={sub}
+          defaultFrom={from} defaultTo={to} defaultAmount={period.net_due}
+          defaultCurrency={period.currency}
+          onDone={() => { setPaying(false); loadAll(); }}
+          onClose={() => setPaying(false)} />
+      )}
+    </Card>
+  );
+}
+
+function SalaryStat({ label, value, tone = 'default' }: {
+  label: string; value: React.ReactNode; tone?: 'default' | 'rose';
+}) {
+  return (
+    <div className={`p-2 rounded-lg border ${
+      tone === 'rose'
+        ? 'bg-rose-50 border-rose-100 text-rose-700'
+        : 'bg-slate-50 border-slate-100 text-slate-700'
+    }`}>
+      <div className="text-base font-bold">{value}</div>
+      <div className="text-[10px] uppercase tracking-wider">{label}</div>
+    </div>
+  );
+}
+
+function SalaryEditModal({ sub, initial, onDone, onClose }: {
+  sub: Subscriber;
+  initial: SalaryConfig | null;
+  onDone: () => void;
+  onClose: () => void;
+}) {
+  const [paymentType, setPaymentType] = useState<SalaryConfig['payment_type']>(
+    initial?.payment_type ?? 'monthly_base'
+  );
+  const [rate, setRate] = useState(String(initial?.rate ?? ''));
+  const [currency, setCurrency] = useState(initial?.currency ?? 'SGD');
+  const [notes, setNotes] = useState(initial?.notes ?? '');
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+
+  async function save(e: React.FormEvent) {
+    e.preventDefault();
+    setBusy(true); setErr(null);
+    try {
+      const res = await apiFetch(`/api/team/subscribers/${sub.id}/salary`, {
+        method: 'PUT',
+        body: JSON.stringify({
+          payment_type: paymentType,
+          rate: Number(rate),
+          currency,
+          notes: notes || null,
+        }),
+      });
+      if (!res.ok) {
+        const body = await res.json().catch(() => ({}));
+        throw new Error((body as {error?: string}).error || `HTTP ${res.status}`);
+      }
+      onDone();
+    } catch (e) { setErr((e as Error).message); }
+    finally { setBusy(false); }
+  }
+
+  return (
+    <ModalShell title={`Salary for ${sub.name}`} onSubmit={save} onClose={onClose} busy={busy} err={err}>
+      <label className="block">
+        <span className="text-xs font-medium text-slate-700">Payment type</span>
+        <select value={paymentType} onChange={e => setPaymentType(e.target.value as typeof paymentType)}
+          className="mt-1 w-full border border-slate-200 rounded-lg px-3 py-2 text-sm">
+          <option value="monthly_base">Monthly base</option>
+          <option value="hourly">Hourly (× reported hours)</option>
+          <option value="daily_rate">Daily rate (× reported days)</option>
+        </select>
+      </label>
+      <div className="grid grid-cols-2 gap-3">
+        <label className="block">
+          <span className="text-xs font-medium text-slate-700">
+            Rate ({paymentType === 'monthly_base' ? 'per month' :
+                   paymentType === 'hourly' ? 'per hour' : 'per day'})
+          </span>
+          <input type="number" step="0.01" required value={rate}
+            onChange={e => setRate(e.target.value)}
+            className="mt-1 w-full border border-slate-200 rounded-lg px-3 py-2 text-sm" />
+        </label>
+        <label className="block">
+          <span className="text-xs font-medium text-slate-700">Currency</span>
+          <select value={currency} onChange={e => setCurrency(e.target.value)}
+            className="mt-1 w-full border border-slate-200 rounded-lg px-3 py-2 text-sm">
+            {['SGD', 'MYR', 'HKD', 'USD', 'CNY', 'EUR', 'GBP'].map(c => <option key={c} value={c}>{c}</option>)}
+          </select>
+        </label>
+      </div>
+      <label className="block">
+        <span className="text-xs font-medium text-slate-700">Notes</span>
+        <textarea value={notes} onChange={e => setNotes(e.target.value)}
+          rows={2} placeholder="optional"
+          className="mt-1 w-full border border-slate-200 rounded-lg px-3 py-2 text-sm" />
+      </label>
+    </ModalShell>
+  );
+}
+
+function SalaryPayModal({ sub, defaultFrom, defaultTo, defaultAmount, defaultCurrency, onDone, onClose }: {
+  sub: Subscriber;
+  defaultFrom: string; defaultTo: string;
+  defaultAmount: number; defaultCurrency: string;
+  onDone: () => void;
+  onClose: () => void;
+}) {
+  const [from, setFrom] = useState(defaultFrom);
+  const [to, setTo] = useState(defaultTo);
+  const [amount, setAmount] = useState(String(defaultAmount));
+  const [currency, setCurrency] = useState(defaultCurrency);
+  const [notes, setNotes] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+
+  async function save(e: React.FormEvent) {
+    e.preventDefault();
+    setBusy(true); setErr(null);
+    try {
+      const res = await apiFetch(`/api/team/subscribers/${sub.id}/salary/pay`, {
+        method: 'POST',
+        body: JSON.stringify({
+          period_start: from, period_end: to,
+          amount: Number(amount), currency, notes: notes || null,
+        }),
+      });
+      if (!res.ok) {
+        const body = await res.json().catch(() => ({}));
+        throw new Error((body as {error?: string}).error || `HTTP ${res.status}`);
+      }
+      onDone();
+    } catch (e) { setErr((e as Error).message); }
+    finally { setBusy(false); }
+  }
+
+  return (
+    <ModalShell title={`Mark paid — ${sub.name}`} onSubmit={save} onClose={onClose}
+      busy={busy} err={err} submitLabel="Record payment">
+      <div className="grid grid-cols-2 gap-3">
+        <label className="block">
+          <span className="text-xs font-medium text-slate-700">Period start</span>
+          <input type="date" value={from} onChange={e => setFrom(e.target.value)}
+            className="mt-1 w-full border border-slate-200 rounded-lg px-3 py-2 text-sm" />
+        </label>
+        <label className="block">
+          <span className="text-xs font-medium text-slate-700">Period end</span>
+          <input type="date" value={to} onChange={e => setTo(e.target.value)}
+            className="mt-1 w-full border border-slate-200 rounded-lg px-3 py-2 text-sm" />
+        </label>
+      </div>
+      <div className="grid grid-cols-2 gap-3">
+        <label className="block">
+          <span className="text-xs font-medium text-slate-700">Amount</span>
+          <input type="number" step="0.01" required value={amount} onChange={e => setAmount(e.target.value)}
+            className="mt-1 w-full border border-slate-200 rounded-lg px-3 py-2 text-sm font-mono" />
+        </label>
+        <label className="block">
+          <span className="text-xs font-medium text-slate-700">Currency</span>
+          <select value={currency} onChange={e => setCurrency(e.target.value)}
+            className="mt-1 w-full border border-slate-200 rounded-lg px-3 py-2 text-sm">
+            {['SGD','MYR','HKD','USD','CNY','EUR','GBP'].map(c => <option key={c} value={c}>{c}</option>)}
+          </select>
+        </label>
+      </div>
+      <label className="block">
+        <span className="text-xs font-medium text-slate-700">Notes</span>
+        <input value={notes} onChange={e => setNotes(e.target.value)}
+          placeholder="e.g. paid via bank transfer Apr 30"
+          className="mt-1 w-full border border-slate-200 rounded-lg px-3 py-2 text-sm" />
+      </label>
+    </ModalShell>
+  );
+}
+
+function ModalShell({ title, onSubmit, onClose, busy, err, children, submitLabel = 'Save' }: {
+  title: string;
+  onSubmit: (e: React.FormEvent) => void;
+  onClose: () => void;
+  busy: boolean;
+  err: string | null;
+  children: React.ReactNode;
+  submitLabel?: string;
+}) {
+  return (
+    <div className="fixed inset-0 z-50 bg-slate-900/40 grid place-items-center p-4"
+         onMouseDown={e => { if (e.target === e.currentTarget) onClose(); }}>
+      <form onSubmit={onSubmit}
+        className="bg-white rounded-2xl w-full max-w-md shadow-2xl overflow-hidden max-h-[92vh] flex flex-col">
+        <header className="flex items-center justify-between px-5 py-3 border-b border-slate-100">
+          <h3 className="text-base font-bold text-slate-900">{title}</h3>
+          <button type="button" onClick={onClose}
+            className="text-slate-400 hover:text-slate-600">
+            <X className="w-5 h-5" />
+          </button>
+        </header>
+        <div className="p-5 space-y-3 overflow-y-auto">{children}
+          {err && (
+            <div className="text-xs text-rose-700 bg-rose-50 border border-rose-200 rounded-lg p-2">{err}</div>
+          )}
+        </div>
+        <footer className="px-5 py-3 border-t border-slate-100 bg-slate-50 flex items-center justify-end gap-2">
+          <button type="button" onClick={onClose}
+            className="px-3 py-1.5 text-sm text-slate-600 hover:bg-slate-100 rounded-lg">
+            Cancel
+          </button>
+          <button type="submit" disabled={busy}
+            className="px-3 py-1.5 text-sm font-medium bg-slate-900 hover:bg-slate-800
+                       disabled:opacity-40 text-white rounded-lg">
+            {busy ? 'Saving…' : submitLabel}
+          </button>
+        </footer>
+      </form>
+    </div>
+  );
+}
+
+function thirtyDaysAgo(): string {
+  const d = new Date(); d.setDate(d.getDate() - 30);
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+}
+function todayLocalISO(): string {
+  const d = new Date();
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
 }
 
 function TelegramMessagesCard({ messages }: { messages: TelegramMsg[] }) {

@@ -237,6 +237,55 @@ app.get('/api/reports/today', async (_req, res) => {
   }
 });
 
+// Manually create / upsert a daily-report row (boss only). Lets the
+// boss log a report when the n8n Telegram collector misses it (e.g.
+// the subscriber didn't use Telegram's Reply feature, so the message
+// never bound to the open session). UPSERT on (subscriber_id,
+// report_date) so the same call works for new days and existing rows.
+app.post('/api/reports',
+  requireRole('boss'),
+  async (req, res) => {
+    const b = req.body || {};
+    const subscriberId = String(b.subscriber_id || '').trim();
+    if (!subscriberId) return res.status(400).json({ error: 'subscriber_id required' });
+    const reportDate = (b.report_date as string) || new Date().toISOString().slice(0, 10);
+    const fields = ['goals', 'mid_progress', 'mid_issues', 'mid_changes',
+                    'eod_completed', 'eod_unfinished', 'eod_hours'] as const;
+    // Build column lists for the UPSERT.
+    const cols: string[] = ['subscriber_id', 'report_date'];
+    const vals: unknown[] = [subscriberId, reportDate];
+    const placeholders: string[] = ['$1::uuid', '$2::date'];
+    const updates: string[] = [];
+    for (const k of fields) {
+      if (b[k] !== undefined) {
+        vals.push(b[k] === '' ? null : b[k]);
+        const p = `$${vals.length}`;
+        cols.push(k);
+        placeholders.push(p);
+        updates.push(`${k} = EXCLUDED.${k}`);
+      }
+    }
+    if (updates.length === 0) {
+      return res.status(400).json({ error: 'at least one report field required' });
+    }
+    try {
+      const rows = await query(
+        `INSERT INTO ops.daily_reports (${cols.join(', ')}, updated_at)
+         VALUES (${placeholders.join(', ')}, now())
+         ON CONFLICT (subscriber_id, report_date) DO UPDATE
+           SET ${updates.join(', ')}, updated_at = now()
+         RETURNING id, subscriber_id, to_char(report_date, 'YYYY-MM-DD') AS report_date,
+                   goals, mid_progress, mid_issues, mid_changes,
+                   eod_completed, eod_unfinished, eod_hours, updated_at`,
+        vals
+      );
+      res.json({ report: rows[0] });
+    } catch (e) {
+      res.status(pgErrorStatus(e)).json({ error: (e as Error).message });
+    }
+  }
+);
+
 // Edit a daily-report row (boss only). Accepts any subset of the
 // human-authored fields; nulls are allowed to clear a slot. The n8n
 // pipeline won't re-overwrite an edited slot within the same day
@@ -2056,6 +2105,71 @@ app.get('/api/activity', async (req, res) => {
     res.status(pgErrorStatus(e)).json({ error: (e as Error).message });
   }
 });
+
+// Free-form Q&A over the team's recent reports. Boss/PA only since the
+// data is sensitive. Pulls last `days` of reports (default 14, max 60),
+// hands them to Claude with the boss's question, returns a plain prose
+// answer. Cheaper model than /api/agent/summary because the question is
+// usually narrow.
+app.post('/api/agent/ask-reports',
+  requireRole('boss', 'pa'),
+  async (req, res) => {
+    const question = ((req.body?.question as string) || '').trim().slice(0, 500);
+    if (!question) return res.status(400).json({ error: 'question required' });
+    const days = Math.min(60, Math.max(1, Number(req.body?.days ?? 14)));
+    if (!ANTHROPIC_API_KEY) {
+      return res.status(503).json({ error: 'ANTHROPIC_API_KEY not configured' });
+    }
+    try {
+      const rows = await query(
+        `SELECT s.name AS subscriber, s.role,
+                to_char(d.report_date, 'YYYY-MM-DD') AS date,
+                d.goals, d.mid_progress, d.mid_issues, d.mid_changes,
+                d.eod_completed, d.eod_unfinished, d.eod_hours
+           FROM ops.daily_reports d
+           JOIN ops.report_subscribers s ON s.id = d.subscriber_id
+          WHERE d.report_date >= (now() - ($1 || ' days')::interval)::date
+          ORDER BY d.report_date DESC, s.name`,
+        [String(days)]
+      );
+      const system =
+        "You are a senior operations analyst answering a question about a small " +
+        "team's recent daily reports. Each report has the subscriber's name, " +
+        "role, date, and slot fields (morning goals, mid-day progress/issues, " +
+        "end-of-day completed/unfinished/hours). Answer the boss's question in " +
+        "plain prose, cite names and dates, keep it under 200 words. If the " +
+        "data doesn't contain the answer, say so directly — do not hallucinate.";
+      const userMessage =
+        `Last ${days} days of reports (JSON):\n\n` +
+        JSON.stringify(rows, null, 2) +
+        `\n\nQuestion: ${question}`;
+      const upstream = await fetch('https://api.anthropic.com/v1/messages', {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          'anthropic-version': '2023-06-01',
+          'x-api-key': ANTHROPIC_API_KEY,
+        },
+        body: JSON.stringify({
+          model: 'claude-haiku-4-5-20251001',
+          max_tokens: 600,
+          system,
+          messages: [{ role: 'user', content: userMessage }],
+        }),
+      });
+      const data = await upstream.json().catch(() => ({} as Record<string, unknown>));
+      if (!upstream.ok) {
+        return res.status(502).json({ error: 'anthropic_error', detail: data });
+      }
+      const answer =
+        (data as { content?: Array<{ text?: string }> })?.content?.[0]?.text
+        || '(empty answer)';
+      res.json({ answer, rows: rows.length, days });
+    } catch (e) {
+      res.status(pgErrorStatus(e)).json({ error: (e as Error).message });
+    }
+  }
+);
 
 // ---------- Messages ---------------------------------------------- //
 // Raw Telegram message log (both directions). LEFT JOINs the subscriber

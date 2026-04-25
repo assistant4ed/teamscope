@@ -3,6 +3,7 @@ import {
   Sun, Moon, Clock, Sparkles, Activity, List, Calendar as CalendarIcon,
   Loader2, AlertTriangle, CheckCircle2, User as UserIcon,
   Kanban, ArrowRight, Pencil, Trash2, X, Check, RotateCcw,
+  PlusCircle, MessageSquare, Send,
 } from 'lucide-react';
 import { apiGet, apiPost, apiFetch, Me } from '../auth';
 
@@ -65,6 +66,7 @@ export default function Reports({ me }: { me: Me }) {
   // so re-clicks (or a reload) can't double-create.
   const [importedById, setImportedById] = useState<Map<string, number>>(new Map());
   const [subscribers, setSubscribers] = useState<SubscriberRef[]>([]);
+  const [showManualLog, setShowManualLog] = useState(false);
 
   async function load() {
     setLoading(true);
@@ -176,8 +178,22 @@ export default function Reports({ me }: { me: Me }) {
               <CalendarIcon className="w-4 h-4" />
             </button>
           </div>
+          {isBoss && (
+            <button onClick={() => setShowManualLog(true)}
+              className="inline-flex items-center gap-1.5 text-sm font-medium
+                         bg-slate-900 hover:bg-slate-800 text-white rounded-xl px-3 py-2">
+              <PlusCircle className="w-4 h-4" /> Log report
+            </button>
+          )}
         </div>
       </div>
+
+      {showManualLog && (
+        <ManualLogModal
+          subscribers={subscribers}
+          onDone={() => { setShowManualLog(false); load(); }}
+          onClose={() => setShowManualLog(false)} />
+      )}
 
       {/* Stats */}
       <div className="grid grid-cols-2 md:grid-cols-4 gap-4 md:gap-5">
@@ -207,6 +223,8 @@ export default function Reports({ me }: { me: Me }) {
           tone={totalIssues > 0 ? 'rose' : 'default'}
         />
       </div>
+
+      {(isBoss || me.role === 'pa') && <AskReportsPanel />}
 
       {/* Intelligence Briefing (AI) */}
       <div className="bg-gradient-to-br from-indigo-500 to-purple-600 p-[1px] rounded-[28px] shadow-xl">
@@ -576,4 +594,200 @@ const CalendarView = ({ byDate }: { byDate: [string, Report[]][] }) => (
       );
     })}
   </div>
+);
+
+// ---------- Ask AI panel --------------------------------------------- //
+function AskReportsPanel() {
+  const [question, setQuestion] = useState('');
+  const [days, setDays] = useState(14);
+  const [busy, setBusy] = useState(false);
+  const [answer, setAnswer] = useState<string | null>(null);
+  const [meta, setMeta] = useState<{ rows: number; days: number } | null>(null);
+  const [err, setErr] = useState<string | null>(null);
+
+  async function ask() {
+    if (!question.trim() || busy) return;
+    setBusy(true); setErr(null); setAnswer(null);
+    try {
+      const r = await apiPost<{ answer: string; rows: number; days: number }>(
+        '/api/agent/ask-reports', { question: question.trim(), days }
+      );
+      setAnswer(r.answer);
+      setMeta({ rows: r.rows, days: r.days });
+    } catch (e) { setErr(String(e)); }
+    finally { setBusy(false); }
+  }
+
+  return (
+    <div className="bg-white border border-slate-200 rounded-2xl p-5 md:p-6">
+      <div className="flex items-center gap-3 mb-3">
+        <div className="p-2 bg-emerald-50 rounded-xl text-emerald-600">
+          <MessageSquare className="w-5 h-5" />
+        </div>
+        <div>
+          <h3 className="text-base font-bold text-slate-900">Ask the AI</h3>
+          <p className="text-xs text-slate-500">
+            Pose a question; Claude reads the last {days} days of reports and answers in plain prose.
+          </p>
+        </div>
+      </div>
+      <div className="flex items-stretch gap-2">
+        <select value={days} onChange={e => setDays(Number(e.target.value))}
+          className="text-xs border border-slate-200 rounded-lg px-2 py-2 bg-white">
+          <option value={3}>3d</option>
+          <option value={7}>7d</option>
+          <option value={14}>14d</option>
+          <option value={30}>30d</option>
+          <option value={60}>60d</option>
+        </select>
+        <input value={question} onChange={e => setQuestion(e.target.value)}
+          onKeyDown={e => { if (e.key === 'Enter') ask(); }}
+          placeholder="e.g. Who logged the most hours this week? · Has Andrea flagged blockers? · What's still unfinished?"
+          className="flex-1 border border-slate-200 rounded-lg px-3 py-2 text-sm" />
+        <button onClick={ask} disabled={busy || !question.trim()}
+          className="inline-flex items-center gap-1.5 px-3 py-2 text-sm font-medium
+                     bg-slate-900 hover:bg-slate-800 disabled:opacity-40 text-white rounded-lg">
+          {busy ? <Loader2 className="w-4 h-4 animate-spin" /> : <Send className="w-4 h-4" />}
+          Ask
+        </button>
+      </div>
+      {err && (
+        <div className="mt-3 text-xs text-rose-700 bg-rose-50 border border-rose-200 rounded-lg p-2">
+          {err}
+        </div>
+      )}
+      {answer && (
+        <div className="mt-4 bg-slate-50 border border-slate-100 rounded-xl p-4">
+          <p className="text-sm text-slate-700 leading-relaxed whitespace-pre-line">{answer}</p>
+          {meta && (
+            <div className="mt-2 text-[11px] text-slate-400">
+              based on {meta.rows} report row{meta.rows === 1 ? '' : 's'} from the last {meta.days} day{meta.days === 1 ? '' : 's'}
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ---------- Manual log modal ----------------------------------------- //
+function ManualLogModal({ subscribers, onDone, onClose }: {
+  subscribers: SubscriberRef[];
+  onDone: () => void;
+  onClose: () => void;
+}) {
+  const active = subscribers.filter(s => s.active);
+  const [subscriberId, setSubscriberId] = useState(active[0]?.id ?? '');
+  const [reportDate, setReportDate] = useState(todayLocalISO());
+  const [goals, setGoals] = useState('');
+  const [midProgress, setMidProgress] = useState('');
+  const [eodCompleted, setEodCompleted] = useState('');
+  const [eodUnfinished, setEodUnfinished] = useState('');
+  const [eodHours, setEodHours] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+
+  async function save(e: React.FormEvent) {
+    e.preventDefault();
+    if (!subscriberId) { setErr('Pick a subscriber'); return; }
+    setBusy(true); setErr(null);
+    const body: Record<string, unknown> = {
+      subscriber_id: subscriberId,
+      report_date: reportDate,
+    };
+    if (goals.trim())          body.goals = goals.trim();
+    if (midProgress.trim())    body.mid_progress = midProgress.trim();
+    if (eodCompleted.trim())   body.eod_completed = eodCompleted.trim();
+    if (eodUnfinished.trim())  body.eod_unfinished = eodUnfinished.trim();
+    if (eodHours.trim())       body.eod_hours = Number(eodHours);
+    if (Object.keys(body).length <= 2) {
+      setErr('Fill at least one slot field'); setBusy(false); return;
+    }
+    try {
+      const res = await apiFetch('/api/reports', {
+        method: 'POST',
+        body: JSON.stringify(body),
+      });
+      if (!res.ok) {
+        const b = await res.json().catch(() => ({}));
+        throw new Error((b as { error?: string }).error || `HTTP ${res.status}`);
+      }
+      onDone();
+    } catch (e) { setErr((e as Error).message); }
+    finally { setBusy(false); }
+  }
+
+  return (
+    <div className="fixed inset-0 z-50 bg-slate-900/40 grid place-items-center p-4"
+         onMouseDown={e => { if (e.target === e.currentTarget) onClose(); }}>
+      <form onSubmit={save}
+        className="bg-white rounded-2xl w-full max-w-xl shadow-2xl overflow-hidden max-h-[92vh] flex flex-col">
+        <header className="flex items-center justify-between px-6 py-4 border-b border-slate-100">
+          <div>
+            <h3 className="text-lg font-bold text-slate-900">Log report manually</h3>
+            <p className="text-xs text-slate-400 mt-0.5">
+              Use this if Telegram capture missed something. Fields you leave blank stay untouched.
+            </p>
+          </div>
+          <button type="button" onClick={onClose}
+            className="text-slate-400 hover:text-slate-600">
+            <X className="w-5 h-5" />
+          </button>
+        </header>
+        <div className="p-6 space-y-3 overflow-y-auto">
+          <div className="grid grid-cols-2 gap-3">
+            <label className="block">
+              <span className="text-xs font-medium text-slate-700">Subscriber</span>
+              <select value={subscriberId} onChange={e => setSubscriberId(e.target.value)}
+                className="mt-1 w-full border border-slate-200 rounded-lg px-3 py-2 text-sm">
+                {active.map(s => <option key={s.id} value={s.id}>{s.name}</option>)}
+              </select>
+            </label>
+            <label className="block">
+              <span className="text-xs font-medium text-slate-700">Report date</span>
+              <input type="date" value={reportDate} onChange={e => setReportDate(e.target.value)}
+                className="mt-1 w-full border border-slate-200 rounded-lg px-3 py-2 text-sm" />
+            </label>
+          </div>
+          <ManualField label="Morning goals" value={goals} onChange={setGoals} />
+          <ManualField label="Midday progress" value={midProgress} onChange={setMidProgress} />
+          <ManualField label="EOD completed" value={eodCompleted} onChange={setEodCompleted} />
+          <ManualField label="EOD unfinished" value={eodUnfinished} onChange={setEodUnfinished} />
+          <label className="block">
+            <span className="text-xs font-medium text-slate-700">Hours worked</span>
+            <input type="number" step="0.5" value={eodHours} onChange={e => setEodHours(e.target.value)}
+              placeholder="(optional)"
+              className="mt-1 w-full border border-slate-200 rounded-lg px-3 py-2 text-sm" />
+          </label>
+          {err && (
+            <div className="text-xs text-rose-700 bg-rose-50 border border-rose-200 rounded-lg p-2">
+              {err}
+            </div>
+          )}
+        </div>
+        <footer className="px-6 py-4 border-t border-slate-100 bg-slate-50 flex items-center justify-end gap-2">
+          <button type="button" onClick={onClose}
+            className="px-4 py-2 text-sm text-slate-600 hover:bg-slate-100 rounded-lg">
+            Cancel
+          </button>
+          <button type="submit" disabled={busy}
+            className="px-4 py-2 text-sm font-medium bg-slate-900 hover:bg-slate-800
+                       disabled:opacity-40 text-white rounded-lg">
+            {busy ? 'Saving…' : 'Save report'}
+          </button>
+        </footer>
+      </form>
+    </div>
+  );
+}
+
+const ManualField = ({ label, value, onChange }: {
+  label: string; value: string; onChange: (v: string) => void;
+}) => (
+  <label className="block">
+    <span className="text-xs font-medium text-slate-700">{label}</span>
+    <textarea value={value} onChange={e => onChange(e.target.value)}
+      rows={2} placeholder="(optional)"
+      className="mt-1 w-full border border-slate-200 rounded-lg px-3 py-2 text-sm" />
+  </label>
 );

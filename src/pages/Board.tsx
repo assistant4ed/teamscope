@@ -997,7 +997,7 @@ function EditCardModal({
   const columnName = columns.find(c => c.id === card.column_id)?.name;
 
   return (
-    <ModalShell title="Edit card" onClose={onClose} onSubmit={save}
+    <ModalShell wide title="Edit card" onClose={onClose} onSubmit={save}
       subtitle={
         <>
           In <b>{columnName}</b> · created {new Date(card.created_at).toLocaleString()}
@@ -1029,42 +1029,54 @@ function EditCardModal({
             label={busy ? 'Saving…' : 'Save changes'} />
         </>
       }>
-      <Field label="Title">
-        <input required value={title} onChange={e => setTitle(e.target.value)}
-          className="w-full border border-slate-200 rounded-lg px-3 py-2 text-sm" />
-      </Field>
-      <Field label="Description" hint="Drop or paste images directly into the text.">
-        <DescriptionField value={description} onChange={setDescription} />
-      </Field>
-      <div className="grid grid-cols-2 gap-3">
-        <Field label="Priority">
-          <PrioritySelect value={priority} onChange={setPriority} />
-        </Field>
-        <Field label="Due date">
-          <input type="date" value={dueDate} onChange={e => setDueDate(e.target.value)}
-            className="w-full border border-slate-200 rounded-lg px-3 py-2 text-sm" />
-        </Field>
+      <div className="grid grid-cols-1 md:grid-cols-[1fr_320px] gap-4 -m-2">
+        <div className="space-y-4 p-2 min-w-0">
+          <Field label="Title">
+            <input required value={title} onChange={e => setTitle(e.target.value)}
+              className="w-full border border-slate-200 rounded-lg px-3 py-2 text-sm" />
+          </Field>
+          <Field label="Description" hint="Drop or paste images directly into the text.">
+            <DescriptionField value={description} onChange={setDescription} />
+          </Field>
+          <div className="grid grid-cols-2 gap-3">
+            <Field label="Priority">
+              <PrioritySelect value={priority} onChange={setPriority} />
+            </Field>
+            <Field label="Due date">
+              <input type="date" value={dueDate} onChange={e => setDueDate(e.target.value)}
+                className="w-full border border-slate-200 rounded-lg px-3 py-2 text-sm" />
+            </Field>
+          </div>
+          <AssigneePicker subscribers={subscribers} value={assignees} onChange={setAssignees} />
+          <ImageDropZone value={imageUrls} onChange={setImageUrls} />
+          {err && <ErrorBox msg={err} />}
+        </div>
+        <CardTimelinePanel cardId={cardId}
+          subsByEmail={useMemo(() => {
+            const m = new Map<string, Subscriber>();
+            subscribers.forEach(s => m.set(s.id, s));
+            return m;
+          }, [subscribers])} />
       </div>
-      <AssigneePicker subscribers={subscribers} value={assignees} onChange={setAssignees} />
-      <ImageDropZone value={imageUrls} onChange={setImageUrls} />
-      {err && <ErrorBox msg={err} />}
     </ModalShell>
   );
 }
 
 // ---------- Reusable form bits -------------------------------------- //
 function ModalShell({
-  title, subtitle, onClose, onSubmit, children, footer,
+  title, subtitle, onClose, onSubmit, children, footer, wide = false,
 }: {
   title: string; subtitle?: React.ReactNode;
   onClose: () => void; onSubmit: (e: React.FormEvent) => void;
   children: React.ReactNode; footer: React.ReactNode;
+  wide?: boolean;
 }) {
+  const widthCls = wide ? 'max-w-4xl' : 'max-w-lg';
   return (
     <div className="fixed inset-0 z-50 bg-slate-900/40 grid place-items-center p-4"
          onMouseDown={e => { if (e.target === e.currentTarget) onClose(); }}>
       <form onSubmit={onSubmit}
-        className="bg-white rounded-2xl w-full max-w-lg shadow-2xl overflow-hidden max-h-[92vh] flex flex-col">
+        className={`bg-white rounded-2xl w-full ${widthCls} shadow-2xl overflow-hidden max-h-[92vh] flex flex-col`}>
         <header className="flex items-center justify-between px-6 py-4 border-b border-slate-100">
           <div>
             <h3 className="text-lg font-bold text-slate-900">{title}</h3>
@@ -1427,6 +1439,197 @@ function DescriptionField({ value, onChange }: {
       )}
     </div>
   );
+}
+
+// ---------- Per-card timeline panel (right rail of EditCardModal) -- //
+// Two tabs: Comments (default) — chronological, paste-an-image works
+// just like the description; Activity — read-only feed of card events
+// from the existing kanban_activity table. The two are merged into one
+// chronological feed if Activity is selected; Comments stays comment-only
+// to avoid noise when the user just wants to leave a note.
+
+interface CommentRow {
+  id: string; card_id: string; author_email: string;
+  body: string; created_at: string; edited_at: string | null;
+}
+interface ActivityEvent {
+  id: string; actor_email: string; action: string;
+  payload: Record<string, unknown>; created_at: string;
+}
+
+function CardTimelinePanel({ cardId, subsByEmail }: {
+  cardId: string;
+  subsByEmail: Map<string, Subscriber>;
+}) {
+  const apiCtx = useApiCtx();
+  const [tab, setTab] = useState<'comments' | 'activity'>('comments');
+  const [comments, setComments] = useState<CommentRow[]>([]);
+  const [events, setEvents] = useState<ActivityEvent[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [draft, setDraft] = useState('');
+  const [posting, setPosting] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+
+  const timelineUrl = apiCtx.kind === 'authed'
+    ? `/api/kanban/cards/${cardId}/timeline`
+    : `/api/public/board/${apiCtx.token}/cards/${cardId}/timeline`;
+  const commentPostUrl = apiCtx.kind === 'authed'
+    ? `/api/kanban/cards/${cardId}/comments`
+    : `/api/public/board/${apiCtx.token}/cards/${cardId}/comments`;
+  const canPost = apiCtx.kind !== 'public-view';
+
+  const reload = useCallback(async () => {
+    setLoading(true);
+    try {
+      const r = await apiFetch(timelineUrl);
+      if (!r.ok) throw new Error(`HTTP ${r.status}`);
+      const body = await r.json();
+      setComments(body.comments || []);
+      setEvents(body.events || []);
+      setErr(null);
+    } catch (e) { setErr((e as Error).message); }
+    finally { setLoading(false); }
+  }, [timelineUrl]);
+
+  useEffect(() => { reload(); }, [reload]);
+
+  async function postComment(e: React.FormEvent) {
+    e.preventDefault();
+    const body = draft.trim();
+    if (!body) return;
+    setPosting(true); setErr(null);
+    try {
+      const r = await apiFetch(commentPostUrl, {
+        method: 'POST', body: JSON.stringify({ body }),
+      });
+      if (!r.ok) {
+        const j = await r.json().catch(() => ({}));
+        throw new Error(j.error || `HTTP ${r.status}`);
+      }
+      setDraft('');
+      reload();
+    } catch (e) { setErr((e as Error).message); }
+    finally { setPosting(false); }
+  }
+
+  // Merge for Activity tab — comments inserted into events as 'commented' rows.
+  const mergedEvents = useMemo<ActivityEvent[]>(() => {
+    const fromComments: ActivityEvent[] = comments.map(c => ({
+      id: 'c:' + c.id,
+      actor_email: c.author_email,
+      action: 'card.commented',
+      payload: { body_preview: c.body.slice(0, 120) },
+      created_at: c.created_at,
+    }));
+    return [...events.filter(e => e.action !== 'card.commented'), ...fromComments]
+      .sort((a, b) => a.created_at.localeCompare(b.created_at));
+  }, [comments, events]);
+
+  return (
+    <aside className="bg-slate-50 border-l border-slate-200 -my-2 -mr-2 p-3 flex flex-col">
+      <div className="inline-flex bg-white border border-slate-200 rounded-lg p-0.5 mb-3 self-start">
+        <button type="button" onClick={() => setTab('comments')}
+          className={`px-3 py-1 text-xs rounded ${tab==='comments'?'bg-slate-900 text-white':'text-slate-600'}`}>
+          Comments {comments.length > 0 && `(${comments.length})`}
+        </button>
+        <button type="button" onClick={() => setTab('activity')}
+          className={`px-3 py-1 text-xs rounded ${tab==='activity'?'bg-slate-900 text-white':'text-slate-600'}`}>
+          Activity
+        </button>
+      </div>
+      <div className="flex-1 overflow-y-auto min-h-0 space-y-3 pr-1">
+        {loading && <p className="text-xs text-slate-400">Loading…</p>}
+        {!loading && tab === 'comments' && comments.length === 0 && (
+          <p className="text-xs text-slate-400 italic">No comments yet. Be the first.</p>
+        )}
+        {!loading && tab === 'comments' && comments.map(c => (
+          <CommentBubble key={c.id} c={c} />
+        ))}
+        {!loading && tab === 'activity' && mergedEvents.length === 0 && (
+          <p className="text-xs text-slate-400 italic">No activity yet.</p>
+        )}
+        {!loading && tab === 'activity' && mergedEvents.map(ev => (
+          <ActivityRow key={ev.id} ev={ev} />
+        ))}
+      </div>
+      {tab === 'comments' && canPost && (
+        <form onSubmit={postComment} className="mt-3 pt-3 border-t border-slate-200 space-y-2">
+          <textarea value={draft} onChange={e => setDraft(e.target.value)}
+            rows={2}
+            placeholder="Write a comment…"
+            className="w-full border border-slate-200 rounded-lg px-2 py-1.5 text-sm bg-white" />
+          <button type="submit" disabled={!draft.trim() || posting}
+            className="w-full px-3 py-1.5 text-xs font-medium bg-slate-900 hover:bg-slate-800
+                       disabled:opacity-40 text-white rounded-lg">
+            {posting ? 'Posting…' : 'Add comment'}
+          </button>
+          {err && <p className="text-xs text-rose-700">{err}</p>}
+        </form>
+      )}
+    </aside>
+  );
+}
+
+function CommentBubble({ c }: { c: CommentRow }) {
+  const author = c.author_email === 'share-link' ? 'Share link' : c.author_email.split('@')[0];
+  return (
+    <div className="bg-white rounded-lg border border-slate-200 px-3 py-2 text-xs space-y-1">
+      <div className="flex items-center justify-between">
+        <span className="font-medium text-slate-700">{author}</span>
+        <span className="text-slate-400">{relTime(c.created_at)}</span>
+      </div>
+      <div className="text-slate-700 whitespace-pre-wrap break-words">{c.body}</div>
+      {c.edited_at && (
+        <span className="text-[10px] text-slate-400">edited</span>
+      )}
+    </div>
+  );
+}
+
+function ActivityRow({ ev }: { ev: ActivityEvent }) {
+  const verb = ACTIVITY_VERBS[ev.action] || ev.action.replace('card.', '');
+  const actor = ev.actor_email === 'share-link' ? 'Share link'
+    : ev.actor_email === 'system' ? 'System'
+    : ev.actor_email.split('@')[0];
+  const detail = ev.action === 'card.commented' && ev.payload?.body_preview
+    ? `: "${String(ev.payload.body_preview).slice(0, 60)}"`
+    : '';
+  return (
+    <div className="text-xs text-slate-600 flex items-baseline gap-2">
+      <span className="text-slate-400 tabular-nums w-12 flex-shrink-0">
+        {relTime(ev.created_at)}
+      </span>
+      <span className="flex-1">
+        <b className="text-slate-700">{actor}</b> {verb}{detail}
+      </span>
+    </div>
+  );
+}
+
+const ACTIVITY_VERBS: Record<string, string> = {
+  'card.created':    'created the card',
+  'card.updated':    'edited the card',
+  'card.moved':      'moved the card',
+  'card.assigned':   'assigned a member',
+  'card.unassigned': 'unassigned a member',
+  'card.done':       'marked done',
+  'card.reopened':   'reopened',
+  'card.deleted':    'deleted the card',
+  'card.commented':  'commented',
+};
+
+function relTime(iso: string): string {
+  const d = new Date(iso);
+  const ms = Date.now() - d.getTime();
+  const sec = Math.floor(ms / 1000);
+  if (sec < 60) return 'just now';
+  const min = Math.floor(sec / 60);
+  if (min < 60) return `${min}m`;
+  const hr = Math.floor(min / 60);
+  if (hr < 24) return `${hr}h`;
+  const day = Math.floor(hr / 24);
+  if (day < 7) return `${day}d`;
+  return d.toLocaleDateString();
 }
 
 // Small thumbnail strip rendered inline on the board card.

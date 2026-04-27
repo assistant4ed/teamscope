@@ -2947,6 +2947,171 @@ app.post('/api/public/board/:token/uploads/image', async (req, res) => {
   res.json({ url });
 });
 
+// ---------- Card comments + per-card timeline ---------------------- //
+// Comments live on cards across both the authed UI and public-edit shared
+// boards; share-link visitors author as 'share-link'. The timeline endpoint
+// merges comment events with the existing kanban_activity rows so the right
+// rail in EditCardModal is one chronological feed.
+
+interface CommentRow {
+  id: string; card_id: string; author_email: string;
+  body: string; created_at: string; edited_at: string | null;
+}
+
+app.get('/api/kanban/cards/:id/comments', async (req, res) => {
+  try {
+    const rows = await query<CommentRow>(
+      `SELECT id, card_id, author_email, body, created_at, edited_at
+         FROM ops.kanban_card_comments
+        WHERE card_id = $1 AND deleted_at IS NULL
+        ORDER BY created_at ASC`,
+      [req.params.id]
+    );
+    res.json({ comments: rows });
+  } catch (e) {
+    res.status(pgErrorStatus(e)).json({ error: (e as Error).message });
+  }
+});
+
+app.post('/api/kanban/cards/:id/comments',
+  requireRole('boss', 'pa', 'colleague'),
+  async (req, res) => {
+    const body = ((req.body?.body as string) || '').trim();
+    if (!body) return res.status(400).json({ error: 'body required' });
+    if (body.length > 4000) return res.status(400).json({ error: 'body too long (4000 max)' });
+    try {
+      const rows = await query<CommentRow>(
+        `INSERT INTO ops.kanban_card_comments (card_id, author_email, body)
+         VALUES ($1, $2, $3)
+         RETURNING id, card_id, author_email, body, created_at, edited_at`,
+        [req.params.id, req.user!.email, body]
+      );
+      await logActivity(req.user!.email, String(req.params.id), 'card.commented',
+        { comment_id: rows[0].id, body_preview: body.slice(0, 120) });
+      res.json({ comment: rows[0] });
+    } catch (e) {
+      res.status(pgErrorStatus(e)).json({ error: (e as Error).message });
+    }
+  }
+);
+
+app.patch('/api/kanban/comments/:id', async (req, res) => {
+  const body = ((req.body?.body as string) || '').trim();
+  if (!body) return res.status(400).json({ error: 'body required' });
+  if (!req.user) return res.status(401).json({ error: 'unauthorized' });
+  try {
+    const rows = await query<CommentRow>(
+      `UPDATE ops.kanban_card_comments
+          SET body = $1, edited_at = now()
+        WHERE id = $2 AND deleted_at IS NULL
+          AND (author_email = $3 OR $4 = 'boss')
+       RETURNING id, card_id, author_email, body, created_at, edited_at`,
+      [body, req.params.id, req.user.email, req.user.role]
+    );
+    if (rows.length === 0) return res.status(403).json({ error: 'not_owner' });
+    res.json({ comment: rows[0] });
+  } catch (e) {
+    res.status(pgErrorStatus(e)).json({ error: (e as Error).message });
+  }
+});
+
+app.delete('/api/kanban/comments/:id', async (req, res) => {
+  if (!req.user) return res.status(401).json({ error: 'unauthorized' });
+  try {
+    const rows = await query<{ id: string }>(
+      `UPDATE ops.kanban_card_comments
+          SET deleted_at = now()
+        WHERE id = $1 AND deleted_at IS NULL
+          AND (author_email = $2 OR $3 = 'boss')
+       RETURNING id`,
+      [req.params.id, req.user.email, req.user.role]
+    );
+    if (rows.length === 0) return res.status(403).json({ error: 'not_owner' });
+    res.json({ deleted: req.params.id });
+  } catch (e) {
+    res.status(pgErrorStatus(e)).json({ error: (e as Error).message });
+  }
+});
+
+// Merged timeline: comments + activity events for a single card,
+// sorted ascending. Used by the EditCardModal right-rail Activity tab.
+app.get('/api/kanban/cards/:id/timeline', async (req, res) => {
+  try {
+    const [comments, events] = await Promise.all([
+      query<CommentRow>(
+        `SELECT id, card_id, author_email, body, created_at, edited_at
+           FROM ops.kanban_card_comments
+          WHERE card_id = $1 AND deleted_at IS NULL`,
+        [req.params.id]
+      ),
+      query<{ id: string; actor_email: string; action: string; payload: unknown; created_at: string }>(
+        `SELECT id, actor_email, action, payload, created_at
+           FROM ops.kanban_activity
+          WHERE card_id = $1
+          ORDER BY created_at ASC`,
+        [req.params.id]
+      ),
+    ]);
+    res.json({ comments, events });
+  } catch (e) {
+    res.status(pgErrorStatus(e)).json({ error: (e as Error).message });
+  }
+});
+
+// Public POST comment for share-edit visitors. View-only links 403.
+app.post('/api/public/board/:token/cards/:id/comments', async (req, res) => {
+  const scope = await guardShareEdit(req.params.token, res);
+  if (!scope) return;
+  if (!(await cardInBoard(req.params.id, scope.boardId))) {
+    return res.status(403).json({ error: 'card_outside_share_scope' });
+  }
+  const body = ((req.body?.body as string) || '').trim();
+  if (!body) return res.status(400).json({ error: 'body required' });
+  if (body.length > 4000) return res.status(400).json({ error: 'body too long (4000 max)' });
+  try {
+    const rows = await query<CommentRow>(
+      `INSERT INTO ops.kanban_card_comments (card_id, author_email, body)
+       VALUES ($1, 'share-link', $2)
+       RETURNING id, card_id, author_email, body, created_at, edited_at`,
+      [req.params.id, body]
+    );
+    await logActivity('share-link', String(req.params.id), 'card.commented',
+      { via: 'share_link', body_preview: body.slice(0, 120) });
+    res.json({ comment: rows[0] });
+  } catch (e) {
+    res.status(pgErrorStatus(e)).json({ error: (e as Error).message });
+  }
+});
+
+// Public timeline for share visitors (both view + edit).
+app.get('/api/public/board/:token/cards/:id/timeline', async (req, res) => {
+  try {
+    const scope = await resolveShareToken(req.params.token);
+    if (!scope) return res.status(404).json({ error: 'not_found_or_revoked' });
+    if (!(await cardInBoard(req.params.id, scope.boardId))) {
+      return res.status(403).json({ error: 'card_outside_share_scope' });
+    }
+    const [comments, events] = await Promise.all([
+      query<CommentRow>(
+        `SELECT id, card_id, author_email, body, created_at, edited_at
+           FROM ops.kanban_card_comments
+          WHERE card_id = $1 AND deleted_at IS NULL`,
+        [req.params.id]
+      ),
+      query<{ id: string; actor_email: string; action: string; payload: unknown; created_at: string }>(
+        `SELECT id, actor_email, action, payload, created_at
+           FROM ops.kanban_activity
+          WHERE card_id = $1
+          ORDER BY created_at ASC`,
+        [req.params.id]
+      ),
+    ]);
+    res.json({ comments, events });
+  } catch (e) {
+    res.status(pgErrorStatus(e)).json({ error: (e as Error).message });
+  }
+});
+
 // Create a card. Position defaults to the end of the target column.
 app.post('/api/kanban/cards',
   requireRole('boss', 'pa', 'colleague'),

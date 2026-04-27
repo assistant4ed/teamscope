@@ -5,6 +5,7 @@ import { apiGet, apiPost, apiFetch, Me } from '../auth';
 interface Subscriber {
   id: string; telegram_chat_id: number; name: string;
   role: string | null; timezone: string;
+  language: 'zh' | 'en';
   slot_morning: string; slot_midday: string; slot_eod: string;
   working_days: number[]; active: boolean; created_at: string;
   updated_at?: string;
@@ -451,6 +452,7 @@ function EditSubscriberModal({ id, onDone, onClose }: {
   const [slotEod, setSlotEod] = useState('18:30');
   const [days, setDays] = useState<number[]>([1, 2, 3, 4, 5]);
   const [active, setActive] = useState(true);
+  const [language, setLanguage] = useState<'zh' | 'en'>('zh');
 
   useEffect(() => {
     let cancelled = false;
@@ -471,6 +473,7 @@ function EditSubscriberModal({ id, onDone, onClose }: {
         setSlotEod(toHHMM(d.subscriber.slot_eod));
         setDays(d.subscriber.working_days ?? []);
         setActive(d.subscriber.active);
+        setLanguage(d.subscriber.language ?? 'zh');
       } catch (e) {
         if (!cancelled) setErr(String(e));
       } finally {
@@ -500,6 +503,7 @@ function EditSubscriberModal({ id, onDone, onClose }: {
           slot_eod: toHHMMSS(slotEod),
           working_days: days,
           active,
+          language,
         }),
       });
       if (!res.ok) {
@@ -589,6 +593,23 @@ function EditSubscriberModal({ id, onDone, onClose }: {
                   <SlotInput label="Morning" value={slotMorning} onChange={setSlotMorning} />
                   <SlotInput label="Midday" value={slotMidday} onChange={setSlotMidday} />
                   <SlotInput label="End of day" value={slotEod} onChange={setSlotEod} />
+                </div>
+              </Field>
+
+              <Field label="Bot language" hint="Telegram DMs go out in this language. Replies are auto-translated to English when stored.">
+                <div className="flex gap-2">
+                  {(['zh', 'en'] as const).map(lng => {
+                    const on = language === lng;
+                    return (
+                      <button key={lng} type="button" onClick={() => setLanguage(lng)}
+                        className={`flex-1 text-sm py-2 rounded-lg border transition
+                          ${on
+                            ? 'bg-indigo-600 text-white border-indigo-600'
+                            : 'bg-white text-slate-600 border-slate-200 hover:border-slate-300'}`}>
+                        {lng === 'zh' ? '中文' : 'English'}
+                      </button>
+                    );
+                  })}
                 </div>
               </Field>
 

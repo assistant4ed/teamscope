@@ -588,7 +588,7 @@ app.get('/api/agent/classifications', async (req, res) => {
 app.get('/api/team', async (_req, res) => {
   try {
     const [subscribers, profiles] = await Promise.all([
-      query(`SELECT id, telegram_chat_id, name, role, timezone, email,
+      query(`SELECT id, telegram_chat_id, name, role, timezone, email, language,
                     slot_morning, slot_midday, slot_eod, working_days, active, created_at
                FROM ops.report_subscribers ORDER BY active DESC, name`),
       query(`SELECT id, telegram_chat_id, name, role, timezone, active, created_at
@@ -1300,7 +1300,7 @@ app.patch('/api/team/subscribers/:id',
     const allowed = ['name', 'role', 'timezone',
                      'slot_morning', 'slot_midday', 'slot_eod',
                      'working_days', 'active', 'telegram_chat_id',
-                     'email'] as const;
+                     'email', 'language'] as const;
     const sets: string[] = [];
     const vals: unknown[] = [];
     for (const k of allowed) {
@@ -1315,7 +1315,7 @@ app.patch('/api/team/subscribers/:id',
       const rows = await query(
         `UPDATE ops.report_subscribers SET ${sets.join(', ')}, updated_at = now()
           WHERE id = $${vals.length}
-        RETURNING id, telegram_chat_id, name, role, timezone,
+        RETURNING id, telegram_chat_id, name, role, timezone, language,
                   slot_morning, slot_midday, slot_eod, working_days, active`,
         vals
       );
@@ -1349,7 +1349,7 @@ app.get('/api/team/subscribers/:id',
     try {
       const [sub, reports] = await Promise.all([
         query(
-          `SELECT id, telegram_chat_id, name, role, timezone, email,
+          `SELECT id, telegram_chat_id, name, role, timezone, email, language,
                   slot_morning, slot_midday, slot_eod, working_days,
                   active, created_at, updated_at
              FROM ops.report_subscribers WHERE id = $1`,
@@ -1452,6 +1452,11 @@ app.post('/api/agent/classify-report', async (req, res) => {
       "You are a message classifier for a Telegram bot that collects daily work reports. " +
       "The bot asks its subscribers a question at each slot (morning/midday/eod). " +
       "Your job: read the subscriber's reply and classify it.\n\n" +
+      "LANGUAGE RULE — CRITICAL:\n" +
+      "Subscribers may reply in Chinese (traditional or simplified), English, or mixed. " +
+      "You MUST translate every text value in the output (summary, all string fields inside " +
+      "structured, and any suggested_task strings) into natural English. Preserve names, " +
+      "URLs, identifiers, and code verbatim. Do not add explanatory notes.\n\n" +
       "Possible kinds:\n" +
       "- report_goals: subscriber giving their morning plan (hours, goals)\n" +
       "- report_progress: subscriber giving midday progress (what's done, blockers)\n" +
@@ -1462,9 +1467,9 @@ app.post('/api/agent/classify-report', async (req, res) => {
       '{\n' +
       '  "kind": "report_goals" | "report_progress" | "report_eod" | "task" | "chatter",\n' +
       '  "confidence": <float 0.0 - 1.0>,\n' +
-      '  "summary": "<one short line, max 160 chars, plain prose>",\n' +
-      `  "structured": ${slotFields[slot]},\n` +
-      '  "suggested_task": { "title": "<short>", "details": "<one-line>" }  // ONLY when kind==="task"; omit otherwise\n' +
+      '  "summary": "<one short ENGLISH line, max 160 chars, plain prose>",\n' +
+      `  "structured": ${slotFields[slot]},  // all string values in English\n` +
+      '  "suggested_task": { "title": "<short ENGLISH>", "details": "<one-line ENGLISH>" }  // ONLY when kind==="task"; omit otherwise\n' +
       '}\n';
 
     const userMessage =

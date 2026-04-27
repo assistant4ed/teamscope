@@ -13,6 +13,7 @@ interface Subscriber {
   id: string; telegram_chat_id: number; name: string;
   role: string | null; timezone: string;
   email?: string | null;
+  language: 'zh' | 'en';
   slot_morning: string; slot_midday: string; slot_eod: string;
   working_days: number[]; active: boolean;
   created_at: string; updated_at?: string;
@@ -841,6 +842,7 @@ function ScheduleCard({ sub, isBoss, onSaved }: {
   const [tz, setTz]           = useState(sub.timezone);
   const [days, setDays]       = useState<number[]>(sub.working_days ?? []);
   const [active, setActive]   = useState(sub.active);
+  const [language, setLanguage] = useState<'zh' | 'en'>(sub.language ?? 'zh');
   const [busy, setBusy]       = useState(false);
   const [err, setErr]         = useState<string | null>(null);
   const [justSaved, setJustSaved] = useState(false);
@@ -853,6 +855,7 @@ function ScheduleCard({ sub, isBoss, onSaved }: {
     setTz(sub.timezone);
     setDays(sub.working_days ?? []);
     setActive(sub.active);
+    setLanguage(sub.language ?? 'zh');
   }, [sub.updated_at, sub.id]);
 
   function toggleDay(d: number) {
@@ -871,6 +874,7 @@ function ScheduleCard({ sub, isBoss, onSaved }: {
           timezone: tz,
           working_days: days,
           active,
+          language,
         }),
       });
       if (!res.ok) {
@@ -925,6 +929,24 @@ function ScheduleCard({ sub, isBoss, onSaved }: {
           </select>
         </Field>
       </div>
+      <Field label="Bot language" hint="DMs go out in this language. Replies are auto-translated to English when stored.">
+        <div className="flex gap-2 mb-4">
+          {(['zh', 'en'] as const).map(lng => {
+            const on = language === lng;
+            return (
+              <button key={lng} type="button" onClick={() => setLanguage(lng)}
+                disabled={!isBoss}
+                className={`flex-1 text-sm py-2 rounded-lg border transition
+                  disabled:cursor-not-allowed disabled:opacity-60
+                  ${on
+                    ? 'bg-indigo-600 text-white border-indigo-600'
+                    : 'bg-white text-slate-600 border-slate-200 hover:border-slate-300'}`}>
+                {lng === 'zh' ? '中文' : 'English'}
+              </button>
+            );
+          })}
+        </div>
+      </Field>
       <label className="flex items-center gap-2 mb-4">
         <input type="checkbox" checked={active} onChange={e => setActive(e.target.checked)}
           disabled={!isBoss} className="rounded border-slate-300" />
@@ -1208,11 +1230,14 @@ function Card({ title, icon, children }: {
   );
 }
 
-function Field({ label, children }: { label: string; children: React.ReactNode }) {
+function Field({ label, hint, children }: {
+  label: string; hint?: string; children: React.ReactNode;
+}) {
   return (
     <label className="block">
       <span className="text-xs font-medium text-slate-700">{label}</span>
       <div className="mt-1">{children}</div>
+      {hint && <p className="text-[11px] text-slate-400 mt-1">{hint}</p>}
     </label>
   );
 }

@@ -669,6 +669,11 @@ function CardView({ card, assigneeIds, subsById, canEdit, onClick }: {
   onClick: () => void;
 }) {
   const [dragging, setDragging] = useState(false);
+  const allImages = useMemo(
+    () => [...(card.image_urls || []), ...extractDescriptionImageUrls(card.description)],
+    [card.image_urls, card.description]
+  );
+  const cover = allImages[0] || null;
   return (
     <div data-card-id={card.id}
       data-dragging={dragging ? 'true' : undefined}
@@ -680,38 +685,45 @@ function CardView({ card, assigneeIds, subsById, canEdit, onClick }: {
       }}
       onDragEnd={() => setDragging(false)}
       onClick={onClick}
-      className={`bg-white border border-slate-200 rounded-lg p-2.5 shadow-sm
+      className={`bg-white border border-slate-200 rounded-lg shadow-sm overflow-hidden
                   hover:shadow hover:border-slate-300 cursor-pointer transition
                   ${dragging ? 'opacity-30' : ''}`}>
-      <div className="flex items-start justify-between gap-2">
-        <div className="text-sm text-slate-800 font-medium leading-snug flex-1">
-          {card.title}
-        </div>
-        {card.priority !== 'medium' && <PriorityFlag priority={card.priority} />}
-      </div>
-      {descriptionPreviewText(card.description) && (
-        <div className="text-xs text-slate-500 mt-1 line-clamp-2">
-          {descriptionPreviewText(card.description)}
-        </div>
+      {cover && (
+        <img src={cover} alt=""
+          className="w-full h-24 object-cover bg-slate-50" loading="lazy" />
       )}
-      <CardImageStrip
-        urls={[...(card.image_urls || []),
-               ...extractDescriptionImageUrls(card.description)]} />
-      <div className="mt-2 flex items-center justify-between gap-2">
-        <div className="flex -space-x-1">
-          {assigneeIds.slice(0, 4).map(sid => (
-            <Avatar key={sid} sub={subsById.get(sid)} />
-          ))}
-          {assigneeIds.length > 4 && (
-            <div className="w-6 h-6 rounded-full bg-slate-200 text-[10px] font-medium
-                            grid place-items-center text-slate-600 border border-white">
-              +{assigneeIds.length - 4}
-            </div>
+      <div className="p-2.5">
+        <div className="flex items-start justify-between gap-2">
+          <div className="text-sm text-slate-800 font-medium leading-snug flex-1">
+            {card.title}
+          </div>
+          {card.priority !== 'medium' && <PriorityFlag priority={card.priority} />}
+        </div>
+        {descriptionPreviewText(card.description) && (
+          <div className="text-xs text-slate-500 mt-1 line-clamp-2">
+            {descriptionPreviewText(card.description)}
+          </div>
+        )}
+        {/* Show extra thumbnails only if there's more than the cover. */}
+        {allImages.length > 1 && (
+          <CardImageStrip urls={allImages.slice(1)} />
+        )}
+        <div className="mt-2 flex items-center justify-between gap-2">
+          <div className="flex -space-x-1">
+            {assigneeIds.slice(0, 4).map(sid => (
+              <Avatar key={sid} sub={subsById.get(sid)} />
+            ))}
+            {assigneeIds.length > 4 && (
+              <div className="w-6 h-6 rounded-full bg-slate-200 text-[10px] font-medium
+                              grid place-items-center text-slate-600 border border-white">
+                +{assigneeIds.length - 4}
+              </div>
+            )}
+          </div>
+          {card.due_date && (
+            <DueDate date={card.due_date} done={!!card.done_at} />
           )}
         </div>
-        {card.due_date && (
-          <DueDate date={card.due_date} done={!!card.done_at} />
-        )}
       </div>
     </div>
   );
@@ -1219,6 +1231,95 @@ function descriptionPreviewText(text: string | null | undefined): string {
   return text.replace(/!\[[^\]]*\]\([^)]+\)/g, '').replace(/\n{3,}/g, '\n\n').trim();
 }
 
+// Tiny safe-by-construction markdown renderer. Handles the subset we
+// actually use in card descriptions and comments: paragraphs, single
+// newlines as <br/>, **bold**, *italic*, `code`, [text](url) safe
+// links, ![alt](url) inline images. No HTML passthrough — every node
+// is a React element, so XSS isn't a concern.
+function renderInline(text: string, keyPrefix: string): React.ReactNode[] {
+  const out: React.ReactNode[] = [];
+  // Order matters: images before links because both start with [...
+  const re = /(!\[([^\]]*)\]\(([^)\s]+)\))|(\[([^\]]+)\]\(([^)\s]+)\))|(\*\*([^*]+)\*\*)|(\*([^*]+)\*)|(`([^`]+)`)/g;
+  let last = 0;
+  let i = 0;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(text)) !== null) {
+    if (m.index > last) {
+      out.push(<span key={`${keyPrefix}-t${i++}`}>{text.slice(last, m.index)}</span>);
+    }
+    if (m[1]) {
+      // Image
+      out.push(<img key={`${keyPrefix}-i${i++}`} src={m[3]} alt={m[2]}
+        className="my-2 max-w-full h-auto rounded border border-slate-200" />);
+    } else if (m[4]) {
+      // Link — only http(s) and image hosts allowed
+      const href = m[6];
+      if (/^https?:\/\//.test(href)) {
+        out.push(<a key={`${keyPrefix}-l${i++}`} href={href} target="_blank" rel="noopener noreferrer"
+          className="text-indigo-600 hover:underline">{m[5]}</a>);
+      } else {
+        out.push(<span key={`${keyPrefix}-l${i++}`}>{m[5]}</span>);
+      }
+    } else if (m[7]) {
+      out.push(<strong key={`${keyPrefix}-b${i++}`}>{m[8]}</strong>);
+    } else if (m[9]) {
+      out.push(<em key={`${keyPrefix}-em${i++}`}>{m[10]}</em>);
+    } else if (m[11]) {
+      out.push(<code key={`${keyPrefix}-c${i++}`}
+        className="px-1 py-0.5 bg-slate-100 rounded text-[0.85em] font-mono">{m[12]}</code>);
+    }
+    last = m.index + m[0].length;
+  }
+  if (last < text.length) {
+    out.push(<span key={`${keyPrefix}-t${i++}`}>{text.slice(last)}</span>);
+  }
+  return out;
+}
+
+function Markdown({ text, className = '' }: { text: string | null | undefined; className?: string }) {
+  if (!text) return null;
+  const blocks = text.split(/\n{2,}/);
+  return (
+    <div className={`prose-tight space-y-2 ${className}`}>
+      {blocks.map((block, bi) => {
+        // Bullet list?
+        const lines = block.split('\n');
+        const isBullet = lines.every(l => /^\s*[-*•]\s+/.test(l));
+        const isOrdered = lines.every(l => /^\s*\d+[.)]\s+/.test(l));
+        if (isBullet && lines.length > 1) {
+          return (
+            <ul key={bi} className="list-disc pl-5 space-y-0.5">
+              {lines.map((l, li) => (
+                <li key={li}>{renderInline(l.replace(/^\s*[-*•]\s+/, ''), `b${bi}-${li}`)}</li>
+              ))}
+            </ul>
+          );
+        }
+        if (isOrdered && lines.length > 1) {
+          return (
+            <ol key={bi} className="list-decimal pl-5 space-y-0.5">
+              {lines.map((l, li) => (
+                <li key={li}>{renderInline(l.replace(/^\s*\d+[.)]\s+/, ''), `o${bi}-${li}`)}</li>
+              ))}
+            </ol>
+          );
+        }
+        // Paragraph with single \n → <br/>
+        return (
+          <p key={bi} className="whitespace-pre-wrap break-words">
+            {lines.map((l, li) => (
+              <React.Fragment key={li}>
+                {li > 0 && <br />}
+                {renderInline(l, `p${bi}-${li}`)}
+              </React.Fragment>
+            ))}
+          </p>
+        );
+      })}
+    </div>
+  );
+}
+
 function ImageDropZone({ value, onChange }: {
   value: string[];
   onChange: (urls: string[]) => void;
@@ -1437,6 +1538,16 @@ function DescriptionField({ value, onChange }: {
           ))}
         </div>
       )}
+      {value && value.trim().length > 0 && (
+        <details className="mt-2 group">
+          <summary className="text-[11px] text-slate-400 cursor-pointer hover:text-slate-600 list-none flex items-center gap-1">
+            <span className="group-open:rotate-90 transition-transform">▸</span> Preview
+          </summary>
+          <div className="mt-2 p-3 rounded border border-slate-100 bg-slate-50 text-sm text-slate-700">
+            <Markdown text={value} />
+          </div>
+        </details>
+      )}
     </div>
   );
 }
@@ -1578,7 +1689,9 @@ function CommentBubble({ c }: { c: CommentRow }) {
         <span className="font-medium text-slate-700">{author}</span>
         <span className="text-slate-400">{relTime(c.created_at)}</span>
       </div>
-      <div className="text-slate-700 whitespace-pre-wrap break-words">{c.body}</div>
+      <div className="text-slate-700 break-words text-xs">
+        <Markdown text={c.body} />
+      </div>
       {c.edited_at && (
         <span className="text-[10px] text-slate-400">edited</span>
       )}

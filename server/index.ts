@@ -137,6 +137,16 @@ const app = express();
 app.use(compression());
 app.use(express.json({ limit: '1mb' }));
 
+// HSTS so browsers remember to use HTTPS even after a stray HTTP visit.
+// Only set when the request reached us over HTTPS (Railway sets x-forwarded-proto).
+app.use((req, res, next) => {
+  const proto = (req.header('x-forwarded-proto') || '').split(',')[0].trim();
+  if (proto === 'https' || NODE_ENV !== 'production') {
+    res.setHeader('Strict-Transport-Security', 'max-age=31536000; includeSubDomains');
+  }
+  next();
+});
+
 // ---------- Public routes ----------------------------------------- //
 app.get('/api/health', (_req, res) => {
   res.json({ ok: true, env: NODE_ENV, ts: new Date().toISOString() });

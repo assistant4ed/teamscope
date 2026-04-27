@@ -122,9 +122,10 @@ export default function Team({ me, onOpenMember }: {
                           {s.active ? 'Pause' : 'Resume'}
                         </button>
                         <button onClick={(e) => { e.stopPropagation(); setEditId(s.id); }}
-                          className="text-indigo-600 hover:text-indigo-800"
+                          className="inline-flex items-center gap-1 text-xs font-medium text-indigo-600 hover:text-indigo-800 hover:bg-indigo-50 px-2 py-0.5 rounded"
                           title="Edit details">
                           <Edit2 className="w-3.5 h-3.5" />
+                          Edit
                         </button>
                       </div>
                     </Td>

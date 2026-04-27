@@ -3161,6 +3161,66 @@ app.get('/api/public/board/:token/cards/:id/timeline', async (req, res) => {
   }
 });
 
+// ---------- Global search (⌘K) -------------------------------------- //
+// Single endpoint that searches across cards, reports, and members.
+// Returns small grouped buckets so the UI can render Linear-style.
+// Uses ILIKE rather than pg_trgm for portability — dataset is small.
+app.get('/api/search', async (req, res) => {
+  const qRaw = (req.query.q as string | undefined) || '';
+  const q = qRaw.trim();
+  if (q.length < 2) return res.json({ q, cards: [], reports: [], members: [] });
+  const wildcard = `%${q.replace(/[\\%_]/g, m => '\\' + m)}%`;
+  try {
+    const [cards, reports, members] = await Promise.all([
+      query<{
+        id: string; title: string; description: string | null;
+        column_id: string; column_name: string; board_id: string;
+        board_name: string; image_urls: string[];
+      }>(
+        `SELECT c.id, c.title, c.description, c.column_id,
+                col.name AS column_name, col.board_id,
+                b.name AS board_name, c.image_urls
+           FROM ops.kanban_cards c
+           JOIN ops.kanban_columns col ON col.id = c.column_id
+           JOIN ops.kanban_boards b ON b.id = col.board_id
+          WHERE c.deleted_at IS NULL
+            AND (c.title ILIKE $1 OR c.description ILIKE $1)
+          ORDER BY (c.title ILIKE $1) DESC, c.updated_at DESC
+          LIMIT 8`,
+        [wildcard]
+      ),
+      query<{
+        id: string; report_date: string; subscriber_id: string;
+        subscriber_name: string;
+        goals: string | null; mid_progress: string | null;
+        eod_completed: string | null;
+      }>(
+        `SELECT dr.id, to_char(dr.report_date, 'YYYY-MM-DD') AS report_date,
+                dr.subscriber_id, s.name AS subscriber_name,
+                dr.goals, dr.mid_progress, dr.eod_completed
+           FROM ops.daily_reports dr
+           JOIN ops.report_subscribers s ON s.id = dr.subscriber_id
+          WHERE dr.goals ILIKE $1 OR dr.mid_progress ILIKE $1
+             OR dr.eod_completed ILIKE $1 OR dr.eod_unfinished ILIKE $1
+          ORDER BY dr.report_date DESC
+          LIMIT 6`,
+        [wildcard]
+      ),
+      query<{ id: string; name: string; role: string | null; active: boolean }>(
+        `SELECT id, name, role, active
+           FROM ops.report_subscribers
+          WHERE name ILIKE $1 OR email ILIKE $1
+          ORDER BY active DESC, name
+          LIMIT 5`,
+        [wildcard]
+      ),
+    ]);
+    res.json({ q, cards, reports, members });
+  } catch (e) {
+    res.status(pgErrorStatus(e)).json({ error: (e as Error).message });
+  }
+});
+
 // ---------- Promise tracker (goal items) ---------------------------- //
 // One goal_item row per parsed line of a morning report's `goals` text.
 // Status of an item is derived: completed if its linked card is in a

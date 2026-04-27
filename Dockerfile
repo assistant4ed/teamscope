@@ -24,6 +24,7 @@ RUN npm ci --omit=dev --no-audit --no-fund
 
 COPY --from=build /app/dist        ./dist
 COPY --from=build /app/server      ./server
+COPY --from=build /app/migrations  ./migrations
 COPY --from=build /app/tsconfig*.json ./
 
 # tsx runs the TS server file directly in prod — small and simple

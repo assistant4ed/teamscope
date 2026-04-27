@@ -106,7 +106,7 @@ interface BoardSummary {
   share_token: string | null;
 }
 
-type ViewMode = 'columns' | 'swimlanes';
+type ViewMode = 'columns' | 'swimlanes' | 'calendar';
 
 // ---------- Main component ------------------------------------------ //
 // `apiCtx` defaults to authed when rendered from Shell. PublicBoard
@@ -358,6 +358,10 @@ export default function Board({ me, apiCtx = { kind: 'authed' } }: {
               className={`px-3 py-1 text-sm rounded ${view==='swimlanes'?'bg-slate-900 text-white':'text-slate-600'}`}>
               By member
             </button>
+            <button onClick={() => setView('calendar')}
+              className={`px-3 py-1 text-sm rounded ${view==='calendar'?'bg-slate-900 text-white':'text-slate-600'}`}>
+              Calendar
+            </button>
           </div>
           {canManageBoards && activeBoardId && (
             <button onClick={() => {
@@ -420,7 +424,7 @@ export default function Board({ me, apiCtx = { kind: 'authed' } }: {
       )}
 
       <div className="flex-1 overflow-auto px-6 md:px-10 pb-8">
-        {view === 'columns' ? (
+        {view === 'columns' && (
           <ColumnsView
             data={data} visibleCards={visibleCards}
             assigneesByCard={assigneesByCard} subsById={subsById}
@@ -431,7 +435,8 @@ export default function Board({ me, apiCtx = { kind: 'authed' } }: {
             onAddClick={c => setAddToCol(c)}
             onCardClick={id => setEditCardId(id)}
           />
-        ) : (
+        )}
+        {view === 'swimlanes' && (
           <SwimlanesView
             data={data} visibleCards={visibleCards}
             assigneesByCard={assigneesByCard}
@@ -440,6 +445,10 @@ export default function Board({ me, apiCtx = { kind: 'authed' } }: {
             onAddClick={() => setAddToCol(data.columns[0]?.id ?? null)}
             onCardClick={id => setEditCardId(id)}
           />
+        )}
+        {view === 'calendar' && (
+          <CalendarView cards={visibleCards} columns={data.columns}
+            onCardClick={id => setEditCardId(id)} />
         )}
       </div>
 
@@ -766,6 +775,139 @@ function MiniLane({ column, cards, canEdit, onMove, onCardClick }: {
             onClick={() => onCardClick(card.id)} />
         ))}
       </div>
+    </div>
+  );
+}
+
+// ---------- Calendar view (cards by due_date) ----------------------- //
+// Month grid with 7 columns (Mon-Sun). Each cell shows up to 4 card
+// chips for cards whose due_date falls on that day; a +N button
+// expands the rest. Clicking a chip opens the EditCardModal.
+// Cards without a due_date are listed in a "No due date" tray below.
+function CalendarView({ cards, columns, onCardClick }: {
+  cards: Card[]; columns: Column[]; onCardClick: (id: string) => void;
+}) {
+  const [cursor, setCursor] = useState(() => {
+    const d = new Date(); return new Date(d.getFullYear(), d.getMonth(), 1);
+  });
+  const [expandedDay, setExpandedDay] = useState<string | null>(null);
+
+  const colById = useMemo(() => {
+    const m = new Map<string, Column>();
+    columns.forEach(c => m.set(c.id, c));
+    return m;
+  }, [columns]);
+
+  const cardsByDay = useMemo(() => {
+    const m = new Map<string, Card[]>();
+    for (const c of cards) {
+      if (!c.due_date) continue;
+      const arr = m.get(c.due_date) || [];
+      arr.push(c);
+      m.set(c.due_date, arr);
+    }
+    return m;
+  }, [cards]);
+
+  const cardsWithoutDue = useMemo(() => cards.filter(c => !c.due_date), [cards]);
+
+  // Build the visible weeks. Start the grid on the Monday before the
+  // 1st of the cursor month and run until the Sunday after the last day.
+  const monthStart = cursor;
+  const monthEnd = new Date(cursor.getFullYear(), cursor.getMonth() + 1, 0);
+  const gridStart = new Date(monthStart);
+  // JS getDay: Sun=0..Sat=6. Convert to Mon-first (Mon=0..Sun=6).
+  const startWeekday = (monthStart.getDay() + 6) % 7;
+  gridStart.setDate(gridStart.getDate() - startWeekday);
+  const endWeekday = (monthEnd.getDay() + 6) % 7;
+  const gridEnd = new Date(monthEnd);
+  gridEnd.setDate(gridEnd.getDate() + (6 - endWeekday));
+  const days: Date[] = [];
+  for (let d = new Date(gridStart); d <= gridEnd; d.setDate(d.getDate() + 1)) {
+    days.push(new Date(d));
+  }
+
+  function ymd(d: Date): string {
+    const y = d.getFullYear(); const m = String(d.getMonth() + 1).padStart(2, '0');
+    const day = String(d.getDate()).padStart(2, '0');
+    return `${y}-${m}-${day}`;
+  }
+  const today = ymd(new Date());
+
+  return (
+    <div className="space-y-4">
+      <header className="flex items-center justify-between">
+        <div className="text-lg font-semibold text-slate-800">
+          {cursor.toLocaleDateString(undefined, { month: 'long', year: 'numeric' })}
+        </div>
+        <div className="flex items-center gap-2">
+          <button onClick={() => setCursor(new Date(cursor.getFullYear(), cursor.getMonth() - 1, 1))}
+            className="px-2 py-1 text-sm border border-slate-200 rounded hover:bg-slate-50">‹</button>
+          <button onClick={() => setCursor(new Date(new Date().getFullYear(), new Date().getMonth(), 1))}
+            className="px-2 py-1 text-sm border border-slate-200 rounded hover:bg-slate-50">Today</button>
+          <button onClick={() => setCursor(new Date(cursor.getFullYear(), cursor.getMonth() + 1, 1))}
+            className="px-2 py-1 text-sm border border-slate-200 rounded hover:bg-slate-50">›</button>
+        </div>
+      </header>
+      <div className="grid grid-cols-7 gap-px bg-slate-200 border border-slate-200 rounded-xl overflow-hidden">
+        {['Mon','Tue','Wed','Thu','Fri','Sat','Sun'].map(d => (
+          <div key={d} className="bg-slate-50 px-2 py-1 text-[10px] font-semibold text-slate-500 uppercase">{d}</div>
+        ))}
+        {days.map(d => {
+          const key = ymd(d);
+          const inMonth = d.getMonth() === cursor.getMonth();
+          const dayCards = cardsByDay.get(key) || [];
+          const isToday = key === today;
+          const expanded = expandedDay === key;
+          const visible = expanded ? dayCards : dayCards.slice(0, 4);
+          return (
+            <div key={key}
+              className={`bg-white p-1.5 min-h-[100px] flex flex-col gap-1 text-xs
+                ${inMonth ? '' : 'opacity-40'}`}>
+              <div className={`text-[11px] font-medium tabular-nums ${isToday ? 'text-indigo-700' : 'text-slate-500'}`}>
+                {d.getDate()}
+                {isToday && <span className="ml-1 inline-block w-1.5 h-1.5 rounded-full bg-indigo-500" />}
+              </div>
+              {visible.map(c => {
+                const col = colById.get(c.column_id);
+                const isDone = !!col?.is_done || !!c.done_at;
+                return (
+                  <button key={c.id} onClick={() => onCardClick(c.id)}
+                    className={`text-left text-[11px] px-1.5 py-0.5 rounded truncate border
+                      ${isDone
+                        ? 'bg-emerald-50 border-emerald-100 text-emerald-700 line-through'
+                        : 'bg-slate-50 border-slate-100 text-slate-700 hover:bg-slate-100'}`}
+                    title={c.title}>
+                    {c.title}
+                  </button>
+                );
+              })}
+              {dayCards.length > 4 && (
+                <button onClick={() => setExpandedDay(expanded ? null : key)}
+                  className="text-[10px] text-slate-400 hover:text-slate-700 self-start">
+                  {expanded ? 'show less' : `+${dayCards.length - 4} more`}
+                </button>
+              )}
+            </div>
+          );
+        })}
+      </div>
+      {cardsWithoutDue.length > 0 && (
+        <details className="bg-white border border-slate-200 rounded-xl">
+          <summary className="px-4 py-3 cursor-pointer text-sm font-medium text-slate-700">
+            No due date · {cardsWithoutDue.length}
+          </summary>
+          <div className="px-4 pb-3 flex flex-wrap gap-1.5">
+            {cardsWithoutDue.map(c => (
+              <button key={c.id} onClick={() => onCardClick(c.id)}
+                className="text-xs px-2 py-1 bg-slate-50 border border-slate-200 rounded hover:bg-slate-100 text-slate-700"
+                title={c.title}>
+                {c.title.slice(0, 60)}
+              </button>
+            ))}
+          </div>
+        </details>
+      )}
     </div>
   );
 }

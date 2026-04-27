@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from 'react';
+import React, { useCallback, useEffect, useState } from 'react';
 import { UserPlus, X, Edit2, Trash2, AlertTriangle } from 'lucide-react';
 import { apiGet, apiPost, apiFetch, Me } from '../auth';
 
@@ -183,7 +183,117 @@ export default function Team({ me, onOpenMember }: {
           </ul>
         </div>
       </section>
+
+      <PublicHolidaysSection isBoss={me.role === 'boss'} />
     </div>
+  );
+}
+
+// ---------- Public holidays admin (boss-managed) ------------------- //
+// Fronts the existing GET/POST/DELETE /api/config/public-holidays
+// endpoints. Salary calc on the Member page reads these as non-working
+// days; without this UI the boss had to run psql by hand.
+interface Holiday { holiday_date: string; name: string; country: string | null }
+
+function PublicHolidaysSection({ isBoss }: { isBoss: boolean }) {
+  const [items, setItems] = useState<Holiday[]>([]);
+  const [date, setDate] = useState('');
+  const [name, setName] = useState('');
+  const [country, setCountry] = useState('HK');
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+
+  const load = useCallback(async () => {
+    try {
+      const r = await apiGet<{ holidays: Holiday[] }>('/api/config/public-holidays');
+      setItems(r.holidays);
+    } catch (e) { setErr(String(e)); }
+  }, []);
+  useEffect(() => { load(); }, [load]);
+
+  async function add(e: React.FormEvent) {
+    e.preventDefault();
+    if (!date || !name.trim()) return;
+    setBusy(true); setErr(null);
+    try {
+      const r = await apiFetch('/api/config/public-holidays', {
+        method: 'POST',
+        body: JSON.stringify({ holiday_date: date, name: name.trim(), country: country || null }),
+      });
+      if (!r.ok) {
+        const b = await r.json().catch(() => ({}));
+        throw new Error(b.error || `HTTP ${r.status}`);
+      }
+      setDate(''); setName('');
+      load();
+    } catch (e) { setErr((e as Error).message); }
+    finally { setBusy(false); }
+  }
+  async function remove(d: string) {
+    if (!window.confirm(`Remove holiday ${d}?`)) return;
+    setBusy(true);
+    try {
+      await apiFetch(`/api/config/public-holidays/${d}`, { method: 'DELETE' });
+      load();
+    } finally { setBusy(false); }
+  }
+
+  return (
+    <section>
+      <h2 className="text-sm font-semibold text-slate-500 uppercase tracking-wider mb-3">
+        Public holidays
+      </h2>
+      <div className="bg-white border border-slate-200 rounded-xl p-4">
+        <p className="text-xs text-slate-400 mb-3">
+          Days flagged as paid-but-not-working in the salary calculator.
+          Members aren't expected to file reports on these dates.
+        </p>
+        {isBoss && (
+          <form onSubmit={add} className="flex flex-wrap items-end gap-2 mb-4">
+            <div>
+              <label className="block text-[11px] text-slate-500 mb-0.5">Date</label>
+              <input type="date" required value={date} onChange={e => setDate(e.target.value)}
+                className="border border-slate-200 rounded-lg px-2 py-1.5 text-sm" />
+            </div>
+            <div className="flex-1 min-w-[180px]">
+              <label className="block text-[11px] text-slate-500 mb-0.5">Name</label>
+              <input required value={name} onChange={e => setName(e.target.value)}
+                placeholder="e.g. Lunar New Year"
+                className="w-full border border-slate-200 rounded-lg px-2 py-1.5 text-sm" />
+            </div>
+            <div className="w-20">
+              <label className="block text-[11px] text-slate-500 mb-0.5">Country</label>
+              <input value={country} onChange={e => setCountry(e.target.value.toUpperCase().slice(0, 3))}
+                className="w-full border border-slate-200 rounded-lg px-2 py-1.5 text-sm uppercase" />
+            </div>
+            <button type="submit" disabled={busy || !date || !name.trim()}
+              className="px-3 py-1.5 text-sm bg-slate-900 hover:bg-slate-800 disabled:opacity-40 text-white rounded-lg">
+              Add
+            </button>
+          </form>
+        )}
+        {items.length === 0 ? (
+          <p className="text-sm text-slate-400">No holidays added yet.</p>
+        ) : (
+          <ul className="divide-y divide-slate-100">
+            {items.map(h => (
+              <li key={h.holiday_date} className="py-2 flex items-center justify-between text-sm">
+                <div>
+                  <span className="font-mono text-slate-500 text-xs mr-3">{h.holiday_date}</span>
+                  <span className="text-slate-800">{h.name}</span>
+                  {h.country && <span className="ml-2 text-xs text-slate-400 uppercase">{h.country}</span>}
+                </div>
+                {isBoss && (
+                  <button onClick={() => remove(h.holiday_date)} disabled={busy}
+                    className="text-xs text-rose-600 hover:underline">Remove</button>
+                )}
+              </li>
+            ))}
+          </ul>
+        )}
+        {err && <p className="text-xs text-rose-700 mt-2">{err}</p>}
+      </div>
+    </section>
   );
 }
 

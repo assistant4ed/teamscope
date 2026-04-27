@@ -2522,7 +2522,7 @@ async function getDefaultBoardId(): Promise<string | null> {
 }
 
 async function loadBoardData(boardId: string) {
-  const [columns, cards, assignees, subscribers] = await Promise.all([
+  const [columns, cards, assignees, subscribers, labels, cardLabels, checklistAgg] = await Promise.all([
     query<{ id: string; name: string; position: number; is_done: boolean; wip_limit: number | null }>(
       `SELECT id, name, position, is_done, wip_limit
          FROM ops.kanban_columns
@@ -2553,8 +2553,33 @@ async function loadBoardData(boardId: string) {
          FROM ops.report_subscribers
         ORDER BY active DESC, name`
     ),
+    query<LabelRow>(
+      `SELECT id, board_id, name, color, position
+         FROM ops.kanban_labels WHERE board_id = $1
+        ORDER BY position, name`,
+      [boardId]
+    ),
+    query<{ card_id: string; label_id: string }>(
+      `SELECT cl.card_id, cl.label_id
+         FROM ops.kanban_card_labels cl
+         JOIN ops.kanban_cards c ON c.id = cl.card_id
+         JOIN ops.kanban_columns col ON col.id = c.column_id
+        WHERE c.deleted_at IS NULL AND col.board_id = $1`,
+      [boardId]
+    ),
+    query<{ card_id: string; total: number; done: number }>(
+      `SELECT ci.card_id,
+              COUNT(*)::int AS total,
+              COUNT(*) FILTER (WHERE ci.done)::int AS done
+         FROM ops.kanban_card_checklist_items ci
+         JOIN ops.kanban_cards c ON c.id = ci.card_id
+         JOIN ops.kanban_columns col ON col.id = c.column_id
+        WHERE c.deleted_at IS NULL AND col.board_id = $1
+        GROUP BY ci.card_id`,
+      [boardId]
+    ),
   ]);
-  return { columns, cards, assignees, subscribers };
+  return { columns, cards, assignees, subscribers, labels, card_labels: cardLabels, checklist_progress: checklistAgg };
 }
 
 // List all boards (folders). Anyone whitelisted can see all of them.
@@ -2731,6 +2756,9 @@ app.get('/api/public/board/:token', async (req, res) => {
       columns: data.columns,
       cards: data.cards,
       assignees: data.assignees,
+      labels: data.labels,
+      card_labels: data.card_labels,
+      checklist_progress: data.checklist_progress,
       // Only minimal subscriber info needed to render avatars.
       subscribers: data.subscribers.map((s: any) => ({
         id: s.id, name: s.name, role: s.role, active: s.active,
@@ -2995,6 +3023,179 @@ app.post('/api/public/board/:token/uploads/image', async (req, res) => {
   if (!url) return res.status(503).json({ error: 'cf_images_unavailable' });
   res.json({ url });
 });
+
+// ---------- Labels (per board) -------------------------------------- //
+const LABEL_COLORS = ['slate','red','amber','emerald','sky','indigo','fuchsia','rose'] as const;
+type LabelColor = typeof LABEL_COLORS[number];
+
+interface LabelRow {
+  id: string; board_id: string; name: string; color: LabelColor; position: number;
+}
+
+app.get('/api/kanban/boards/:id/labels', async (req, res) => {
+  try {
+    const rows = await query<LabelRow>(
+      `SELECT id, board_id, name, color, position
+         FROM ops.kanban_labels WHERE board_id = $1
+        ORDER BY position, name`,
+      [String(req.params.id)]
+    );
+    res.json({ labels: rows });
+  } catch (e) {
+    res.status(pgErrorStatus(e)).json({ error: (e as Error).message });
+  }
+});
+
+app.post('/api/kanban/boards/:id/labels',
+  requireRole('boss'),
+  async (req, res) => {
+    const name = ((req.body?.name as string) || '').trim();
+    const colorRaw = (req.body?.color as string) || 'slate';
+    const color: LabelColor = (LABEL_COLORS as readonly string[]).includes(colorRaw)
+      ? (colorRaw as LabelColor) : 'slate';
+    if (!name) return res.status(400).json({ error: 'name required' });
+    try {
+      const posRow = await query<{ next_pos: number }>(
+        `SELECT COALESCE(MAX(position), -1) + 1 AS next_pos
+           FROM ops.kanban_labels WHERE board_id = $1`,
+        [String(req.params.id)]
+      );
+      const rows = await query<LabelRow>(
+        `INSERT INTO ops.kanban_labels (board_id, name, color, position)
+         VALUES ($1, $2, $3, $4)
+         RETURNING id, board_id, name, color, position`,
+        [String(req.params.id), name, color, posRow[0].next_pos]
+      );
+      res.json({ label: rows[0] });
+    } catch (e) {
+      res.status(pgErrorStatus(e)).json({ error: (e as Error).message });
+    }
+  }
+);
+
+app.patch('/api/kanban/labels/:id', requireRole('boss'), async (req, res) => {
+  const b = req.body || {};
+  const sets: string[] = [];
+  const vals: unknown[] = [];
+  if (typeof b.name === 'string' && b.name.trim()) {
+    sets.push(`name = $${sets.length + 1}`); vals.push(b.name.trim());
+  }
+  if (typeof b.color === 'string' && (LABEL_COLORS as readonly string[]).includes(b.color)) {
+    sets.push(`color = $${sets.length + 1}`); vals.push(b.color);
+  }
+  if (sets.length === 0) return res.status(400).json({ error: 'no fields' });
+  vals.push(String(req.params.id));
+  try {
+    const rows = await query<LabelRow>(
+      `UPDATE ops.kanban_labels SET ${sets.join(', ')}
+        WHERE id = $${vals.length}
+       RETURNING id, board_id, name, color, position`,
+      vals
+    );
+    if (rows.length === 0) return res.status(404).json({ error: 'not_found' });
+    res.json({ label: rows[0] });
+  } catch (e) {
+    res.status(pgErrorStatus(e)).json({ error: (e as Error).message });
+  }
+});
+
+app.delete('/api/kanban/labels/:id', requireRole('boss'), async (req, res) => {
+  try {
+    await query(`DELETE FROM ops.kanban_labels WHERE id = $1`, [String(req.params.id)]);
+    res.json({ deleted: req.params.id });
+  } catch (e) {
+    res.status(pgErrorStatus(e)).json({ error: (e as Error).message });
+  }
+});
+
+// ---------- Card checklist (subtasks) ------------------------------ //
+interface ChecklistItem {
+  id: string; card_id: string; text: string; done: boolean; position: number;
+}
+
+app.get('/api/kanban/cards/:id/checklist', async (req, res) => {
+  try {
+    const rows = await query<ChecklistItem>(
+      `SELECT id, card_id, text, done, position
+         FROM ops.kanban_card_checklist_items
+        WHERE card_id = $1
+        ORDER BY position`,
+      [String(req.params.id)]
+    );
+    res.json({ items: rows });
+  } catch (e) {
+    res.status(pgErrorStatus(e)).json({ error: (e as Error).message });
+  }
+});
+
+app.post('/api/kanban/cards/:id/checklist',
+  requireRole('boss', 'pa', 'colleague'),
+  async (req, res) => {
+    const text = ((req.body?.text as string) || '').trim();
+    if (!text) return res.status(400).json({ error: 'text required' });
+    try {
+      const posRow = await query<{ next_pos: number }>(
+        `SELECT COALESCE(MAX(position), -1) + 1 AS next_pos
+           FROM ops.kanban_card_checklist_items WHERE card_id = $1`,
+        [String(req.params.id)]
+      );
+      const rows = await query<ChecklistItem>(
+        `INSERT INTO ops.kanban_card_checklist_items (card_id, text, position)
+         VALUES ($1, $2, $3)
+         RETURNING id, card_id, text, done, position`,
+        [String(req.params.id), text.slice(0, 300), posRow[0].next_pos]
+      );
+      res.json({ item: rows[0] });
+    } catch (e) {
+      res.status(pgErrorStatus(e)).json({ error: (e as Error).message });
+    }
+  }
+);
+
+app.patch('/api/kanban/checklist/:id',
+  requireRole('boss', 'pa', 'colleague'),
+  async (req, res) => {
+    const b = req.body || {};
+    const sets: string[] = [];
+    const vals: unknown[] = [];
+    if (typeof b.text === 'string' && b.text.trim()) {
+      sets.push(`text = $${sets.length + 1}`); vals.push(b.text.trim().slice(0, 300));
+    }
+    if (typeof b.done === 'boolean') {
+      sets.push(`done = $${sets.length + 1}`); vals.push(b.done);
+    }
+    if (typeof b.position === 'number') {
+      sets.push(`position = $${sets.length + 1}`); vals.push(b.position);
+    }
+    if (sets.length === 0) return res.status(400).json({ error: 'no fields' });
+    sets.push('updated_at = now()');
+    vals.push(String(req.params.id));
+    try {
+      const rows = await query<ChecklistItem>(
+        `UPDATE ops.kanban_card_checklist_items SET ${sets.join(', ')}
+          WHERE id = $${vals.length}
+         RETURNING id, card_id, text, done, position`,
+        vals
+      );
+      if (rows.length === 0) return res.status(404).json({ error: 'not_found' });
+      res.json({ item: rows[0] });
+    } catch (e) {
+      res.status(pgErrorStatus(e)).json({ error: (e as Error).message });
+    }
+  }
+);
+
+app.delete('/api/kanban/checklist/:id',
+  requireRole('boss', 'pa', 'colleague'),
+  async (req, res) => {
+    try {
+      await query(`DELETE FROM ops.kanban_card_checklist_items WHERE id = $1`, [String(req.params.id)]);
+      res.json({ deleted: req.params.id });
+    } catch (e) {
+      res.status(pgErrorStatus(e)).json({ error: (e as Error).message });
+    }
+  }
+);
 
 // ---------- Card comments + per-card timeline ---------------------- //
 // Comments live on cards across both the authed UI and public-edit shared
@@ -3358,6 +3559,14 @@ app.post('/api/kanban/cards',
           [card.id, sid, req.user!.email]
         );
       }
+      const labelIds: string[] = Array.isArray(b.label_ids) ? b.label_ids : [];
+      for (const lid of labelIds) {
+        await client.query(
+          `INSERT INTO ops.kanban_card_labels (card_id, label_id)
+           VALUES ($1, $2) ON CONFLICT DO NOTHING`,
+          [card.id, lid]
+        );
+      }
       await client.query('COMMIT');
       await logActivity(req.user!.email, card.id, 'card.created', {
         title: card.title, column_id: card.column_id, assignees: assigneeIds,
@@ -3392,7 +3601,7 @@ app.patch('/api/kanban/cards/:id',
       sets.push(`image_urls = $${sets.length + 1}`);
       vals.push(sanitizeImageUrls(b.image_urls));
     }
-    if (sets.length === 0 && !Array.isArray(b.assignee_ids)) {
+    if (sets.length === 0 && !Array.isArray(b.assignee_ids) && !Array.isArray(b.label_ids)) {
       return res.status(400).json({ error: 'no fields to update' });
     }
     const client = await pool.connect();
@@ -3446,6 +3655,19 @@ app.patch('/api/kanban/cards/:id',
             `INSERT INTO ops.kanban_assignees (card_id, subscriber_id, assigned_by)
              VALUES ($1, $2, $3) ON CONFLICT DO NOTHING`,
             [req.params.id, sid, req.user!.email]
+          );
+        }
+      }
+      if (Array.isArray(b.label_ids)) {
+        await client.query(
+          `DELETE FROM ops.kanban_card_labels WHERE card_id = $1`,
+          [req.params.id]
+        );
+        for (const lid of b.label_ids) {
+          await client.query(
+            `INSERT INTO ops.kanban_card_labels (card_id, label_id)
+             VALUES ($1, $2) ON CONFLICT DO NOTHING`,
+            [req.params.id, lid]
           );
         }
       }

@@ -18,6 +18,18 @@ export type ApiCtx =
 const ApiContext = createContext<ApiCtx>({ kind: 'authed' });
 const useApiCtx = () => useContext(ApiContext);
 
+// Card-derived data (labels per card, checklist progress) is needed deep
+// in the rendering tree. Threading through every Lane prop is noisy, so
+// it lives in context and is set once at the Board level.
+interface CardEnrichments {
+  labelsByCard: Map<string, Label[]>;
+  checklistByCard: Map<string, ChecklistProgress>;
+}
+const CardEnrichContext = createContext<CardEnrichments>({
+  labelsByCard: new Map(), checklistByCard: new Map(),
+});
+const useCardEnrich = () => useContext(CardEnrichContext);
+
 function urlBoard(ctx: ApiCtx, boardId?: string): string {
   if (ctx.kind === 'authed') {
     return boardId ? `/api/kanban/board?board_id=${encodeURIComponent(boardId)}` : '/api/kanban/board';
@@ -53,12 +65,40 @@ interface Subscriber {
   timezone: string; telegram_chat_id: number; active: boolean;
 }
 
+interface Label {
+  id: string; board_id: string; name: string;
+  color: 'slate'|'red'|'amber'|'emerald'|'sky'|'indigo'|'fuchsia'|'rose';
+  position: number;
+}
+interface CardLabelRow { card_id: string; label_id: string }
+interface ChecklistProgress { card_id: string; total: number; done: number }
+
 interface BoardData {
   columns: Column[]; cards: Card[];
   assignees: Assignee[]; subscribers: Subscriber[];
   board_id?: string;
   board?: { id: string; name: string; share_mode: 'view' | 'edit' };
+  labels?: Label[];
+  card_labels?: CardLabelRow[];
+  checklist_progress?: ChecklistProgress[];
 }
+
+const LABEL_COLOR_CLASSES: Record<Label['color'], string> = {
+  slate:    'bg-slate-100 text-slate-700 border-slate-200',
+  red:      'bg-red-100 text-red-700 border-red-200',
+  amber:    'bg-amber-100 text-amber-800 border-amber-200',
+  emerald:  'bg-emerald-100 text-emerald-700 border-emerald-200',
+  sky:      'bg-sky-100 text-sky-700 border-sky-200',
+  indigo:   'bg-indigo-100 text-indigo-700 border-indigo-200',
+  fuchsia:  'bg-fuchsia-100 text-fuchsia-700 border-fuchsia-200',
+  rose:     'bg-rose-100 text-rose-700 border-rose-200',
+};
+const LABEL_COLOR_DOT: Record<Label['color'], string> = {
+  slate: 'bg-slate-400', red: 'bg-red-500', amber: 'bg-amber-500',
+  emerald: 'bg-emerald-500', sky: 'bg-sky-500', indigo: 'bg-indigo-500',
+  fuchsia: 'bg-fuchsia-500', rose: 'bg-rose-500',
+};
+const LABEL_COLORS_LIST: Label['color'][] = ['slate','red','amber','emerald','sky','indigo','fuchsia','rose'];
 
 interface BoardSummary {
   id: string; name: string; is_default: boolean;
@@ -195,14 +235,48 @@ export default function Board({ me, apiCtx = { kind: 'authed' } }: {
     return m;
   }, [data?.assignees]);
 
+  const labelsById = useMemo(() => {
+    const m = new Map<string, Label>();
+    (data?.labels ?? []).forEach(l => m.set(l.id, l));
+    return m;
+  }, [data?.labels]);
+
+  const labelsByCard = useMemo(() => {
+    const m = new Map<string, Label[]>();
+    (data?.card_labels ?? []).forEach(cl => {
+      const lab = labelsById.get(cl.label_id);
+      if (!lab) return;
+      const arr = m.get(cl.card_id) || [];
+      arr.push(lab);
+      m.set(cl.card_id, arr);
+    });
+    return m;
+  }, [data?.card_labels, labelsById]);
+
+  const checklistByCard = useMemo(() => {
+    const m = new Map<string, ChecklistProgress>();
+    (data?.checklist_progress ?? []).forEach(cp => m.set(cp.card_id, cp));
+    return m;
+  }, [data?.checklist_progress]);
+
+  const [filterLabelIds, setFilterLabelIds] = useState<string[]>([]);
+
   const visibleCards = useMemo(() => {
     if (!data) return [] as Card[];
-    if (!filterSub) return data.cards;
+    let cards = data.cards;
     if (filterSub === '__unassigned') {
-      return data.cards.filter(c => (assigneesByCard.get(c.id) || []).length === 0);
+      cards = cards.filter(c => (assigneesByCard.get(c.id) || []).length === 0);
+    } else if (filterSub) {
+      cards = cards.filter(c => (assigneesByCard.get(c.id) || []).includes(filterSub));
     }
-    return data.cards.filter(c => (assigneesByCard.get(c.id) || []).includes(filterSub));
-  }, [data, filterSub, assigneesByCard]);
+    if (filterLabelIds.length > 0) {
+      cards = cards.filter(c => {
+        const ls = labelsByCard.get(c.id) || [];
+        return filterLabelIds.every(lid => ls.some(l => l.id === lid));
+      });
+    }
+    return cards;
+  }, [data, filterSub, filterLabelIds, assigneesByCard, labelsByCard]);
 
   // Card counts per chip (independent of current filter so labels stay stable).
   const countsByMember = useMemo(() => {
@@ -237,6 +311,7 @@ export default function Board({ me, apiCtx = { kind: 'authed' } }: {
 
   return (
     <ApiContext.Provider value={apiCtx}>
+    <CardEnrichContext.Provider value={{ labelsByCard, checklistByCard }}>
     <div className="flex flex-col h-full">
       <header className="px-6 md:px-10 pt-6 md:pt-8 pb-3 flex items-center justify-between flex-wrap gap-3">
         <div>
@@ -309,6 +384,31 @@ export default function Board({ me, apiCtx = { kind: 'authed' } }: {
         counts={countsByMember}
       />
 
+      {(data.labels?.length ?? 0) > 0 && (
+        <div className="px-6 md:px-10 pb-2 flex flex-wrap items-center gap-1.5">
+          <span className="text-[10px] uppercase tracking-wider text-slate-400 mr-1">Labels:</span>
+          {(data.labels ?? []).map(l => {
+            const on = filterLabelIds.includes(l.id);
+            return (
+              <button key={l.id}
+                onClick={() => setFilterLabelIds(prev =>
+                  prev.includes(l.id) ? prev.filter(x => x !== l.id) : [...prev, l.id])}
+                className={`inline-flex items-center gap-1.5 px-2 py-0.5 rounded-md text-xs border
+                  ${on ? LABEL_COLOR_CLASSES[l.color] : 'bg-white border-slate-200 text-slate-500 hover:border-slate-300'}`}>
+                <span className={`w-1.5 h-1.5 rounded-full ${LABEL_COLOR_DOT[l.color]}`} />
+                {l.name}
+              </button>
+            );
+          })}
+          {filterLabelIds.length > 0 && (
+            <button onClick={() => setFilterLabelIds([])}
+              className="text-[11px] text-slate-400 hover:text-slate-700 ml-1">
+              clear
+            </button>
+          )}
+        </div>
+      )}
+
       {err && (
         <div className="mx-6 md:mx-10 mb-3 text-xs text-rose-700 bg-rose-50 border border-rose-200 rounded-lg p-2 flex items-start gap-2">
           <AlertTriangle className="w-4 h-4 flex-shrink-0 mt-0.5" />
@@ -349,6 +449,10 @@ export default function Board({ me, apiCtx = { kind: 'authed' } }: {
           columns={data.columns}
           subscribers={data.subscribers}
           defaultAssignee={filterSub}
+          boardId={data.board_id ?? data.board?.id ?? activeBoardId ?? undefined}
+          allLabels={data.labels ?? []}
+          onLabelsChanged={load}
+          canManageLabels={canManageBoards}
           onDone={() => { setAddToCol(null); load(); }}
           onClose={() => setAddToCol(null)}
         />
@@ -360,6 +464,11 @@ export default function Board({ me, apiCtx = { kind: 'authed' } }: {
           columns={data.columns}
           subscribers={data.subscribers}
           initialAssignees={assigneesByCard.get(editCardId) || []}
+          initialLabelIds={(data.card_labels ?? []).filter(cl => cl.card_id === editCardId).map(cl => cl.label_id)}
+          boardId={data.board_id ?? data.board?.id ?? activeBoardId ?? undefined}
+          allLabels={data.labels ?? []}
+          onLabelsChanged={load}
+          canManageLabels={canManageBoards}
           canDelete={canDelete}
           onDone={() => { setEditCardId(null); load(); }}
           onClose={() => setEditCardId(null)}
@@ -383,6 +492,7 @@ export default function Board({ me, apiCtx = { kind: 'authed' } }: {
         />
       )}
     </div>
+    </CardEnrichContext.Provider>
     </ApiContext.Provider>
   );
 }
@@ -668,6 +778,9 @@ function CardView({ card, assigneeIds, subsById, canEdit, onClick }: {
   canEdit: boolean;
   onClick: () => void;
 }) {
+  const { labelsByCard, checklistByCard } = useCardEnrich();
+  const labels = labelsByCard.get(card.id) || [];
+  const checklist = checklistByCard.get(card.id);
   const [dragging, setDragging] = useState(false);
   const allImages = useMemo(
     () => [...(card.image_urls || []), ...extractDescriptionImageUrls(card.description)],
@@ -693,6 +806,11 @@ function CardView({ card, assigneeIds, subsById, canEdit, onClick }: {
           className="w-full h-24 object-cover bg-slate-50" loading="lazy" />
       )}
       <div className="p-2.5">
+        {labels.length > 0 && (
+          <div className="flex flex-wrap gap-1 mb-1.5">
+            {labels.map(l => <LabelChip key={l.id} label={l} />)}
+          </div>
+        )}
         <div className="flex items-start justify-between gap-2">
           <div className="text-sm text-slate-800 font-medium leading-snug flex-1">
             {card.title}
@@ -703,6 +821,9 @@ function CardView({ card, assigneeIds, subsById, canEdit, onClick }: {
           <div className="text-xs text-slate-500 mt-1 line-clamp-2">
             {descriptionPreviewText(card.description)}
           </div>
+        )}
+        {checklist && checklist.total > 0 && (
+          <ChecklistProgressBar done={checklist.done} total={checklist.total} />
         )}
         {/* Show extra thumbnails only if there's more than the cover. */}
         {allImages.length > 1 && (
@@ -869,12 +990,16 @@ function groupCardsByColumn(cards: Card[]): Map<string, Card[]> {
 
 // ---------- Add card modal ------------------------------------------ //
 function AddCardModal({
-  columnId, columns, subscribers, defaultAssignee, onDone, onClose,
+  columnId, columns, subscribers, defaultAssignee, boardId, allLabels, onLabelsChanged, canManageLabels, onDone, onClose,
 }: {
   columnId: string;
   columns: Column[];
   subscribers: Subscriber[];
   defaultAssignee: string | null;
+  boardId: string | undefined;
+  allLabels: Label[];
+  onLabelsChanged: () => void;
+  canManageLabels: boolean;
   onDone: () => void;
   onClose: () => void;
 }) {
@@ -883,6 +1008,7 @@ function AddCardModal({
   const [priority, setPriority] = useState<'low'|'medium'|'high'|'urgent'>('medium');
   const [dueDate, setDueDate] = useState('');
   const [assignees, setAssignees] = useState<string[]>(defaultAssignee ? [defaultAssignee] : []);
+  const [labelIds, setLabelIds] = useState<string[]>([]);
   const [targetCol, setTargetCol] = useState(columnId);
   const [imageUrls, setImageUrls] = useState<string[]>([]);
   const [busy, setBusy] = useState(false);
@@ -902,6 +1028,7 @@ function AddCardModal({
           priority,
           due_date: dueDate || null,
           assignee_ids: assignees,
+          label_ids: labelIds,
           image_urls: imageUrls,
         }),
       });
@@ -942,6 +1069,9 @@ function AddCardModal({
         </Field>
       </div>
       <AssigneePicker subscribers={subscribers} value={assignees} onChange={setAssignees} />
+      <LabelPicker boardId={boardId} allLabels={allLabels}
+        value={labelIds} onChange={setLabelIds}
+        canCreate={canManageLabels} onLabelsChanged={onLabelsChanged} />
       <ImageDropZone value={imageUrls} onChange={setImageUrls} />
       {err && <ErrorBox msg={err} />}
     </ModalShell>
@@ -950,13 +1080,18 @@ function AddCardModal({
 
 // ---------- Edit card modal ----------------------------------------- //
 function EditCardModal({
-  cardId, card, columns, subscribers, initialAssignees, canDelete, onDone, onClose,
+  cardId, card, columns, subscribers, initialAssignees, initialLabelIds, boardId, allLabels, onLabelsChanged, canManageLabels, canDelete, onDone, onClose,
 }: {
   cardId: string;
   card: Card;
   columns: Column[];
   subscribers: Subscriber[];
   initialAssignees: string[];
+  initialLabelIds: string[];
+  boardId: string | undefined;
+  allLabels: Label[];
+  onLabelsChanged: () => void;
+  canManageLabels: boolean;
   canDelete: boolean;
   onDone: () => void;
   onClose: () => void;
@@ -966,6 +1101,7 @@ function EditCardModal({
   const [priority, setPriority] = useState(card.priority);
   const [dueDate, setDueDate] = useState(card.due_date || '');
   const [assignees, setAssignees] = useState<string[]>(initialAssignees);
+  const [labelIds, setLabelIds] = useState<string[]>(initialLabelIds);
   const [imageUrls, setImageUrls] = useState<string[]>(card.image_urls ?? []);
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState<string | null>(null);
@@ -984,6 +1120,7 @@ function EditCardModal({
           priority,
           due_date: dueDate || null,
           assignee_ids: assignees,
+          label_ids: labelIds,
           image_urls: imageUrls,
         }),
       });
@@ -1060,6 +1197,10 @@ function EditCardModal({
             </Field>
           </div>
           <AssigneePicker subscribers={subscribers} value={assignees} onChange={setAssignees} />
+          <LabelPicker boardId={boardId} allLabels={allLabels}
+            value={labelIds} onChange={setLabelIds}
+            canCreate={canManageLabels} onLabelsChanged={onLabelsChanged} />
+          <ChecklistEditor cardId={cardId} />
           <ImageDropZone value={imageUrls} onChange={setImageUrls} />
           {err && <ErrorBox msg={err} />}
         </div>
@@ -1548,6 +1689,219 @@ function DescriptionField({ value, onChange }: {
           </div>
         </details>
       )}
+    </div>
+  );
+}
+
+// ---------- Label picker (with inline create) ----------------------- //
+// Per-board labels. The boss can create new labels right inside this
+// picker — keeps the flow tight and avoids a dedicated label-admin
+// page. Non-boss users can only pick from existing labels.
+function LabelPicker({ boardId, allLabels, value, onChange, canCreate, onLabelsChanged }: {
+  boardId: string | undefined;
+  allLabels: Label[];
+  value: string[];
+  onChange: (ids: string[]) => void;
+  canCreate: boolean;
+  onLabelsChanged: () => void;
+}) {
+  const [creating, setCreating] = useState(false);
+  const [newName, setNewName] = useState('');
+  const [newColor, setNewColor] = useState<Label['color']>('indigo');
+  const [busy, setBusy] = useState(false);
+
+  function toggle(id: string) {
+    onChange(value.includes(id) ? value.filter(x => x !== id) : [...value, id]);
+  }
+  async function createLabel(e: React.FormEvent) {
+    e.preventDefault();
+    if (!newName.trim() || !boardId) return;
+    setBusy(true);
+    try {
+      const r = await apiFetch(`/api/kanban/boards/${boardId}/labels`, {
+        method: 'POST',
+        body: JSON.stringify({ name: newName.trim(), color: newColor }),
+      });
+      if (r.ok) {
+        const body = await r.json();
+        onChange([...value, body.label.id]);
+        setNewName(''); setCreating(false);
+        onLabelsChanged();
+      }
+    } finally { setBusy(false); }
+  }
+  async function removeLabel(id: string) {
+    if (!window.confirm('Delete this label? It will be removed from any card using it.')) return;
+    setBusy(true);
+    try {
+      await apiFetch(`/api/kanban/labels/${id}`, { method: 'DELETE' });
+      onChange(value.filter(x => x !== id));
+      onLabelsChanged();
+    } finally { setBusy(false); }
+  }
+  return (
+    <Field label="Labels">
+      <div className="flex flex-wrap gap-1.5">
+        {allLabels.map(l => {
+          const on = value.includes(l.id);
+          return (
+            <button key={l.id} type="button" onClick={() => toggle(l.id)}
+              className={`group inline-flex items-center gap-1.5 px-2 py-1 rounded-md text-xs border
+                ${on ? LABEL_COLOR_CLASSES[l.color] : 'bg-white border-slate-200 text-slate-500 hover:border-slate-300'}`}>
+              <span className={`w-2 h-2 rounded-full ${LABEL_COLOR_DOT[l.color]}`} />
+              {l.name}
+              {on && <Check className="w-3 h-3" />}
+              {canCreate && (
+                <span onClick={e => { e.stopPropagation(); removeLabel(l.id); }}
+                  className="opacity-0 group-hover:opacity-100 ml-0.5 text-slate-400 hover:text-rose-600">
+                  <X className="w-3 h-3" />
+                </span>
+              )}
+            </button>
+          );
+        })}
+        {canCreate && !creating && (
+          <button type="button" onClick={() => setCreating(true)}
+            className="inline-flex items-center gap-1 px-2 py-1 rounded-md text-xs border border-dashed
+                       border-slate-300 text-slate-500 hover:border-slate-400 hover:text-slate-700">
+            <Plus className="w-3 h-3" /> New label
+          </button>
+        )}
+      </div>
+      {creating && (
+        <div className="mt-2 flex items-center gap-2">
+          <input value={newName} onChange={e => setNewName(e.target.value)}
+            placeholder="Label name" autoFocus
+            onKeyDown={e => { if (e.key === 'Enter') createLabel(e as unknown as React.FormEvent); if (e.key === 'Escape') setCreating(false); }}
+            className="flex-1 border border-slate-200 rounded-md px-2 py-1 text-xs" />
+          <div className="flex gap-1">
+            {LABEL_COLORS_LIST.map(c => (
+              <button key={c} type="button" onClick={() => setNewColor(c)}
+                className={`w-5 h-5 rounded-full border-2 ${LABEL_COLOR_DOT[c]} ${newColor === c ? 'border-slate-700' : 'border-transparent'}`}
+                aria-label={c} />
+            ))}
+          </div>
+          <button type="button" onClick={createLabel} disabled={!newName.trim() || busy}
+            className="text-xs px-2 py-1 bg-slate-900 hover:bg-slate-800 disabled:opacity-40 text-white rounded-md">
+            Save
+          </button>
+        </div>
+      )}
+    </Field>
+  );
+}
+
+// ---------- Card checklist (subtasks) ------------------------------- //
+interface ChecklistItemRow {
+  id: string; card_id: string; text: string; done: boolean; position: number;
+}
+
+function ChecklistEditor({ cardId }: { cardId: string }) {
+  const apiCtx = useApiCtx();
+  const [items, setItems] = useState<ChecklistItemRow[]>([]);
+  const [draft, setDraft] = useState('');
+  const [loading, setLoading] = useState(true);
+
+  // Public-edit visitors can also use checklists. View-only hides actions.
+  const baseUrl = apiCtx.kind === 'authed'
+    ? `/api/kanban/cards/${cardId}/checklist`
+    : `/api/kanban/cards/${cardId}/checklist`; // public mutation TODO; v1 read-only for shared view-only
+  const canMutate = apiCtx.kind !== 'public-view';
+
+  const load = useCallback(async () => {
+    setLoading(true);
+    try {
+      const r = await apiFetch(baseUrl);
+      if (r.ok) {
+        const body = await r.json();
+        setItems(body.items || []);
+      }
+    } finally { setLoading(false); }
+  }, [baseUrl]);
+
+  useEffect(() => { load(); }, [load]);
+
+  async function add(e: React.FormEvent) {
+    e.preventDefault();
+    if (!draft.trim() || !canMutate) return;
+    const r = await apiFetch(baseUrl, { method: 'POST', body: JSON.stringify({ text: draft.trim() }) });
+    if (r.ok) { setDraft(''); load(); }
+  }
+  async function toggle(item: ChecklistItemRow) {
+    if (!canMutate) return;
+    await apiFetch(`/api/kanban/checklist/${item.id}`, {
+      method: 'PATCH', body: JSON.stringify({ done: !item.done }),
+    });
+    load();
+  }
+  async function remove(item: ChecklistItemRow) {
+    if (!canMutate) return;
+    await apiFetch(`/api/kanban/checklist/${item.id}`, { method: 'DELETE' });
+    load();
+  }
+
+  const total = items.length;
+  const done = items.filter(i => i.done).length;
+  const pct = total === 0 ? 0 : Math.round((done / total) * 100);
+
+  return (
+    <Field label={`Checklist${total > 0 ? ` (${done}/${total})` : ''}`}>
+      {total > 0 && (
+        <div className="h-1 rounded-full bg-slate-100 overflow-hidden mb-2">
+          <div className={`h-full ${pct === 100 ? 'bg-emerald-500' : 'bg-indigo-500'}`} style={{ width: `${pct}%` }} />
+        </div>
+      )}
+      {loading && <p className="text-xs text-slate-400">Loading…</p>}
+      {!loading && items.length === 0 && !canMutate && (
+        <p className="text-xs text-slate-400 italic">No subtasks.</p>
+      )}
+      <ul className="space-y-1">
+        {items.map(item => (
+          <li key={item.id} className="flex items-center gap-2 text-sm group">
+            <input type="checkbox" checked={item.done} onChange={() => toggle(item)}
+              disabled={!canMutate} className="rounded border-slate-300 flex-shrink-0" />
+            <span className={`flex-1 ${item.done ? 'line-through text-slate-400' : 'text-slate-700'}`}>
+              {item.text}
+            </span>
+            {canMutate && (
+              <button type="button" onClick={() => remove(item)}
+                className="opacity-0 group-hover:opacity-100 text-slate-400 hover:text-rose-600">
+                <X className="w-3.5 h-3.5" />
+              </button>
+            )}
+          </li>
+        ))}
+      </ul>
+      {canMutate && (
+        <form onSubmit={add} className="mt-2 flex items-center gap-2">
+          <input value={draft} onChange={e => setDraft(e.target.value)}
+            placeholder="+ Add a subtask"
+            className="flex-1 border border-slate-200 rounded-md px-2 py-1 text-sm" />
+        </form>
+      )}
+    </Field>
+  );
+}
+
+// Small label chip used on the rendered card on the board.
+function LabelChip({ label }: { label: Label }) {
+  return (
+    <span className={`inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] border ${LABEL_COLOR_CLASSES[label.color]}`}>
+      <span className={`w-1.5 h-1.5 rounded-full ${LABEL_COLOR_DOT[label.color]}`} />
+      {label.name}
+    </span>
+  );
+}
+
+// Tiny progress bar used inline on the card preview.
+function ChecklistProgressBar({ done, total }: { done: number; total: number }) {
+  const pct = total === 0 ? 0 : Math.round((done / total) * 100);
+  return (
+    <div className="flex items-center gap-1.5 mt-1.5">
+      <div className="flex-1 h-1 rounded-full bg-slate-100 overflow-hidden">
+        <div className={`h-full ${pct === 100 ? 'bg-emerald-500' : 'bg-indigo-500'}`} style={{ width: `${pct}%` }} />
+      </div>
+      <span className="text-[10px] text-slate-400 tabular-nums flex-shrink-0">{done}/{total}</span>
     </div>
   );
 }

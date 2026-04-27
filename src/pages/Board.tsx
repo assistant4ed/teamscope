@@ -1,9 +1,35 @@
-import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import React, { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState } from 'react';
 import {
   Plus, X, Users, RefreshCw, MoreHorizontal, Flag,
   Calendar, Trash2, AlertTriangle, Check, ImagePlus, Loader2,
+  Folder, Share2, Link as LinkIcon, FolderPlus, Pencil,
 } from 'lucide-react';
 import { apiGet, apiFetch, Me } from '../auth';
+
+// Single source of truth for "where are we — logged-in app, public view-only
+// link, or public edit-mode link?" Every API call routes through helpers
+// that consult this so a public visitor doesn't accidentally hit authed
+// endpoints (and so authed code keeps working unchanged).
+export type ApiCtx =
+  | { kind: 'authed' }
+  | { kind: 'public-view'; token: string }
+  | { kind: 'public-edit'; token: string };
+
+const ApiContext = createContext<ApiCtx>({ kind: 'authed' });
+const useApiCtx = () => useContext(ApiContext);
+
+function urlBoard(ctx: ApiCtx, boardId?: string): string {
+  if (ctx.kind === 'authed') {
+    return boardId ? `/api/kanban/board?board_id=${encodeURIComponent(boardId)}` : '/api/kanban/board';
+  }
+  return `/api/public/board/${ctx.token}`;
+}
+function urlCardsBase(ctx: ApiCtx): string {
+  return ctx.kind === 'authed' ? '/api/kanban/cards' : `/api/public/board/${ctx.token}/cards`;
+}
+function urlUpload(ctx: ApiCtx): string {
+  return ctx.kind === 'authed' ? '/api/uploads/image' : `/api/public/board/${ctx.token}/uploads/image`;
+}
 
 // ---------- Types ---------------------------------------------------- //
 interface Column {
@@ -30,12 +56,27 @@ interface Subscriber {
 interface BoardData {
   columns: Column[]; cards: Card[];
   assignees: Assignee[]; subscribers: Subscriber[];
+  board_id?: string;
+  board?: { id: string; name: string; share_mode: 'view' | 'edit' };
+}
+
+interface BoardSummary {
+  id: string; name: string; is_default: boolean;
+  share_enabled: boolean; share_mode: 'view' | 'edit';
+  share_token: string | null;
 }
 
 type ViewMode = 'columns' | 'swimlanes';
 
 // ---------- Main component ------------------------------------------ //
-export default function Board({ me }: { me: Me }) {
+// `apiCtx` defaults to authed when rendered from Shell. PublicBoard
+// passes a token-based ctx so the same rendering tree fetches and
+// mutates against /api/public/board/:token/* instead.
+export default function Board({ me, apiCtx = { kind: 'authed' } }: {
+  me: Me; apiCtx?: ApiCtx;
+}) {
+  const [boards, setBoards] = useState<BoardSummary[]>([]);
+  const [activeBoardId, setActiveBoardId] = useState<string | null>(null);
   const [data, setData] = useState<BoardData | null>(null);
   const [loading, setLoading] = useState(true);
   const [err, setErr] = useState<string | null>(null);
@@ -43,18 +84,43 @@ export default function Board({ me }: { me: Me }) {
   const [filterSub, setFilterSub] = useState<string | null>(null);
   const [addToCol, setAddToCol] = useState<string | null>(null);
   const [editCardId, setEditCardId] = useState<string | null>(null);
+  const [showFolders, setShowFolders] = useState(false);
+  const [shareForBoard, setShareForBoard] = useState<BoardSummary | null>(null);
+
+  const isAuthed = apiCtx.kind === 'authed';
+  const isPublicEdit = apiCtx.kind === 'public-edit';
+  const isReadOnly = apiCtx.kind === 'public-view';
+
+  // Fetch the boards list — only when authed; public links target one board.
+  const loadBoards = useCallback(async () => {
+    if (!isAuthed) return;
+    try {
+      const d = await apiGet<{ boards: BoardSummary[] }>('/api/kanban/boards');
+      setBoards(d.boards);
+      // First load: pick default.
+      if (!activeBoardId) {
+        const def = d.boards.find(b => b.is_default) || d.boards[0];
+        if (def) setActiveBoardId(def.id);
+      }
+    } catch (e) { setErr(String(e)); }
+  }, [isAuthed, activeBoardId]);
 
   const load = useCallback(async () => {
     try {
-      const d = await apiGet<BoardData>('/api/kanban/board');
+      const d = await apiGet<BoardData>(urlBoard(apiCtx, activeBoardId ?? undefined));
       setData(d);
       setErr(null);
     } catch (e) {
       setErr(String(e));
     } finally { setLoading(false); }
-  }, []);
+  }, [apiCtx, activeBoardId]);
 
-  useEffect(() => { load(); }, [load]);
+  useEffect(() => { loadBoards(); }, [loadBoards]);
+  useEffect(() => {
+    // Don't fetch the board until we know which one (authed mode only).
+    if (isAuthed && !activeBoardId) return;
+    load();
+  }, [load, activeBoardId, isAuthed]);
 
   // Refresh when window regains focus so multi-tab boss stays in sync.
   useEffect(() => {
@@ -65,13 +131,16 @@ export default function Board({ me }: { me: Me }) {
 
   // Optimistic move: update local state, sync to server, revert on error.
   async function moveCard(cardId: string, columnId: string, position: number) {
-    if (!data) return;
+    if (!data || isReadOnly) return;
     const before = data;
     const next = reposition(data, cardId, columnId, position);
     setData(next);
     try {
-      const res = await apiFetch(`/api/kanban/cards/${cardId}/move`, {
-        method: 'PUT',
+      const url = isPublicEdit
+        ? `/api/public/board/${(apiCtx as { token: string }).token}/cards/${cardId}/move`
+        : `/api/kanban/cards/${cardId}/move`;
+      const res = await apiFetch(url, {
+        method: isPublicEdit ? 'POST' : 'PUT',
         body: JSON.stringify({ column_id: columnId, position }),
       });
       if (!res.ok) throw new Error(`move failed: ${res.status}`);
@@ -85,7 +154,7 @@ export default function Board({ me }: { me: Me }) {
 
   // Optimistic column reorder: move sourceId to target's slot, re-persist.
   async function reorderColumn(sourceId: string, targetId: string) {
-    if (!data || sourceId === targetId) return;
+    if (!data || sourceId === targetId || !isAuthed) return;
     const before = data;
     const order = data.columns.map(c => c.id);
     const fromIdx = order.indexOf(sourceId);
@@ -155,15 +224,48 @@ export default function Board({ me }: { me: Me }) {
     return <div className="p-10 text-center text-rose-600">{err}</div>;
   }
 
-  const canEdit = me.role === 'boss' || me.role === 'pa' || me.role === 'colleague';
-  const canDelete = me.role === 'boss' || me.role === 'pa';
-  const canReorderColumns = me.role === 'boss';
+  // In public-view mode the board is read-only. In public-edit mode any
+  // visitor can mutate cards but cannot rename / delete columns.
+  const canEdit = isReadOnly ? false :
+    isPublicEdit ? true :
+    (me.role === 'boss' || me.role === 'pa' || me.role === 'colleague');
+  const canDelete = isReadOnly ? false :
+    isPublicEdit ? true :
+    (me.role === 'boss' || me.role === 'pa');
+  const canReorderColumns = isAuthed && me.role === 'boss';
+  const canManageBoards = isAuthed && me.role === 'boss';
 
   return (
+    <ApiContext.Provider value={apiCtx}>
     <div className="flex flex-col h-full">
       <header className="px-6 md:px-10 pt-6 md:pt-8 pb-3 flex items-center justify-between flex-wrap gap-3">
         <div>
-          <h1 className="text-2xl font-bold text-slate-900">Board</h1>
+          <div className="flex items-center gap-2 flex-wrap">
+            <h1 className="text-2xl font-bold text-slate-900">
+              {isAuthed
+                ? (boards.find(b => b.id === activeBoardId)?.name || 'Board')
+                : (data.board?.name || 'Board')}
+            </h1>
+            {isAuthed && boards.length > 0 && (
+              <BoardSwitcher
+                boards={boards}
+                activeId={activeBoardId}
+                onPick={setActiveBoardId}
+                canManage={canManageBoards}
+                onManageFolders={() => setShowFolders(true)}
+              />
+            )}
+            {isReadOnly && (
+              <span className="text-xs px-2 py-0.5 rounded bg-amber-100 text-amber-800">
+                Read-only share
+              </span>
+            )}
+            {isPublicEdit && (
+              <span className="text-xs px-2 py-0.5 rounded bg-emerald-100 text-emerald-800">
+                Editable share
+              </span>
+            )}
+          </div>
           <p className="text-sm text-slate-500">
             {visibleCards.length} card{visibleCards.length === 1 ? '' : 's'} visible
             {filterSub && filterSub !== '__unassigned' &&
@@ -182,6 +284,16 @@ export default function Board({ me }: { me: Me }) {
               By member
             </button>
           </div>
+          {canManageBoards && activeBoardId && (
+            <button onClick={() => {
+              const b = boards.find(b => b.id === activeBoardId);
+              if (b) setShareForBoard(b);
+            }}
+              className="inline-flex items-center gap-1.5 px-3 py-2 text-sm border border-slate-200 rounded-lg hover:bg-slate-50 bg-white"
+              title="Share this folder via public link">
+              <Share2 className="w-4 h-4" /> Share
+            </button>
+          )}
           <button onClick={() => load()}
             className="p-2 border border-slate-200 rounded-lg hover:bg-slate-50 bg-white"
             title="Refresh">
@@ -253,7 +365,25 @@ export default function Board({ me }: { me: Me }) {
           onClose={() => setEditCardId(null)}
         />
       )}
+      {showFolders && canManageBoards && (
+        <FoldersModal
+          boards={boards}
+          activeId={activeBoardId}
+          onPick={id => { setActiveBoardId(id); setShowFolders(false); }}
+          onChanged={loadBoards}
+          onShare={b => { setShareForBoard(b); }}
+          onClose={() => setShowFolders(false)}
+        />
+      )}
+      {shareForBoard && canManageBoards && (
+        <ShareModal
+          board={shareForBoard}
+          onChanged={loadBoards}
+          onClose={() => setShareForBoard(null)}
+        />
+      )}
     </div>
+    </ApiContext.Provider>
   );
 }
 
@@ -746,11 +876,12 @@ function AddCardModal({
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState<string | null>(null);
 
+  const apiCtx = useApiCtx();
   async function submit(e: React.FormEvent) {
     e.preventDefault();
     setBusy(true); setErr(null);
     try {
-      const res = await apiFetch('/api/kanban/cards', {
+      const res = await apiFetch(urlCardsBase(apiCtx), {
         method: 'POST',
         body: JSON.stringify({
           column_id: targetCol,
@@ -828,11 +959,12 @@ function EditCardModal({
   const [err, setErr] = useState<string | null>(null);
   const [confirmDel, setConfirmDel] = useState(false);
 
+  const apiCtx = useApiCtx();
   async function save(e: React.FormEvent) {
     e.preventDefault();
     setBusy(true); setErr(null);
     try {
-      const res = await apiFetch(`/api/kanban/cards/${cardId}`, {
+      const res = await apiFetch(`${urlCardsBase(apiCtx)}/${cardId}`, {
         method: 'PATCH',
         body: JSON.stringify({
           title: title.trim(),
@@ -855,7 +987,7 @@ function EditCardModal({
   async function remove() {
     setBusy(true); setErr(null);
     try {
-      const res = await apiFetch(`/api/kanban/cards/${cardId}`, { method: 'DELETE' });
+      const res = await apiFetch(`${urlCardsBase(apiCtx)}/${cardId}`, { method: 'DELETE' });
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       onDone();
     } catch (e) { setErr((e as Error).message); }
@@ -1034,8 +1166,10 @@ const MAX_IMAGES_PER_CARD = 10;
 const MAX_IMAGE_BYTES = 8 * 1024 * 1024;
 
 // Single source of truth for image upload — used by both the card-level
-// ImageDropZone and the in-description paste/drop handler.
-async function uploadImageFile(file: File): Promise<string> {
+// ImageDropZone and the in-description paste/drop handler. Routes via
+// /api/public/board/:token/uploads/image when called from a share-edit
+// session so unauthenticated visitors can still attach screenshots.
+async function uploadImageFile(file: File, ctx: ApiCtx): Promise<string> {
   if (file.size > MAX_IMAGE_BYTES) {
     throw new Error(`${file.name} is larger than 8 MB`);
   }
@@ -1045,7 +1179,7 @@ async function uploadImageFile(file: File): Promise<string> {
     r.onerror = () => reject(new Error('read failed'));
     r.readAsDataURL(file);
   });
-  const res = await apiFetch('/api/uploads/image', {
+  const res = await apiFetch(urlUpload(ctx), {
     method: 'POST',
     body: JSON.stringify({ data_url: dataUrl, filename: file.name }),
   });
@@ -1077,6 +1211,7 @@ function ImageDropZone({ value, onChange }: {
   value: string[];
   onChange: (urls: string[]) => void;
 }) {
+  const apiCtx = useApiCtx();
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState<string | null>(null);
   const [over, setOver] = useState(false);
@@ -1101,14 +1236,14 @@ function ImageDropZone({ value, onChange }: {
     const newUrls: string[] = [];
     for (const f of accepted) {
       try {
-        newUrls.push(await uploadImageFile(f));
+        newUrls.push(await uploadImageFile(f, apiCtx));
       } catch (e) {
         setErr(`${f.name}: ${(e as Error).message}`);
       }
     }
     if (newUrls.length > 0) onChange([...value, ...newUrls]);
     setBusy(false);
-  }, [value, onChange]);
+  }, [value, onChange, apiCtx]);
 
   // Window-level paste listener — image from clipboard pastes into the
   // open modal regardless of which input has focus.
@@ -1193,6 +1328,7 @@ function ImageDropZone({ value, onChange }: {
 function DescriptionField({ value, onChange }: {
   value: string; onChange: (v: string) => void;
 }) {
+  const apiCtx = useApiCtx();
   const ref = useRef<HTMLTextAreaElement>(null);
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState<string | null>(null);
@@ -1204,7 +1340,7 @@ function DescriptionField({ value, onChange }: {
     try {
       const urls: string[] = [];
       for (const f of accepted) {
-        try { urls.push(await uploadImageFile(f)); }
+        try { urls.push(await uploadImageFile(f, apiCtx)); }
         catch (e) { setErr(`${f.name}: ${(e as Error).message}`); }
       }
       if (urls.length === 0) return;
@@ -1228,7 +1364,7 @@ function DescriptionField({ value, onChange }: {
         ta.setSelectionRange(cursor, cursor);
       });
     } finally { setBusy(false); }
-  }, [value, onChange]);
+  }, [value, onChange, apiCtx]);
 
   const descUrls = extractDescriptionImageUrls(value);
 
@@ -1311,5 +1447,311 @@ function CardImageStrip({ urls }: { urls: string[] }) {
         </div>
       )}
     </div>
+  );
+}
+
+// ---------- Folder switcher (boss-only chrome) ---------------------- //
+function BoardSwitcher({ boards, activeId, onPick, canManage, onManageFolders }: {
+  boards: BoardSummary[]; activeId: string | null;
+  onPick: (id: string) => void;
+  canManage: boolean;
+  onManageFolders: () => void;
+}) {
+  const [open, setOpen] = useState(false);
+  const ref = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    function close(e: MouseEvent) {
+      if (!ref.current?.contains(e.target as Node)) setOpen(false);
+    }
+    if (open) {
+      document.addEventListener('mousedown', close);
+      return () => document.removeEventListener('mousedown', close);
+    }
+  }, [open]);
+  return (
+    <div ref={ref} className="relative">
+      <button onClick={() => setOpen(o => !o)}
+        className="inline-flex items-center gap-1.5 px-2.5 py-1 text-xs font-medium
+                   text-slate-600 bg-white border border-slate-200 rounded-lg hover:bg-slate-50">
+        <Folder className="w-3.5 h-3.5" /> Switch folder
+      </button>
+      {open && (
+        <div className="absolute z-30 mt-1 left-0 w-56 bg-white rounded-lg shadow-lg
+                        border border-slate-200 overflow-hidden">
+          <div className="max-h-72 overflow-y-auto py-1">
+            {boards.map(b => (
+              <button key={b.id}
+                onClick={() => { onPick(b.id); setOpen(false); }}
+                className={`w-full text-left px-3 py-1.5 text-sm flex items-center justify-between
+                  ${b.id === activeId ? 'bg-indigo-50 text-indigo-700' : 'hover:bg-slate-50 text-slate-700'}`}>
+                <span className="flex items-center gap-2">
+                  <Folder className="w-3.5 h-3.5" /> {b.name}
+                </span>
+                {b.is_default && <span className="text-[10px] text-slate-400">default</span>}
+              </button>
+            ))}
+          </div>
+          {canManage && (
+            <button onClick={() => { setOpen(false); onManageFolders(); }}
+              className="w-full text-left px-3 py-2 text-xs text-slate-500 border-t border-slate-100
+                         hover:bg-slate-50 inline-flex items-center gap-1.5">
+              <FolderPlus className="w-3.5 h-3.5" /> Manage folders…
+            </button>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ---------- Folders manager ----------------------------------------- //
+function FoldersModal({ boards, activeId, onPick, onChanged, onShare, onClose }: {
+  boards: BoardSummary[]; activeId: string | null;
+  onPick: (id: string) => void;
+  onChanged: () => void;
+  onShare: (b: BoardSummary) => void;
+  onClose: () => void;
+}) {
+  const [newName, setNewName] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+  const [renamingId, setRenamingId] = useState<string | null>(null);
+  const [renameValue, setRenameValue] = useState('');
+
+  async function create(e: React.FormEvent) {
+    e.preventDefault();
+    if (!newName.trim()) return;
+    setBusy(true); setErr(null);
+    try {
+      const res = await apiFetch('/api/kanban/boards', {
+        method: 'POST', body: JSON.stringify({ name: newName.trim() }),
+      });
+      if (!res.ok) {
+        const body = await res.json().catch(() => ({}));
+        throw new Error(body.error || `HTTP ${res.status}`);
+      }
+      setNewName('');
+      onChanged();
+    } catch (e) { setErr((e as Error).message); }
+    finally { setBusy(false); }
+  }
+
+  async function setDefault(id: string) {
+    setBusy(true); setErr(null);
+    try {
+      const res = await apiFetch(`/api/kanban/boards/${id}`, {
+        method: 'PATCH', body: JSON.stringify({ is_default: true }),
+      });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      onChanged();
+    } catch (e) { setErr((e as Error).message); }
+    finally { setBusy(false); }
+  }
+
+  async function rename(id: string) {
+    if (!renameValue.trim()) return;
+    setBusy(true); setErr(null);
+    try {
+      const res = await apiFetch(`/api/kanban/boards/${id}`, {
+        method: 'PATCH', body: JSON.stringify({ name: renameValue.trim() }),
+      });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      setRenamingId(null);
+      onChanged();
+    } catch (e) { setErr((e as Error).message); }
+    finally { setBusy(false); }
+  }
+
+  async function remove(id: string) {
+    if (!window.confirm('Delete this folder? Cards inside are kept but hidden until reassigned.')) return;
+    setBusy(true); setErr(null);
+    try {
+      const res = await apiFetch(`/api/kanban/boards/${id}`, { method: 'DELETE' });
+      if (!res.ok) {
+        const body = await res.json().catch(() => ({}));
+        throw new Error(body.error || `HTTP ${res.status}`);
+      }
+      onChanged();
+    } catch (e) { setErr((e as Error).message); }
+    finally { setBusy(false); }
+  }
+
+  return (
+    <ModalShell title="Folders" subtitle="Each folder is its own Kanban board." onClose={onClose}
+      onSubmit={e => e.preventDefault()}
+      footer={<button type="button" onClick={onClose}
+        className="ml-auto px-3 py-2 text-sm text-slate-600 hover:bg-slate-100 rounded-lg">Done</button>}>
+      <form onSubmit={create} className="flex items-center gap-2">
+        <input value={newName} onChange={e => setNewName(e.target.value)}
+          placeholder="New folder name"
+          className="flex-1 border border-slate-200 rounded-lg px-3 py-2 text-sm" />
+        <button type="submit" disabled={!newName.trim() || busy}
+          className="inline-flex items-center gap-1 px-3 py-2 text-sm bg-slate-900 hover:bg-slate-800
+                     disabled:opacity-40 text-white rounded-lg">
+          <FolderPlus className="w-4 h-4" /> Add
+        </button>
+      </form>
+      <ul className="divide-y divide-slate-100 border border-slate-200 rounded-lg">
+        {boards.map(b => (
+          <li key={b.id} className="px-3 py-2 flex items-center gap-2">
+            <Folder className="w-4 h-4 text-slate-400 flex-shrink-0" />
+            {renamingId === b.id ? (
+              <input autoFocus value={renameValue}
+                onChange={e => setRenameValue(e.target.value)}
+                onKeyDown={e => { if (e.key === 'Enter') rename(b.id); if (e.key === 'Escape') setRenamingId(null); }}
+                className="flex-1 border border-slate-200 rounded px-2 py-1 text-sm" />
+            ) : (
+              <button onClick={() => onPick(b.id)}
+                className={`flex-1 text-left text-sm truncate ${b.id === activeId ? 'font-semibold text-indigo-700' : 'text-slate-700 hover:underline'}`}>
+                {b.name}
+              </button>
+            )}
+            {b.is_default && <span className="text-[10px] text-slate-400 px-1.5 py-0.5 rounded bg-slate-100">default</span>}
+            {b.share_enabled && <span className="text-[10px] text-emerald-700 px-1.5 py-0.5 rounded bg-emerald-50">shared</span>}
+            <div className="flex items-center gap-1 ml-auto">
+              {renamingId === b.id ? (
+                <button onClick={() => rename(b.id)} disabled={busy}
+                  className="text-xs text-indigo-700 hover:underline">Save</button>
+              ) : (
+                <button onClick={() => { setRenamingId(b.id); setRenameValue(b.name); }}
+                  className="p-1 text-slate-400 hover:text-slate-700" title="Rename">
+                  <Pencil className="w-3.5 h-3.5" />
+                </button>
+              )}
+              <button onClick={() => onShare(b)}
+                className="p-1 text-slate-400 hover:text-slate-700" title="Share">
+                <Share2 className="w-3.5 h-3.5" />
+              </button>
+              {!b.is_default && (
+                <button onClick={() => setDefault(b.id)} disabled={busy}
+                  className="text-[10px] px-2 py-1 text-slate-500 hover:text-slate-800
+                             border border-slate-200 rounded hover:bg-slate-50">
+                  Make default
+                </button>
+              )}
+              {!b.is_default && (
+                <button onClick={() => remove(b.id)} disabled={busy}
+                  className="p-1 text-slate-400 hover:text-rose-600" title="Delete">
+                  <Trash2 className="w-3.5 h-3.5" />
+                </button>
+              )}
+            </div>
+          </li>
+        ))}
+      </ul>
+      {err && <ErrorBox msg={err} />}
+    </ModalShell>
+  );
+}
+
+// ---------- Share modal --------------------------------------------- //
+function ShareModal({ board, onChanged, onClose }: {
+  board: BoardSummary; onChanged: () => void; onClose: () => void;
+}) {
+  const [mode, setMode] = useState<'view' | 'edit'>(board.share_mode);
+  const [token, setToken] = useState<string | null>(board.share_token);
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+  const [copied, setCopied] = useState(false);
+
+  const shareUrl = token
+    ? `${window.location.origin}/share/${token}`
+    : null;
+
+  async function generate(nextMode: 'view' | 'edit') {
+    setBusy(true); setErr(null);
+    try {
+      const res = await apiFetch(`/api/kanban/boards/${board.id}/share`, {
+        method: 'POST', body: JSON.stringify({ mode: nextMode }),
+      });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const body = await res.json();
+      setToken(body.board.share_token);
+      setMode(body.board.share_mode);
+      onChanged();
+    } catch (e) { setErr((e as Error).message); }
+    finally { setBusy(false); }
+  }
+
+  async function changeMode(nextMode: 'view' | 'edit') {
+    if (!token) {
+      // No active link yet — generate one in the requested mode.
+      await generate(nextMode);
+      return;
+    }
+    // Same call regenerates the token AND updates the mode in one round trip.
+    await generate(nextMode);
+  }
+
+  async function revoke() {
+    if (!window.confirm('Revoke the share link? Anyone with the URL loses access immediately.')) return;
+    setBusy(true); setErr(null);
+    try {
+      const res = await apiFetch(`/api/kanban/boards/${board.id}/share/revoke`, { method: 'POST' });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      setToken(null);
+      onChanged();
+    } catch (e) { setErr((e as Error).message); }
+    finally { setBusy(false); }
+  }
+
+  async function copy() {
+    if (!shareUrl) return;
+    try {
+      await navigator.clipboard.writeText(shareUrl);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 1500);
+    } catch { /* clipboard blocked; user will copy manually */ }
+  }
+
+  return (
+    <ModalShell title={`Share "${board.name}"`}
+      subtitle="Anyone with the link below can access this folder. No login required."
+      onClose={onClose}
+      onSubmit={e => e.preventDefault()}
+      footer={<button type="button" onClick={onClose}
+        className="ml-auto px-3 py-2 text-sm text-slate-600 hover:bg-slate-100 rounded-lg">Done</button>}>
+      <Field label="Permission">
+        <div className="flex gap-2">
+          {(['edit', 'view'] as const).map(m => (
+            <button key={m} type="button" onClick={() => changeMode(m)} disabled={busy}
+              className={`flex-1 text-sm py-2 rounded-lg border transition disabled:opacity-50
+                ${mode === m
+                  ? 'bg-indigo-600 text-white border-indigo-600'
+                  : 'bg-white text-slate-700 border-slate-200 hover:border-slate-300'}`}>
+              {m === 'edit' ? 'Anyone with link can edit' : 'View only'}
+            </button>
+          ))}
+        </div>
+      </Field>
+
+      {!token ? (
+        <button type="button" onClick={() => generate(mode)} disabled={busy}
+          className="inline-flex items-center gap-1.5 px-3 py-2 text-sm font-medium
+                     bg-slate-900 hover:bg-slate-800 disabled:opacity-40 text-white rounded-lg">
+          <LinkIcon className="w-4 h-4" /> Generate share link
+        </button>
+      ) : (
+        <>
+          <Field label="Share link">
+            <div className="flex items-center gap-2">
+              <input readOnly value={shareUrl ?? ''}
+                onFocus={e => e.currentTarget.select()}
+                className="flex-1 border border-slate-200 rounded-lg px-3 py-2 text-sm font-mono" />
+              <button type="button" onClick={copy}
+                className="px-3 py-2 text-sm bg-slate-900 hover:bg-slate-800 text-white rounded-lg">
+                {copied ? <Check className="w-4 h-4" /> : 'Copy'}
+              </button>
+            </div>
+          </Field>
+          <button type="button" onClick={revoke} disabled={busy}
+            className="text-xs text-rose-600 hover:underline">
+            Revoke link
+          </button>
+        </>
+      )}
+
+      {err && <ErrorBox msg={err} />}
+    </ModalShell>
   );
 }

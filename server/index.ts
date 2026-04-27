@@ -21,6 +21,7 @@ import pg from 'pg';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import nodeCrypto from 'node:crypto';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -172,7 +173,8 @@ app.use('/api', (req, res, next) => {
   if (
     req.path === '/health' ||
     req.path === '/me' ||
-    req.path === '/config/roster'
+    req.path === '/config/roster' ||
+    req.path.startsWith('/public/')
   ) return next();
   return requireUser(req, res, next);
 });
@@ -2458,39 +2460,491 @@ function pgErrorStatus(e: unknown): number {
 }
 
 // Full board load: columns + cards + assignees, in one round-trip.
-app.get('/api/kanban/board', async (_req, res) => {
+// Default board: the row flagged is_default. Falls back to the oldest
+// board so the agent never has nowhere to write.
+async function getDefaultBoardId(): Promise<string | null> {
+  const rows = await query<{ id: string }>(
+    `SELECT id FROM ops.kanban_boards
+      WHERE deleted_at IS NULL
+      ORDER BY is_default DESC, created_at ASC
+      LIMIT 1`
+  );
+  return rows[0]?.id ?? null;
+}
+
+async function loadBoardData(boardId: string) {
+  const [columns, cards, assignees, subscribers] = await Promise.all([
+    query<{ id: string; name: string; position: number; is_done: boolean; wip_limit: number | null }>(
+      `SELECT id, name, position, is_done, wip_limit
+         FROM ops.kanban_columns
+        WHERE deleted_at IS NULL AND board_id = $1
+        ORDER BY position`,
+      [boardId]
+    ),
+    query(
+      `SELECT c.id, c.column_id, c.title, c.description, c.priority, c.position, c.due_date,
+              c.created_by, c.created_at, c.updated_at, c.done_at,
+              c.source_kind, c.source_ref, c.image_urls
+         FROM ops.kanban_cards c
+         JOIN ops.kanban_columns col ON col.id = c.column_id
+        WHERE c.deleted_at IS NULL AND col.board_id = $1
+        ORDER BY c.column_id, c.position`,
+      [boardId]
+    ),
+    query<{ card_id: string; subscriber_id: string; assigned_at: string }>(
+      `SELECT a.card_id, a.subscriber_id, a.assigned_at
+         FROM ops.kanban_assignees a
+         JOIN ops.kanban_cards c   ON c.id = a.card_id
+         JOIN ops.kanban_columns col ON col.id = c.column_id
+        WHERE c.deleted_at IS NULL AND col.board_id = $1`,
+      [boardId]
+    ),
+    query(
+      `SELECT id, name, role, timezone, telegram_chat_id, active
+         FROM ops.report_subscribers
+        ORDER BY active DESC, name`
+    ),
+  ]);
+  return { columns, cards, assignees, subscribers };
+}
+
+// List all boards (folders). Anyone whitelisted can see all of them.
+app.get('/api/kanban/boards', async (_req, res) => {
   try {
-    const [columns, cards, assignees, subscribers] = await Promise.all([
-      query<{ id: string; name: string; position: number; is_done: boolean; wip_limit: number | null }>(
-        `SELECT id, name, position, is_done, wip_limit
-           FROM ops.kanban_columns
-          WHERE deleted_at IS NULL
-          ORDER BY position`
-      ),
-      query(
-        `SELECT id, column_id, title, description, priority, position, due_date,
-                created_by, created_at, updated_at, done_at,
-                source_kind, source_ref, image_urls
-           FROM ops.kanban_cards
-          WHERE deleted_at IS NULL
-          ORDER BY column_id, position`
-      ),
-      query<{ card_id: string; subscriber_id: string; assigned_at: string }>(
-        `SELECT a.card_id, a.subscriber_id, a.assigned_at
-           FROM ops.kanban_assignees a
-           JOIN ops.kanban_cards c ON c.id = a.card_id
-          WHERE c.deleted_at IS NULL`
-      ),
-      query(
-        `SELECT id, name, role, timezone, telegram_chat_id, active
-           FROM ops.report_subscribers
-          ORDER BY active DESC, name`
-      ),
-    ]);
-    res.json({ columns, cards, assignees, subscribers });
+    const rows = await query(
+      `SELECT id, name, is_default,
+              CASE WHEN share_token IS NULL THEN false ELSE true END AS share_enabled,
+              share_mode, share_token,
+              created_by, created_at, updated_at
+         FROM ops.kanban_boards
+        WHERE deleted_at IS NULL
+        ORDER BY is_default DESC, created_at`
+    );
+    res.json({ boards: rows });
   } catch (e) {
     res.status(pgErrorStatus(e)).json({ error: (e as Error).message });
   }
+});
+
+// Create a new board (folder). Boss only. Optionally seeds default columns
+// so the boss isn't staring at an empty page.
+app.post('/api/kanban/boards', requireRole('boss'), async (req, res) => {
+  const name = ((req.body?.name as string) || '').trim();
+  if (!name) return res.status(400).json({ error: 'name required' });
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const ins = await client.query(
+      `INSERT INTO ops.kanban_boards (name, created_by)
+       VALUES ($1, $2)
+       RETURNING id, name, is_default, created_at`,
+      [name, req.user!.email]
+    );
+    const board = ins.rows[0];
+    const seedColumns = ['Backlog', 'Today', 'In Progress', 'Blocked', 'Done'];
+    for (let i = 0; i < seedColumns.length; i++) {
+      const isDone = seedColumns[i] === 'Done';
+      await client.query(
+        `INSERT INTO ops.kanban_columns (board_id, name, position, is_done)
+         VALUES ($1, $2, $3, $4)`,
+        [board.id, seedColumns[i], i, isDone]
+      );
+    }
+    await client.query('COMMIT');
+    res.json({ board });
+  } catch (e) {
+    await client.query('ROLLBACK').catch(() => {});
+    res.status(pgErrorStatus(e)).json({ error: (e as Error).message });
+  } finally {
+    client.release();
+  }
+});
+
+// Rename / mark default. Boss only.
+app.patch('/api/kanban/boards/:id', requireRole('boss'), async (req, res) => {
+  const b = req.body || {};
+  const sets: string[] = [];
+  const vals: unknown[] = [];
+  if (typeof b.name === 'string' && b.name.trim()) {
+    sets.push(`name = $${sets.length + 1}`);
+    vals.push(b.name.trim());
+  }
+  if (b.is_default === true) {
+    // Single-default invariant: clear everyone else first.
+    await query(`UPDATE ops.kanban_boards SET is_default = false WHERE is_default = true`);
+    sets.push(`is_default = $${sets.length + 1}`);
+    vals.push(true);
+  }
+  if (sets.length === 0) return res.status(400).json({ error: 'no fields to update' });
+  vals.push(req.params.id);
+  try {
+    const rows = await query(
+      `UPDATE ops.kanban_boards SET ${sets.join(', ')}, updated_at = now()
+        WHERE id = $${vals.length} AND deleted_at IS NULL
+       RETURNING id, name, is_default, share_mode, share_token, updated_at`,
+      vals
+    );
+    if (rows.length === 0) return res.status(404).json({ error: 'not_found' });
+    res.json({ board: rows[0] });
+  } catch (e) {
+    res.status(pgErrorStatus(e)).json({ error: (e as Error).message });
+  }
+});
+
+// Soft-delete a board. Boss only. Refuses to delete the default board so
+// the agent flow always has somewhere to write.
+app.delete('/api/kanban/boards/:id', requireRole('boss'), async (req, res) => {
+  try {
+    const rows = await query<{ is_default: boolean }>(
+      `SELECT is_default FROM ops.kanban_boards
+        WHERE id = $1 AND deleted_at IS NULL`,
+      [req.params.id]
+    );
+    if (rows.length === 0) return res.status(404).json({ error: 'not_found' });
+    if (rows[0].is_default) {
+      return res.status(409).json({ error: 'cannot_delete_default_board' });
+    }
+    await query(
+      `UPDATE ops.kanban_boards SET deleted_at = now() WHERE id = $1`,
+      [req.params.id]
+    );
+    res.json({ deleted: req.params.id });
+  } catch (e) {
+    res.status(pgErrorStatus(e)).json({ error: (e as Error).message });
+  }
+});
+
+// Enable / regenerate / change-mode for a board's share link. Boss only.
+// POST { mode: 'view' | 'edit' } → returns the active token.
+app.post('/api/kanban/boards/:id/share', requireRole('boss'), async (req, res) => {
+  const mode = (req.body?.mode as string) === 'view' ? 'view' : 'edit';
+  const token = randomShareToken();
+  try {
+    const rows = await query<{ id: string; share_token: string; share_mode: string }>(
+      `UPDATE ops.kanban_boards
+          SET share_token = $1, share_mode = $2, updated_at = now()
+        WHERE id = $3 AND deleted_at IS NULL
+       RETURNING id, share_token, share_mode`,
+      [token, mode, req.params.id]
+    );
+    if (rows.length === 0) return res.status(404).json({ error: 'not_found' });
+    res.json({ board: rows[0] });
+  } catch (e) {
+    res.status(pgErrorStatus(e)).json({ error: (e as Error).message });
+  }
+});
+
+// Revoke an active share link. Any leaked URL stops working immediately.
+app.post('/api/kanban/boards/:id/share/revoke', requireRole('boss'), async (req, res) => {
+  try {
+    await query(
+      `UPDATE ops.kanban_boards SET share_token = NULL, updated_at = now()
+        WHERE id = $1`,
+      [req.params.id]
+    );
+    res.json({ revoked: req.params.id });
+  } catch (e) {
+    res.status(pgErrorStatus(e)).json({ error: (e as Error).message });
+  }
+});
+
+// Authenticated board view. ?board_id=X scopes to a specific folder;
+// omitted ⇒ default board. Returned shape unchanged from before so the
+// existing frontend keeps working without coordination.
+app.get('/api/kanban/board', async (req, res) => {
+  try {
+    const requested = (req.query.board_id as string | undefined)?.trim();
+    const boardId = requested || (await getDefaultBoardId());
+    if (!boardId) return res.json({ columns: [], cards: [], assignees: [], subscribers: [] });
+    const data = await loadBoardData(boardId);
+    res.json({ ...data, board_id: boardId });
+  } catch (e) {
+    res.status(pgErrorStatus(e)).json({ error: (e as Error).message });
+  }
+});
+
+// Public read view by share token. No auth. Returns the same shape plus
+// share_mode so the SPA can show edit controls when allowed. Subscribers
+// are stripped down (no email / no chat_id) so a leaked link doesn't dox
+// the team.
+app.get('/api/public/board/:token', async (req, res) => {
+  try {
+    const rows = await query<{ id: string; name: string; share_mode: string }>(
+      `SELECT id, name, share_mode FROM ops.kanban_boards
+        WHERE share_token = $1 AND deleted_at IS NULL`,
+      [req.params.token]
+    );
+    if (rows.length === 0) return res.status(404).json({ error: 'not_found_or_revoked' });
+    const board = rows[0];
+    const data = await loadBoardData(board.id);
+    res.json({
+      board: { id: board.id, name: board.name, share_mode: board.share_mode },
+      columns: data.columns,
+      cards: data.cards,
+      assignees: data.assignees,
+      // Only minimal subscriber info needed to render avatars.
+      subscribers: data.subscribers.map((s: any) => ({
+        id: s.id, name: s.name, role: s.role, active: s.active,
+      })),
+    });
+  } catch (e) {
+    res.status(pgErrorStatus(e)).json({ error: (e as Error).message });
+  }
+});
+
+function randomShareToken(): string {
+  // 24 random bytes → 32 base64url chars; ample entropy and copy-friendly.
+  const bytes = nodeCrypto.randomBytes(24);
+  return bytes.toString('base64url');
+}
+
+// Resolve a share token to (boardId, mode). Returns null if the token is
+// missing/revoked. Mutating endpoints call this and 403 unless mode='edit'.
+async function resolveShareToken(
+  token: string
+): Promise<{ boardId: string; mode: 'view' | 'edit' } | null> {
+  if (!token) return null;
+  const rows = await query<{ id: string; share_mode: 'view' | 'edit' }>(
+    `SELECT id, share_mode FROM ops.kanban_boards
+      WHERE share_token = $1 AND deleted_at IS NULL`,
+    [token]
+  );
+  if (rows.length === 0) return null;
+  return { boardId: rows[0].id, mode: rows[0].share_mode };
+}
+
+// Make sure a column belongs to the share's board. Without this an edit-
+// mode visitor could pass any column_id and target someone else's folder.
+async function columnInBoard(columnId: string, boardId: string): Promise<boolean> {
+  const rows = await query(
+    `SELECT 1 FROM ops.kanban_columns
+      WHERE id = $1 AND board_id = $2 AND deleted_at IS NULL`,
+    [columnId, boardId]
+  );
+  return rows.length > 0;
+}
+async function cardInBoard(cardId: string, boardId: string): Promise<boolean> {
+  const rows = await query(
+    `SELECT 1 FROM ops.kanban_cards c
+       JOIN ops.kanban_columns col ON col.id = c.column_id
+      WHERE c.id = $1 AND col.board_id = $2 AND c.deleted_at IS NULL`,
+    [cardId, boardId]
+  );
+  return rows.length > 0;
+}
+
+// Generic guard for the public mutation routes. Returns the share scope
+// or sends a 403/404 response and false to short-circuit.
+async function guardShareEdit(
+  token: string, res: Response
+): Promise<{ boardId: string } | null> {
+  const scope = await resolveShareToken(token);
+  if (!scope) {
+    res.status(404).json({ error: 'not_found_or_revoked' });
+    return null;
+  }
+  if (scope.mode !== 'edit') {
+    res.status(403).json({ error: 'share_link_is_view_only' });
+    return null;
+  }
+  return { boardId: scope.boardId };
+}
+
+// Public CREATE card. Mirrors POST /api/kanban/cards but auth via share
+// token, scoped to the share's board.
+app.post('/api/public/board/:token/cards', async (req, res) => {
+  const scope = await guardShareEdit(req.params.token, res);
+  if (!scope) return;
+  const b = req.body || {};
+  const title = (b.title as string || '').trim();
+  const columnId = b.column_id as string;
+  if (!title) return res.status(400).json({ error: 'title required' });
+  if (!columnId) return res.status(400).json({ error: 'column_id required' });
+  if (!(await columnInBoard(columnId, scope.boardId))) {
+    return res.status(403).json({ error: 'column_outside_share_scope' });
+  }
+  const assigneeIds: string[] = Array.isArray(b.assignee_ids) ? b.assignee_ids.slice(0, 5) : [];
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const posRow = await client.query(
+      `SELECT COALESCE(MAX(position), -1) + 1 AS next_pos
+         FROM ops.kanban_cards
+        WHERE column_id = $1 AND deleted_at IS NULL`,
+      [columnId]
+    );
+    const position = posRow.rows[0].next_pos;
+    const imageUrls = sanitizeImageUrls(b.image_urls);
+    const ins = await client.query(
+      `INSERT INTO ops.kanban_cards
+         (column_id, title, description, priority, position, due_date,
+          created_by, source_kind, image_urls)
+       VALUES ($1, $2, $3, COALESCE($4, 'medium'), $5, $6, 'share-link', 'share-link', $7)
+       RETURNING id, column_id, title, description, priority, position, due_date,
+                 created_by, created_at, updated_at, done_at,
+                 source_kind, source_ref, image_urls`,
+      [columnId, title, b.description ?? null, b.priority ?? null,
+       position, b.due_date ?? null, imageUrls]
+    );
+    const card = ins.rows[0];
+    for (const sid of assigneeIds) {
+      await client.query(
+        `INSERT INTO ops.kanban_assignees (card_id, subscriber_id, assigned_by)
+         VALUES ($1, $2, 'share-link') ON CONFLICT DO NOTHING`,
+        [card.id, sid]
+      );
+    }
+    await client.query('COMMIT');
+    await logActivity('share-link', card.id, 'card.created',
+      { title: card.title, column_id: card.column_id, via: 'share_link' });
+    res.json({ card, assignee_ids: assigneeIds });
+  } catch (e) {
+    await client.query('ROLLBACK').catch(() => {});
+    res.status(pgErrorStatus(e)).json({ error: (e as Error).message });
+  } finally {
+    client.release();
+  }
+});
+
+// Public PATCH card. Same allowed fields as the authed PATCH.
+app.patch('/api/public/board/:token/cards/:id', async (req, res) => {
+  const scope = await guardShareEdit(req.params.token, res);
+  if (!scope) return;
+  if (!(await cardInBoard(req.params.id, scope.boardId))) {
+    return res.status(403).json({ error: 'card_outside_share_scope' });
+  }
+  const b = req.body || {};
+  const fields = ['title', 'description', 'priority', 'due_date'] as const;
+  const sets: string[] = [];
+  const vals: unknown[] = [];
+  for (const k of fields) {
+    if (b[k] !== undefined) {
+      sets.push(`${k} = $${sets.length + 1}`);
+      vals.push(b[k]);
+    }
+  }
+  if (b.image_urls !== undefined) {
+    sets.push(`image_urls = $${sets.length + 1}`);
+    vals.push(sanitizeImageUrls(b.image_urls));
+  }
+  if (sets.length === 0 && !Array.isArray(b.assignee_ids)) {
+    return res.status(400).json({ error: 'no fields to update' });
+  }
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    if (sets.length > 0) {
+      vals.push(req.params.id);
+      const upd = await client.query(
+        `UPDATE ops.kanban_cards SET ${sets.join(', ')}, updated_at = now()
+          WHERE id = $${vals.length} AND deleted_at IS NULL
+        RETURNING id`,
+        vals
+      );
+      if (upd.rows.length === 0) {
+        await client.query('ROLLBACK');
+        return res.status(404).json({ error: 'not_found' });
+      }
+    }
+    if (Array.isArray(b.assignee_ids)) {
+      const ids = (b.assignee_ids as string[]).slice(0, 5);
+      await client.query(`DELETE FROM ops.kanban_assignees WHERE card_id = $1`, [req.params.id]);
+      for (const sid of ids) {
+        await client.query(
+          `INSERT INTO ops.kanban_assignees (card_id, subscriber_id, assigned_by)
+           VALUES ($1, $2, 'share-link') ON CONFLICT DO NOTHING`,
+          [req.params.id, sid]
+        );
+      }
+    }
+    await client.query('COMMIT');
+    await logActivity('share-link', req.params.id, 'card.updated', { via: 'share_link' });
+    res.json({ ok: true });
+  } catch (e) {
+    await client.query('ROLLBACK').catch(() => {});
+    res.status(pgErrorStatus(e)).json({ error: (e as Error).message });
+  } finally {
+    client.release();
+  }
+});
+
+// Public DELETE card.
+app.delete('/api/public/board/:token/cards/:id', async (req, res) => {
+  const scope = await guardShareEdit(req.params.token, res);
+  if (!scope) return;
+  if (!(await cardInBoard(req.params.id, scope.boardId))) {
+    return res.status(403).json({ error: 'card_outside_share_scope' });
+  }
+  try {
+    await query(
+      `UPDATE ops.kanban_cards SET deleted_at = now() WHERE id = $1`,
+      [req.params.id]
+    );
+    await logActivity('share-link', req.params.id, 'card.deleted', { via: 'share_link' });
+    res.json({ deleted: req.params.id });
+  } catch (e) {
+    res.status(pgErrorStatus(e)).json({ error: (e as Error).message });
+  }
+});
+
+// Public MOVE card (drag-drop). Body: { column_id, position }.
+app.post('/api/public/board/:token/cards/:id/move', async (req, res) => {
+  const scope = await guardShareEdit(req.params.token, res);
+  if (!scope) return;
+  if (!(await cardInBoard(req.params.id, scope.boardId))) {
+    return res.status(403).json({ error: 'card_outside_share_scope' });
+  }
+  const b = req.body || {};
+  const newColumnId = b.column_id as string;
+  const newPos = Number(b.position);
+  if (!newColumnId || Number.isNaN(newPos)) {
+    return res.status(400).json({ error: 'column_id + position required' });
+  }
+  if (!(await columnInBoard(newColumnId, scope.boardId))) {
+    return res.status(403).json({ error: 'column_outside_share_scope' });
+  }
+  try {
+    await query(
+      `UPDATE ops.kanban_cards
+          SET column_id = $1, position = $2, updated_at = now()
+        WHERE id = $3 AND deleted_at IS NULL`,
+      [newColumnId, newPos, req.params.id]
+    );
+    await logActivity('share-link', req.params.id, 'card.moved',
+      { column_id: newColumnId, position: newPos, via: 'share_link' });
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(pgErrorStatus(e)).json({ error: (e as Error).message });
+  }
+});
+
+// Public image upload (description paste/drop / dropzone). Used only when
+// share_mode='edit'. Requires the same Cloudflare creds as the authed path.
+app.post('/api/public/board/:token/uploads/image', async (req, res) => {
+  const scope = await guardShareEdit(req.params.token, res);
+  if (!scope) return;
+  const b = req.body || {};
+  let base64 = (b.base64 as string | undefined) || '';
+  let mediaType = (b.media_type as string | undefined) || 'image/jpeg';
+  const fileName = (b.filename as string | undefined) || 'upload';
+  const dataUrl = b.data_url as string | undefined;
+  if (dataUrl && dataUrl.startsWith('data:')) {
+    const m = dataUrl.match(/^data:([^;]+);base64,(.+)$/);
+    if (!m) return res.status(400).json({ error: 'malformed_data_url' });
+    mediaType = m[1]; base64 = m[2];
+  }
+  if (!base64) return res.status(400).json({ error: 'base64_or_data_url_required' });
+  if (!mediaType.startsWith('image/')) return res.status(400).json({ error: 'media_type_must_be_image' });
+  let buf: Buffer;
+  try { buf = Buffer.from(base64, 'base64'); }
+  catch { return res.status(400).json({ error: 'invalid_base64' }); }
+  if (buf.length === 0) return res.status(400).json({ error: 'empty' });
+  if (buf.length > 8 * 1024 * 1024) {
+    return res.status(413).json({ error: 'image_too_large' });
+  }
+  const url = await uploadToCloudflareImages(buf, mediaType, fileName);
+  if (!url) return res.status(503).json({ error: 'cf_images_unavailable' });
+  res.json({ url });
 });
 
 // Create a card. Position defaults to the end of the target column.
@@ -2953,17 +3407,22 @@ app.post('/api/kanban/columns',
     const name = (req.body?.name as string || '').trim();
     const isDone = Boolean(req.body?.is_done);
     const wipLimit = req.body?.wip_limit == null ? null : Number(req.body.wip_limit);
+    const requestedBoard = (req.body?.board_id as string | undefined)?.trim();
     if (!name) return res.status(400).json({ error: 'name required' });
+    const boardId = requestedBoard || (await getDefaultBoardId());
+    if (!boardId) return res.status(400).json({ error: 'no board exists' });
     try {
       const posRow = await query<{ next_pos: number }>(
         `SELECT COALESCE(MAX(position), -1) + 1 AS next_pos
-           FROM ops.kanban_columns WHERE deleted_at IS NULL`
+           FROM ops.kanban_columns
+          WHERE deleted_at IS NULL AND board_id = $1`,
+        [boardId]
       );
       const rows = await query(
-        `INSERT INTO ops.kanban_columns (name, position, is_done, wip_limit)
-         VALUES ($1, $2, $3, $4)
-       RETURNING id, name, position, is_done, wip_limit`,
-        [name, posRow[0].next_pos, isDone, wipLimit]
+        `INSERT INTO ops.kanban_columns (board_id, name, position, is_done, wip_limit)
+         VALUES ($1, $2, $3, $4, $5)
+       RETURNING id, name, position, is_done, wip_limit, board_id`,
+        [boardId, name, posRow[0].next_pos, isDone, wipLimit]
       );
       await logActivity(req.user!.email, null, 'column.created', rows[0] as Record<string, unknown>);
       res.json({ column: rows[0] });

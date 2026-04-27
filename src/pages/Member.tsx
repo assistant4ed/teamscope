@@ -4,7 +4,7 @@ import {
   Loader2, AlertTriangle, ExternalLink, Sun, Clock, Moon,
   Calendar, Kanban, MessageSquare, Zap,
   ArrowDownLeft, ArrowUpRight, MessageCircle,
-  DollarSign, X, Plane, FileBarChart, Flame, Copy,
+  DollarSign, X, Plane, FileBarChart, Flame, Copy, Handshake, CircleDashed,
 } from 'lucide-react';
 import { apiFetch, apiGet, Me } from '../auth';
 
@@ -138,6 +138,7 @@ export default function Member({ me, subscriberId, onBack }: {
           <ActionsCard sub={sub} isBoss={isBoss}
             onChanged={load} onDeleted={onBack} />
         </div>
+        <PromiseTrackerCard subscriberId={sub.id} />
         <RecentReportsCard reports={reports} />
         <MonthlyReviewCard sub={sub} />
         <TelegramMessagesCard messages={messages} />
@@ -1126,6 +1127,127 @@ function ActionButton({ onClick, busy, icon, label, help, danger = false }: {
       {help && <div className="text-xs text-slate-500 mt-0.5 pl-6">{help}</div>}
     </button>
   );
+}
+
+// ---------- Promise tracker (today's morning goals → done) ----------- //
+// One source of truth for "did this member keep what they promised
+// today?" Loaded for today's date specifically; lists each parsed goal
+// with status icons. Boss can manually toggle done for goals never
+// carded (verbal completions). Hidden when there's no morning report.
+interface GoalItem {
+  id: string;
+  position: number;
+  text: string;
+  card_id: string | null;
+  card_done: boolean;
+  card_column_id: string | null;
+  manually_done: boolean;
+  done: boolean;
+}
+
+function PromiseTrackerCard({ subscriberId }: { subscriberId: string }) {
+  const [items, setItems] = useState<GoalItem[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [hasReport, setHasReport] = useState(true);
+  const [busyId, setBusyId] = useState<string | null>(null);
+
+  const load = useCallback(async () => {
+    setLoading(true);
+    try {
+      // First find today's report id for this subscriber.
+      const today = new Date().toISOString().slice(0, 10);
+      const r = await apiGet<{ reports: Array<{ id: string; subscriber_id: string; report_date: string }> }>(
+        `/api/reports/recent?days=1`
+      );
+      const mine = (r.reports || []).find(rr =>
+        rr.subscriber_id === subscriberId && rr.report_date === today);
+      if (!mine) {
+        setHasReport(false);
+        setItems([]);
+        return;
+      }
+      setHasReport(true);
+      const data = await apiGet<{ items: GoalItem[] }>(
+        `/api/reports/${mine.id}/goal-items`
+      );
+      setItems(data.items || []);
+    } catch {
+      setItems([]); setHasReport(false);
+    } finally { setLoading(false); }
+  }, [subscriberId]);
+
+  useEffect(() => { load(); }, [load]);
+
+  async function toggle(itemId: string) {
+    setBusyId(itemId);
+    try {
+      await apiFetch(`/api/report-goal-items/${itemId}/toggle-done`, { method: 'POST' });
+      await load();
+    } finally { setBusyId(null); }
+  }
+
+  const total = items.length;
+  const kept = items.filter(i => i.done).length;
+  const pct = total === 0 ? 0 : Math.round((kept / total) * 100);
+
+  if (loading) {
+    return (
+      <Card title="Today's promises" icon={<Handshake className="w-4 h-4 text-indigo-500" />}>
+        <p className="text-sm text-slate-400">Loading…</p>
+      </Card>
+    );
+  }
+  if (!hasReport || total === 0) {
+    return (
+      <Card title="Today's promises" icon={<Handshake className="w-4 h-4 text-indigo-500" />}>
+        <p className="text-sm text-slate-400">
+          No morning goals filed today yet — promises tracker will show up once goals are in.
+        </p>
+      </Card>
+    );
+  }
+  return (
+    <Card title="Today's promises" icon={<Handshake className="w-4 h-4 text-indigo-500" />}>
+      <div className="flex items-center gap-3 mb-4">
+        <div className="text-2xl font-bold text-slate-900">{kept}<span className="text-slate-400 text-base font-normal"> / {total}</span></div>
+        <div className="flex-1 h-2 rounded-full bg-slate-100 overflow-hidden">
+          <div className={`h-full rounded-full transition-all ${
+            pct === 100 ? 'bg-emerald-500' :
+            pct >= 50 ? 'bg-amber-500' :
+            'bg-slate-400'
+          }`} style={{ width: `${pct}%` }} />
+        </div>
+        <div className="text-xs text-slate-500 tabular-nums">{pct}%</div>
+      </div>
+      <ul className="space-y-2">
+        {items.map(item => (
+          <li key={item.id} className="flex items-center gap-3 text-sm">
+            <GoalStatusIcon item={item} />
+            <span className={`flex-1 ${item.done ? 'line-through text-slate-400' : 'text-slate-700'}`}>
+              {item.text}
+            </span>
+            <button onClick={() => toggle(item.id)} disabled={busyId === item.id}
+              className="text-xs text-slate-400 hover:text-slate-700 px-2 py-0.5 rounded hover:bg-slate-100">
+              {item.manually_done ? 'undo ✓' : 'mark ✓'}
+            </button>
+          </li>
+        ))}
+      </ul>
+    </Card>
+  );
+}
+
+function GoalStatusIcon({ item }: { item: GoalItem }) {
+  if (item.card_done) {
+    return <Check className="w-4 h-4 text-emerald-600 flex-shrink-0" aria-label="Done via card" />;
+  }
+  if (item.manually_done) {
+    return <Check className="w-4 h-4 text-indigo-500 flex-shrink-0" aria-label="Manually marked done" />;
+  }
+  if (item.card_id) {
+    return <CircleDashed className="w-4 h-4 text-amber-500 flex-shrink-0" aria-label="Card open" />;
+  }
+  return <CircleDashed className="w-4 h-4 text-slate-300 flex-shrink-0" aria-label="No card yet" />;
 }
 
 // ---------- Recent reports / assigned cards -------------------------- //

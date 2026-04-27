@@ -2,7 +2,7 @@ import React, { useEffect, useState } from 'react';
 import { apiFetch, apiGet, Me } from '../auth';
 import {
   CheckCircle2, AlertCircle, Clock, Users, ListChecks,
-  AlertTriangle, Send, Loader2,
+  AlertTriangle, Send, Loader2, Handshake,
 } from 'lucide-react';
 
 interface TodayReport {
@@ -39,6 +39,9 @@ interface MissedSubscriber {
   subscriber_id: string; name: string;
   is_off: boolean; missing_slots: string[]; fully_reported: boolean;
 }
+interface PromiseRow {
+  subscriber_id: string; name: string; total: number; kept: number;
+}
 
 export default function Dashboard({ me }: { me: Me }) {
   const [data, setData] = useState<Data | null>(null);
@@ -47,6 +50,7 @@ export default function Dashboard({ me }: { me: Me }) {
   const [missedDate, setMissedDate] = useState<string>('');
   const [digestBusy, setDigestBusy] = useState(false);
   const [digestResult, setDigestResult] = useState<string | null>(null);
+  const [promises, setPromises] = useState<PromiseRow[]>([]);
 
   useEffect(() => {
     apiGet<Data>('/api/dashboard')
@@ -55,6 +59,9 @@ export default function Dashboard({ me }: { me: Me }) {
     apiGet<{ date: string; subscribers: MissedSubscriber[] }>('/api/missed-slots')
       .then(d => { setMissed(d.subscribers); setMissedDate(d.date); })
       .catch(() => {/* silent */});
+    apiGet<{ date: string; members: PromiseRow[] }>('/api/dashboard/promises')
+      .then(d => setPromises(d.members || []))
+      .catch(() => {/* silent — feature is opt-in via a morning report */});
   }, []);
 
   async function dmDigest() {
@@ -87,6 +94,34 @@ export default function Dashboard({ me }: { me: Me }) {
         <Card icon={<ListChecks className="w-5 h-5 text-indigo-600" />} label="Open tasks" value={data.pending.length} />
         <Card icon={<Clock className="w-5 h-5 text-amber-600" />} label="Recent actions" value={data.recentActions.length} />
       </div>
+
+      {promises.length > 0 && (
+        <div className="mb-6 bg-white border border-slate-200 rounded-xl p-5">
+          <div className="flex items-center gap-2 mb-3">
+            <Handshake className="w-5 h-5 text-indigo-600" />
+            <h2 className="text-sm font-semibold text-slate-700 uppercase tracking-wider">
+              Today's promises
+            </h2>
+          </div>
+          <div className="flex flex-wrap gap-2">
+            {promises.map(p => {
+              const pct = p.total === 0 ? 0 : Math.round((p.kept / p.total) * 100);
+              const color = pct === 100
+                ? 'bg-emerald-50 border-emerald-200 text-emerald-800'
+                : pct >= 50
+                  ? 'bg-amber-50 border-amber-200 text-amber-800'
+                  : 'bg-slate-50 border-slate-200 text-slate-600';
+              return (
+                <span key={p.subscriber_id}
+                  className={`inline-flex items-center gap-1.5 text-sm border rounded-full px-3 py-1 ${color}`}>
+                  <span className="font-medium">{p.name}</span>
+                  <span className="tabular-nums">{p.kept}/{p.total}</span>
+                </span>
+              );
+            })}
+          </div>
+        </div>
+      )}
 
       {missed && missed.some(m => !m.is_off && !m.fully_reported) && (
         <div className="mb-8 bg-white border border-amber-200 rounded-xl p-5">

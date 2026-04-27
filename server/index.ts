@@ -257,6 +257,48 @@ app.get('/api/reports/today', async (_req, res) => {
   }
 });
 
+// Promise-loop helper: keep ops.report_goal_items in sync with the
+// `goals` text on a daily_reports row. Each parsed goal line becomes
+// an item indexed by position. Existing items at the same position
+// keep their card_id (so a goal that's already been imported as a card
+// stays linked through small text edits). Items that no longer have a
+// matching position get hard-deleted; unchanged items stay as-is.
+async function syncGoalItems(reportId: string, goalsText: string | null) {
+  const lines = parseGoalLines(goalsText || '');
+  const existing = await query<{ id: string; position: number; text: string }>(
+    `SELECT id, position, text FROM ops.report_goal_items
+      WHERE report_id = $1 ORDER BY position`,
+    [reportId]
+  );
+  const byPos = new Map(existing.map(e => [e.position, e]));
+
+  // Upsert one row per parsed line.
+  for (let i = 0; i < lines.length; i++) {
+    const text = lines[i];
+    const prev = byPos.get(i);
+    if (prev) {
+      if (prev.text !== text) {
+        await query(
+          `UPDATE ops.report_goal_items SET text = $1 WHERE id = $2`,
+          [text, prev.id]
+        );
+      }
+      byPos.delete(i);
+    } else {
+      await query(
+        `INSERT INTO ops.report_goal_items (report_id, position, text)
+         VALUES ($1, $2, $3)
+         ON CONFLICT (report_id, position) DO UPDATE SET text = EXCLUDED.text`,
+        [reportId, i, text]
+      );
+    }
+  }
+  // Anything left in byPos was a position past the new line count → delete.
+  for (const stale of byPos.values()) {
+    await query(`DELETE FROM ops.report_goal_items WHERE id = $1`, [stale.id]);
+  }
+}
+
 // Manually create / upsert a daily-report row (boss only). Lets the
 // boss log a report when the n8n Telegram collector misses it (e.g.
 // the subscriber didn't use Telegram's Reply feature, so the message
@@ -289,7 +331,7 @@ app.post('/api/reports',
       return res.status(400).json({ error: 'at least one report field required' });
     }
     try {
-      const rows = await query(
+      const rows = await query<{ id: string; goals: string | null }>(
         `INSERT INTO ops.daily_reports (${cols.join(', ')}, updated_at)
          VALUES (${placeholders.join(', ')}, now())
          ON CONFLICT (subscriber_id, report_date) DO UPDATE
@@ -299,6 +341,10 @@ app.post('/api/reports',
                    eod_completed, eod_unfinished, eod_hours, updated_at`,
         vals
       );
+      // Keep promise tracker in sync with the goals text.
+      if (b.goals !== undefined) {
+        await syncGoalItems(rows[0].id, rows[0].goals);
+      }
       res.json({ report: rows[0] });
     } catch (e) {
       res.status(pgErrorStatus(e)).json({ error: (e as Error).message });
@@ -365,7 +411,7 @@ app.patch('/api/reports/:id',
     if (sets.length === 0) return res.status(400).json({ error: 'no fields to update' });
     vals.push(id);
     try {
-      const rows = await query(
+      const rows = await query<{ id: string; goals: string | null }>(
         `UPDATE ops.daily_reports SET ${sets.join(', ')}, updated_at = now()
           WHERE id = $${vals.length}
         RETURNING id, subscriber_id, to_char(report_date, 'YYYY-MM-DD') AS report_date,
@@ -374,6 +420,9 @@ app.patch('/api/reports/:id',
         vals
       );
       if (rows.length === 0) return res.status(404).json({ error: 'not_found' });
+      if (b.goals !== undefined) {
+        await syncGoalItems(rows[0].id, rows[0].goals);
+      }
       res.json({ report: rows[0] });
     } catch (e) {
       res.status(pgErrorStatus(e)).json({ error: (e as Error).message });
@@ -3112,6 +3161,98 @@ app.get('/api/public/board/:token/cards/:id/timeline', async (req, res) => {
   }
 });
 
+// ---------- Promise tracker (goal items) ---------------------------- //
+// One goal_item row per parsed line of a morning report's `goals` text.
+// Status of an item is derived: completed if its linked card is in a
+// done column, OR the item was manually marked done. Items without a
+// card_id are still pending until imported or manually completed.
+interface GoalItemView {
+  id: string;
+  position: number;
+  text: string;
+  card_id: string | null;
+  card_done: boolean;
+  card_column_id: string | null;
+  manually_done: boolean;
+  done: boolean;
+}
+
+async function loadGoalItemsForReport(reportId: string): Promise<GoalItemView[]> {
+  return await query<GoalItemView>(
+    `SELECT gi.id, gi.position, gi.text, gi.card_id, gi.manually_done,
+            (c.done_at IS NOT NULL) AS card_done,
+            c.column_id AS card_column_id,
+            (gi.manually_done OR c.done_at IS NOT NULL) AS done
+       FROM ops.report_goal_items gi
+       LEFT JOIN ops.kanban_cards c
+              ON c.id = gi.card_id AND c.deleted_at IS NULL
+      WHERE gi.report_id = $1
+      ORDER BY gi.position`,
+    [reportId]
+  );
+}
+
+app.get('/api/reports/:id/goal-items', async (req, res) => {
+  try {
+    const items = await loadGoalItemsForReport(String(req.params.id));
+    res.json({ items });
+  } catch (e) {
+    res.status(pgErrorStatus(e)).json({ error: (e as Error).message });
+  }
+});
+
+// Toggle the "manually done" flag on a goal item — used when a member
+// completed something verbally without ever creating a card for it.
+app.post('/api/report-goal-items/:id/toggle-done', async (req, res) => {
+  try {
+    const rows = await query<{ id: string; manually_done: boolean }>(
+      `UPDATE ops.report_goal_items
+          SET manually_done = NOT manually_done
+        WHERE id = $1
+       RETURNING id, manually_done`,
+      [String(req.params.id)]
+    );
+    if (rows.length === 0) return res.status(404).json({ error: 'not_found' });
+    res.json({ item: rows[0] });
+  } catch (e) {
+    res.status(pgErrorStatus(e)).json({ error: (e as Error).message });
+  }
+});
+
+// Per-member promise stats for a single date. Drives the Dashboard
+// strip and the per-Member tracker card.
+app.get('/api/dashboard/promises', async (req, res) => {
+  const date = (req.query.date as string | undefined)
+    || new Date().toISOString().slice(0, 10);
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) {
+    return res.status(400).json({ error: 'date must be YYYY-MM-DD' });
+  }
+  try {
+    const rows = await query<{
+      subscriber_id: string; name: string;
+      total: number; kept: number;
+    }>(
+      `SELECT s.id AS subscriber_id, s.name,
+              COUNT(gi.*)::int AS total,
+              COUNT(*) FILTER (
+                WHERE gi.manually_done
+                   OR (c.done_at IS NOT NULL AND c.deleted_at IS NULL)
+              )::int AS kept
+         FROM ops.report_subscribers s
+         JOIN ops.daily_reports dr ON dr.subscriber_id = s.id AND dr.report_date = $1::date
+         JOIN ops.report_goal_items gi ON gi.report_id = dr.id
+         LEFT JOIN ops.kanban_cards c ON c.id = gi.card_id
+        WHERE s.active = true
+        GROUP BY s.id, s.name
+        ORDER BY s.name`,
+      [date]
+    );
+    res.json({ date, members: rows });
+  } catch (e) {
+    res.status(pgErrorStatus(e)).json({ error: (e as Error).message });
+  }
+});
+
 // Create a card. Position defaults to the end of the target column.
 app.post('/api/kanban/cards',
   requireRole('boss', 'pa', 'colleague'),
@@ -3497,7 +3638,8 @@ app.post('/api/kanban/cards/from-report/:report_id',
           [targetColumnId]
         );
         let pos: number = posRow.rows[0].next_pos;
-        for (const title of titles) {
+        for (let goalIdx = 0; goalIdx < titles.length; goalIdx++) {
+          const title = titles[goalIdx];
           const ins = await client.query(
             `INSERT INTO ops.kanban_cards
                (column_id, title, priority, position, created_by,
@@ -3515,6 +3657,14 @@ app.post('/api/kanban/cards/from-report/:report_id',
               [cardId, r.subscriber_id, req.user!.email]
             );
           }
+          // Link the matching goal_item (by position) to this new card
+          // so the promise tracker shows it as carded.
+          await client.query(
+            `UPDATE ops.report_goal_items
+                SET card_id = $1
+              WHERE report_id = $2 AND position = $3 AND card_id IS NULL`,
+            [cardId, reportId, goalIdx]
+          );
           created.push(ins.rows[0]);
         }
         await client.query('COMMIT');

@@ -559,12 +559,14 @@ function CardView({ card, assigneeIds, subsById, canEdit, onClick }: {
         </div>
         {card.priority !== 'medium' && <PriorityFlag priority={card.priority} />}
       </div>
-      {card.description && (
+      {descriptionPreviewText(card.description) && (
         <div className="text-xs text-slate-500 mt-1 line-clamp-2">
-          {card.description}
+          {descriptionPreviewText(card.description)}
         </div>
       )}
-      <CardImageStrip urls={card.image_urls} />
+      <CardImageStrip
+        urls={[...(card.image_urls || []),
+               ...extractDescriptionImageUrls(card.description)]} />
       <div className="mt-2 flex items-center justify-between gap-2">
         <div className="flex -space-x-1">
           {assigneeIds.slice(0, 4).map(sid => (
@@ -778,10 +780,8 @@ function AddCardModal({
           autoFocus
           className="w-full border border-slate-200 rounded-lg px-3 py-2 text-sm" />
       </Field>
-      <Field label="Description" hint="Optional">
-        <textarea value={description} onChange={e => setDescription(e.target.value)}
-          rows={3}
-          className="w-full border border-slate-200 rounded-lg px-3 py-2 text-sm" />
+      <Field label="Description" hint="Optional. Drop or paste images directly into the text.">
+        <DescriptionField value={description} onChange={setDescription} />
       </Field>
       <div className="grid grid-cols-3 gap-3">
         <Field label="Column">
@@ -901,10 +901,8 @@ function EditCardModal({
         <input required value={title} onChange={e => setTitle(e.target.value)}
           className="w-full border border-slate-200 rounded-lg px-3 py-2 text-sm" />
       </Field>
-      <Field label="Description">
-        <textarea value={description} onChange={e => setDescription(e.target.value)}
-          rows={4}
-          className="w-full border border-slate-200 rounded-lg px-3 py-2 text-sm" />
+      <Field label="Description" hint="Drop or paste images directly into the text.">
+        <DescriptionField value={description} onChange={setDescription} />
       </Field>
       <div className="grid grid-cols-2 gap-3">
         <Field label="Priority">
@@ -1035,6 +1033,46 @@ const ErrorBox = ({ msg }: { msg: string }) => (
 const MAX_IMAGES_PER_CARD = 10;
 const MAX_IMAGE_BYTES = 8 * 1024 * 1024;
 
+// Single source of truth for image upload — used by both the card-level
+// ImageDropZone and the in-description paste/drop handler.
+async function uploadImageFile(file: File): Promise<string> {
+  if (file.size > MAX_IMAGE_BYTES) {
+    throw new Error(`${file.name} is larger than 8 MB`);
+  }
+  const dataUrl = await new Promise<string>((resolve, reject) => {
+    const r = new FileReader();
+    r.onload = () => resolve(String(r.result));
+    r.onerror = () => reject(new Error('read failed'));
+    r.readAsDataURL(file);
+  });
+  const res = await apiFetch('/api/uploads/image', {
+    method: 'POST',
+    body: JSON.stringify({ data_url: dataUrl, filename: file.name }),
+  });
+  if (!res.ok) {
+    const body = await res.json().catch(() => ({}));
+    throw new Error(body.error || `upload HTTP ${res.status}`);
+  }
+  const { url } = await res.json();
+  return url as string;
+}
+
+// Pull just the image URLs out of a markdown description so we can
+// render thumbnails / strip them from text previews.
+function extractDescriptionImageUrls(text: string | null | undefined): string[] {
+  if (!text) return [];
+  const out: string[] = [];
+  const re = /!\[[^\]]*\]\(([^)\s]+)\)/g;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(text)) !== null) out.push(m[1]);
+  return out;
+}
+
+function descriptionPreviewText(text: string | null | undefined): string {
+  if (!text) return '';
+  return text.replace(/!\[[^\]]*\]\([^)]+\)/g, '').replace(/\n{3,}/g, '\n\n').trim();
+}
+
 function ImageDropZone({ value, onChange }: {
   value: string[];
   onChange: (urls: string[]) => void;
@@ -1062,27 +1100,8 @@ function ImageDropZone({ value, onChange }: {
     setBusy(true);
     const newUrls: string[] = [];
     for (const f of accepted) {
-      if (f.size > MAX_IMAGE_BYTES) {
-        setErr(`${f.name} is larger than 8 MB.`);
-        continue;
-      }
       try {
-        const dataUrl = await new Promise<string>((resolve, reject) => {
-          const reader = new FileReader();
-          reader.onload = () => resolve(String(reader.result));
-          reader.onerror = () => reject(new Error('read failed'));
-          reader.readAsDataURL(f);
-        });
-        const res = await apiFetch('/api/uploads/image', {
-          method: 'POST',
-          body: JSON.stringify({ data_url: dataUrl, filename: f.name }),
-        });
-        if (!res.ok) {
-          const body = await res.json().catch(() => ({}));
-          throw new Error(body.error || `upload HTTP ${res.status}`);
-        }
-        const { url } = await res.json();
-        newUrls.push(url);
+        newUrls.push(await uploadImageFile(f));
       } catch (e) {
         setErr(`${f.name}: ${(e as Error).message}`);
       }
@@ -1163,6 +1182,114 @@ function ImageDropZone({ value, onChange }: {
       )}
       {err && <p className="mt-2 text-xs text-rose-700">{err}</p>}
     </Field>
+  );
+}
+
+// Description textarea that accepts pasted / dropped images and inserts
+// them as Markdown image syntax at the cursor. Underneath it we render
+// thumbnails of any images found in the description so the user can
+// see what's been attached without leaving edit mode. Removing a
+// thumbnail strips the corresponding `![](url)` from the source.
+function DescriptionField({ value, onChange }: {
+  value: string; onChange: (v: string) => void;
+}) {
+  const ref = useRef<HTMLTextAreaElement>(null);
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+
+  const insertImagesFromFiles = useCallback(async (files: File[]) => {
+    const accepted = files.filter(f => f.type.startsWith('image/'));
+    if (accepted.length === 0) return;
+    setBusy(true); setErr(null);
+    try {
+      const urls: string[] = [];
+      for (const f of accepted) {
+        try { urls.push(await uploadImageFile(f)); }
+        catch (e) { setErr(`${f.name}: ${(e as Error).message}`); }
+      }
+      if (urls.length === 0) return;
+      const md = urls.map(u => `![](${u})`).join('\n');
+      const ta = ref.current;
+      if (!ta) {
+        onChange(value + (value.endsWith('\n') || value === '' ? '' : '\n') + md);
+        return;
+      }
+      const start = ta.selectionStart ?? value.length;
+      const end = ta.selectionEnd ?? value.length;
+      const before = value.slice(0, start);
+      const after = value.slice(end);
+      const leadingNl = before.length > 0 && !before.endsWith('\n') ? '\n' : '';
+      const trailingNl = after.startsWith('\n') || after === '' ? '' : '\n';
+      const next = before + leadingNl + md + trailingNl + after;
+      onChange(next);
+      const cursor = (before + leadingNl + md + trailingNl).length;
+      requestAnimationFrame(() => {
+        ta.focus();
+        ta.setSelectionRange(cursor, cursor);
+      });
+    } finally { setBusy(false); }
+  }, [value, onChange]);
+
+  const descUrls = extractDescriptionImageUrls(value);
+
+  function removeImage(url: string) {
+    const escaped = url.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const re = new RegExp(`!\\[[^\\]]*\\]\\(${escaped}\\)\\n?`, 'g');
+    onChange(value.replace(re, '').replace(/\n{3,}/g, '\n\n'));
+  }
+
+  return (
+    <div>
+      <textarea ref={ref} value={value} onChange={e => onChange(e.target.value)}
+        rows={4}
+        placeholder="Drop, paste (⌘V), or type. Supports Markdown image links."
+        onPaste={e => {
+          const items = e.clipboardData?.items; if (!items) return;
+          const files: File[] = [];
+          for (let i = 0; i < items.length; i++) {
+            const it = items[i];
+            if (it.kind === 'file') {
+              const f = it.getAsFile();
+              if (f && f.type.startsWith('image/')) files.push(f);
+            }
+          }
+          if (files.length > 0) {
+            e.preventDefault();
+            insertImagesFromFiles(files);
+          }
+        }}
+        onDrop={e => {
+          const files = Array.from(e.dataTransfer?.files || [])
+            .filter(f => f.type.startsWith('image/'));
+          if (files.length > 0) {
+            e.preventDefault();
+            insertImagesFromFiles(files);
+          }
+        }}
+        className="w-full border border-slate-200 rounded-lg px-3 py-2 text-sm font-mono" />
+      {busy && (
+        <p className="text-xs text-slate-400 mt-1 flex items-center gap-1">
+          <Loader2 className="w-3 h-3 animate-spin" /> Uploading…
+        </p>
+      )}
+      {err && <p className="text-xs text-rose-700 mt-1">{err}</p>}
+      {descUrls.length > 0 && (
+        <div className="mt-2 grid grid-cols-4 gap-2">
+          {descUrls.map(u => (
+            <div key={u} className="relative group">
+              <img src={u} alt=""
+                className="w-full h-20 object-cover rounded-md border border-slate-200" />
+              <button type="button" onClick={() => removeImage(u)}
+                className="absolute top-1 right-1 bg-slate-900/80 hover:bg-slate-900
+                           text-white rounded-full p-0.5 opacity-0 group-hover:opacity-100 transition"
+                aria-label="Remove image">
+                <X className="w-3 h-3" />
+              </button>
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
   );
 }
 

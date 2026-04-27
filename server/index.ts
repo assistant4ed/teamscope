@@ -2498,6 +2498,90 @@ function escapeMarkdown(s: string): string {
   return s.replace(/([_*`[\]])/g, '\\$1');
 }
 
+// Pull @mention tokens from text. Names are alphanumeric + underscore +
+// hyphen. Stop at whitespace or punctuation. Lowercased for matching.
+function extractMentionHandles(text: string | null | undefined): string[] {
+  if (!text) return [];
+  const out = new Set<string>();
+  const re = /(^|[^\w@])@([A-Za-z][\w-]{0,40})/g;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(text)) !== null) {
+    out.add(m[2].toLowerCase());
+  }
+  return [...out];
+}
+
+// Resolve a list of mention handles to subscriber rows. Match is
+// case-insensitive against the subscriber's full name with whitespace
+// removed (so "@meghanang" matches "Meghan Ang"). Names that don't
+// resolve are silently dropped — no point spamming "no such user".
+async function resolveMentions(
+  handles: string[],
+  excludeEmail?: string,
+): Promise<Array<{ id: string; name: string; telegram_chat_id: number }>> {
+  if (handles.length === 0) return [];
+  const rows = await query<{
+    id: string; name: string; telegram_chat_id: number;
+    email: string | null;
+  }>(
+    `SELECT id, name, telegram_chat_id, email
+       FROM ops.report_subscribers
+      WHERE active = true AND telegram_chat_id IS NOT NULL`
+  );
+  const matched: typeof rows = [];
+  const seen = new Set<string>();
+  for (const r of rows) {
+    const handle = r.name.replace(/\s+/g, '').toLowerCase();
+    if (handles.includes(handle) && !seen.has(r.id)) {
+      if (excludeEmail && r.email && r.email.toLowerCase() === excludeEmail.toLowerCase()) continue;
+      seen.add(r.id);
+      matched.push(r);
+    }
+  }
+  return matched;
+}
+
+// Fire-and-forget DM notifications for newly-mentioned subscribers in a
+// card description or comment. Each recipient gets one message per
+// mention event — caller supplies the contextual title + URL.
+async function notifyMentions(
+  text: string | null,
+  context: { kind: 'card' | 'comment'; cardId: string; cardTitle: string },
+  actorEmail: string,
+) {
+  const handles = extractMentionHandles(text);
+  if (handles.length === 0) return;
+  try {
+    const targets = await resolveMentions(handles, actorEmail);
+    if (targets.length === 0) return;
+    const link = APP_URL ? `\n\n→ ${APP_URL}` : '';
+    const verb = context.kind === 'comment' ? 'mentioned you in a comment on' : 'mentioned you in a card';
+    const body =
+      `🔔 *${escapeMarkdown(actorEmail.split('@')[0])}* ${verb}\n\n` +
+      `_${escapeMarkdown(context.cardTitle)}_${link}`;
+    for (const sub of targets) {
+      const outcome = await sendTelegramMessage(sub.telegram_chat_id, body);
+      console.log(
+        `[teamscope] mention ${sub.name} (${sub.telegram_chat_id}) ` +
+        `via ${context.kind} on card ${context.cardId.slice(0, 8)} → ${outcome}`
+      );
+    }
+  } catch (e) {
+    console.error('[teamscope] mention notify error:', (e as Error).message);
+  }
+}
+
+// Compute the set of mentions added between two text revisions so we
+// only DM on the newly-introduced ones. Used by card description PATCH.
+function newMentionsOnly(prev: string | null | undefined, next: string | null | undefined): string {
+  const prevSet = new Set(extractMentionHandles(prev));
+  const onlyNew = extractMentionHandles(next).filter(h => !prevSet.has(h));
+  if (onlyNew.length === 0) return '';
+  // Synthesize a fake text containing just the new handles so the same
+  // notifyMentions(text, …) extractor downstream picks them up.
+  return onlyNew.map(h => `@${h}`).join(' ');
+}
+
 // Map common pg errors to HTTP 4xx so bad client input doesn't
 // surface as 500. Everything else stays a 500.
 function pgErrorStatus(e: unknown): number {
@@ -3238,6 +3322,14 @@ app.post('/api/kanban/cards/:id/comments',
       );
       await logActivity(req.user!.email, String(req.params.id), 'card.commented',
         { comment_id: rows[0].id, body_preview: body.slice(0, 120) });
+      // Mention DMs — every new comment is its own discrete event so we
+      // don't bother diffing against an "old comment".
+      const titleRow = await query<{ title: string }>(
+        `SELECT title FROM ops.kanban_cards WHERE id = $1`, [String(req.params.id)]
+      );
+      notifyMentions(body,
+        { kind: 'comment', cardId: String(req.params.id), cardTitle: titleRow[0]?.title || '(card)' },
+        req.user!.email);
       res.json({ comment: rows[0] });
     } catch (e) {
       res.status(pgErrorStatus(e)).json({ error: (e as Error).message });
@@ -3327,6 +3419,12 @@ app.post('/api/public/board/:token/cards/:id/comments', async (req, res) => {
     );
     await logActivity('share-link', String(req.params.id), 'card.commented',
       { via: 'share_link', body_preview: body.slice(0, 120) });
+    const titleRow = await query<{ title: string }>(
+      `SELECT title FROM ops.kanban_cards WHERE id = $1`, [String(req.params.id)]
+    );
+    notifyMentions(body,
+      { kind: 'comment', cardId: String(req.params.id), cardTitle: titleRow[0]?.title || '(card)' },
+      'share-link');
     res.json({ comment: rows[0] });
   } catch (e) {
     res.status(pgErrorStatus(e)).json({ error: (e as Error).message });
@@ -3573,6 +3671,8 @@ app.post('/api/kanban/cards',
       });
       // Fire-and-forget: notify new assignees on Telegram.
       notifyAssignment(assigneeIds, { id: card.id, title: card.title }, req.user!.email);
+      notifyMentions(card.description ?? null,
+        { kind: 'card', cardId: card.id, cardTitle: card.title }, req.user!.email);
       res.json({ card, assignee_ids: assigneeIds });
     } catch (e) {
       await client.query('ROLLBACK').catch(() => {});
@@ -3603,6 +3703,16 @@ app.patch('/api/kanban/cards/:id',
     }
     if (sets.length === 0 && !Array.isArray(b.assignee_ids) && !Array.isArray(b.label_ids)) {
       return res.status(400).json({ error: 'no fields to update' });
+    }
+    // Capture the prior description before we overwrite it so we can
+    // diff and only DM newly-introduced @mentions.
+    let priorDescription: string | null = null;
+    if (b.description !== undefined) {
+      const p = await query<{ description: string | null }>(
+        `SELECT description FROM ops.kanban_cards WHERE id = $1`,
+        [String(req.params.id)]
+      );
+      priorDescription = p[0]?.description ?? null;
     }
     const client = await pool.connect();
     try {
@@ -3679,16 +3789,26 @@ app.patch('/api/kanban/cards/:id',
       });
       // Only notify the newly-added assignees so edits don't spam people
       // who were already on the card.
-      if (newlyAssigned.length > 0) {
-        // card may be null if only assignees changed; fetch title if needed.
-        let title = (card?.title as string) || '';
+      let title = (card?.title as string) || '';
+      if (newlyAssigned.length > 0 || b.description !== undefined) {
         if (!title) {
           const t = await query<{ title: string }>(
             `SELECT title FROM ops.kanban_cards WHERE id = $1`, [cardId]
           );
           title = t[0]?.title || '(untitled)';
         }
+      }
+      if (newlyAssigned.length > 0) {
         notifyAssignment(newlyAssigned, { id: cardId, title }, req.user!.email);
+      }
+      // Description-mention DMs: only fire on newly-added handles so
+      // editing a card doesn't ping everyone again.
+      if (b.description !== undefined) {
+        const synth = newMentionsOnly(priorDescription, b.description as string | null);
+        if (synth) {
+          notifyMentions(synth,
+            { kind: 'card', cardId, cardTitle: title }, req.user!.email);
+        }
       }
       res.json({ card: card ?? { id: cardId } });
     } catch (e) {

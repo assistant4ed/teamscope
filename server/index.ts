@@ -135,7 +135,7 @@ async function ensureSchema() {
 // ---------- App ---------------------------------------------------- //
 const app = express();
 app.use(compression());
-app.use(express.json({ limit: '1mb' }));
+app.use(express.json({ limit: '12mb' }));
 
 // HSTS so browsers remember to use HTTPS even after a stray HTTP visit.
 // Only set when the request reached us over HTTPS (Railway sets x-forwarded-proto).
@@ -2031,6 +2031,58 @@ async function uploadToCloudflareImages(
   }
 }
 
+// Cap card image attachments at a sensible number and only accept
+// trusted Cloudflare Images URLs. Any other input becomes an empty
+// array — the upload endpoint is the only legitimate source.
+function sanitizeImageUrls(input: unknown): string[] {
+  if (!Array.isArray(input)) return [];
+  const out: string[] = [];
+  for (const v of input) {
+    if (typeof v !== 'string') continue;
+    if (!v.startsWith('https://imagedelivery.net/')) continue;
+    if (v.length > 400) continue;
+    out.push(v);
+    if (out.length >= 10) break;
+  }
+  return out;
+}
+
+// Thin upload endpoint for the web UI: accept a base64 data URL or a
+// raw base64 + media_type, push to Cloudflare Images, return the public
+// URL. Used by the Board's NewCard / EditCard image drop-zone (drag,
+// paste, or file picker — all funnel here). Auth: any whitelisted user.
+app.post('/api/uploads/image', async (req, res) => {
+  const b = req.body || {};
+  let base64 = (b.base64 as string | undefined) || '';
+  let mediaType = (b.media_type as string | undefined) || 'image/jpeg';
+  const fileName = (b.filename as string | undefined) || 'upload';
+
+  // Accept full data URLs ("data:image/png;base64,...") for convenience.
+  const dataUrl = b.data_url as string | undefined;
+  if (dataUrl && dataUrl.startsWith('data:')) {
+    const m = dataUrl.match(/^data:([^;]+);base64,(.+)$/);
+    if (!m) return res.status(400).json({ error: 'malformed_data_url' });
+    mediaType = m[1];
+    base64 = m[2];
+  }
+  if (!base64) return res.status(400).json({ error: 'base64_or_data_url_required' });
+  if (!mediaType.startsWith('image/')) {
+    return res.status(400).json({ error: 'media_type_must_be_image' });
+  }
+
+  let buf: Buffer;
+  try { buf = Buffer.from(base64, 'base64'); }
+  catch { return res.status(400).json({ error: 'invalid_base64' }); }
+  if (buf.length === 0) return res.status(400).json({ error: 'empty' });
+  if (buf.length > 8 * 1024 * 1024) {
+    return res.status(413).json({ error: 'image_too_large', max_bytes: 8 * 1024 * 1024 });
+  }
+
+  const url = await uploadToCloudflareImages(buf, mediaType, fileName);
+  if (!url) return res.status(503).json({ error: 'cf_images_unavailable' });
+  res.json({ url });
+});
+
 // Vision analysis via Gemini 2.5 Flash. Returns the raw text Claude/Gemini
 // emitted; caller is responsible for JSON-extracting if a structured
 // response was requested.
@@ -2418,7 +2470,7 @@ app.get('/api/kanban/board', async (_req, res) => {
       query(
         `SELECT id, column_id, title, description, priority, position, due_date,
                 created_by, created_at, updated_at, done_at,
-                source_kind, source_ref
+                source_kind, source_ref, image_urls
            FROM ops.kanban_cards
           WHERE deleted_at IS NULL
           ORDER BY column_id, position`
@@ -2464,18 +2516,19 @@ app.post('/api/kanban/cards',
         [columnId]
       );
       const position = positionRow.rows[0].next_pos;
+      const imageUrls = sanitizeImageUrls(b.image_urls);
       const insert = await client.query(
         `INSERT INTO ops.kanban_cards
            (column_id, title, description, priority, position, due_date,
-            created_by, source_kind, source_ref)
+            created_by, source_kind, source_ref, image_urls)
          VALUES ($1, $2, $3, COALESCE($4, 'medium'), $5, $6, $7,
-                 COALESCE($8, 'manual'), $9)
+                 COALESCE($8, 'manual'), $9, $10)
          RETURNING id, column_id, title, description, priority, position,
                    due_date, created_by, created_at, updated_at, done_at,
-                   source_kind, source_ref`,
+                   source_kind, source_ref, image_urls`,
         [columnId, title, b.description ?? null, b.priority ?? null,
          position, b.due_date ?? null, req.user!.email,
-         b.source_kind ?? null, b.source_ref ?? null]
+         b.source_kind ?? null, b.source_ref ?? null, imageUrls]
       );
       const card = insert.rows[0];
       for (const sid of assigneeIds) {
@@ -2514,6 +2567,10 @@ app.patch('/api/kanban/cards/:id',
         sets.push(`${k} = $${sets.length + 1}`);
         vals.push(b[k]);
       }
+    }
+    if (b.image_urls !== undefined) {
+      sets.push(`image_urls = $${sets.length + 1}`);
+      vals.push(sanitizeImageUrls(b.image_urls));
     }
     if (sets.length === 0 && !Array.isArray(b.assignee_ids)) {
       return res.status(400).json({ error: 'no fields to update' });

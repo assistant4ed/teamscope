@@ -1,7 +1,7 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   Plus, X, Users, RefreshCw, MoreHorizontal, Flag,
-  Calendar, Trash2, AlertTriangle, Check,
+  Calendar, Trash2, AlertTriangle, Check, ImagePlus, Loader2,
 } from 'lucide-react';
 import { apiGet, apiFetch, Me } from '../auth';
 
@@ -19,6 +19,7 @@ interface Card {
   created_by: string; created_at: string; updated_at: string;
   done_at: string | null;
   source_kind: string; source_ref: string | null;
+  image_urls: string[];
 }
 interface Assignee { card_id: string; subscriber_id: string; assigned_at: string }
 interface Subscriber {
@@ -563,6 +564,7 @@ function CardView({ card, assigneeIds, subsById, canEdit, onClick }: {
           {card.description}
         </div>
       )}
+      <CardImageStrip urls={card.image_urls} />
       <div className="mt-2 flex items-center justify-between gap-2">
         <div className="flex -space-x-1">
           {assigneeIds.slice(0, 4).map(sid => (
@@ -738,6 +740,7 @@ function AddCardModal({
   const [dueDate, setDueDate] = useState('');
   const [assignees, setAssignees] = useState<string[]>(defaultAssignee ? [defaultAssignee] : []);
   const [targetCol, setTargetCol] = useState(columnId);
+  const [imageUrls, setImageUrls] = useState<string[]>([]);
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState<string | null>(null);
 
@@ -754,6 +757,7 @@ function AddCardModal({
           priority,
           due_date: dueDate || null,
           assignee_ids: assignees,
+          image_urls: imageUrls,
         }),
       });
       if (!res.ok) {
@@ -795,6 +799,7 @@ function AddCardModal({
         </Field>
       </div>
       <AssigneePicker subscribers={subscribers} value={assignees} onChange={setAssignees} />
+      <ImageDropZone value={imageUrls} onChange={setImageUrls} />
       {err && <ErrorBox msg={err} />}
     </ModalShell>
   );
@@ -818,6 +823,7 @@ function EditCardModal({
   const [priority, setPriority] = useState(card.priority);
   const [dueDate, setDueDate] = useState(card.due_date || '');
   const [assignees, setAssignees] = useState<string[]>(initialAssignees);
+  const [imageUrls, setImageUrls] = useState<string[]>(card.image_urls ?? []);
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState<string | null>(null);
   const [confirmDel, setConfirmDel] = useState(false);
@@ -834,6 +840,7 @@ function EditCardModal({
           priority,
           due_date: dueDate || null,
           assignee_ids: assignees,
+          image_urls: imageUrls,
         }),
       });
       if (!res.ok) {
@@ -909,6 +916,7 @@ function EditCardModal({
         </Field>
       </div>
       <AssigneePicker subscribers={subscribers} value={assignees} onChange={setAssignees} />
+      <ImageDropZone value={imageUrls} onChange={setImageUrls} />
       {err && <ErrorBox msg={err} />}
     </ModalShell>
   );
@@ -1020,3 +1028,161 @@ const ErrorBox = ({ msg }: { msg: string }) => (
     {msg}
   </div>
 );
+
+// Drag-drop / paste / click-to-pick image attacher. Each accepted file
+// is uploaded to /api/uploads/image and the returned Cloudflare Images
+// URL is appended to `value`. Caps at 10 attachments per card.
+const MAX_IMAGES_PER_CARD = 10;
+const MAX_IMAGE_BYTES = 8 * 1024 * 1024;
+
+function ImageDropZone({ value, onChange }: {
+  value: string[];
+  onChange: (urls: string[]) => void;
+}) {
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+  const [over, setOver] = useState(false);
+  const fileInput = useRef<HTMLInputElement>(null);
+
+  const upload = useCallback(async (files: File[]) => {
+    if (files.length === 0) return;
+    setErr(null);
+    const room = MAX_IMAGES_PER_CARD - value.length;
+    if (room <= 0) {
+      setErr(`Max ${MAX_IMAGES_PER_CARD} images per card.`);
+      return;
+    }
+    const accepted = files
+      .filter(f => f.type.startsWith('image/'))
+      .slice(0, room);
+    if (accepted.length === 0) {
+      setErr('Only image files are accepted.');
+      return;
+    }
+    setBusy(true);
+    const newUrls: string[] = [];
+    for (const f of accepted) {
+      if (f.size > MAX_IMAGE_BYTES) {
+        setErr(`${f.name} is larger than 8 MB.`);
+        continue;
+      }
+      try {
+        const dataUrl = await new Promise<string>((resolve, reject) => {
+          const reader = new FileReader();
+          reader.onload = () => resolve(String(reader.result));
+          reader.onerror = () => reject(new Error('read failed'));
+          reader.readAsDataURL(f);
+        });
+        const res = await apiFetch('/api/uploads/image', {
+          method: 'POST',
+          body: JSON.stringify({ data_url: dataUrl, filename: f.name }),
+        });
+        if (!res.ok) {
+          const body = await res.json().catch(() => ({}));
+          throw new Error(body.error || `upload HTTP ${res.status}`);
+        }
+        const { url } = await res.json();
+        newUrls.push(url);
+      } catch (e) {
+        setErr(`${f.name}: ${(e as Error).message}`);
+      }
+    }
+    if (newUrls.length > 0) onChange([...value, ...newUrls]);
+    setBusy(false);
+  }, [value, onChange]);
+
+  // Window-level paste listener — image from clipboard pastes into the
+  // open modal regardless of which input has focus.
+  useEffect(() => {
+    function onPaste(e: ClipboardEvent) {
+      const items = e.clipboardData?.items;
+      if (!items) return;
+      const files: File[] = [];
+      for (let i = 0; i < items.length; i++) {
+        const it = items[i];
+        if (it.kind === 'file') {
+          const f = it.getAsFile();
+          if (f && f.type.startsWith('image/')) files.push(f);
+        }
+      }
+      if (files.length > 0) {
+        e.preventDefault();
+        upload(files);
+      }
+    }
+    window.addEventListener('paste', onPaste);
+    return () => window.removeEventListener('paste', onPaste);
+  }, [upload]);
+
+  function remove(url: string) {
+    onChange(value.filter(u => u !== url));
+  }
+
+  return (
+    <Field label={`Images (${value.length}/${MAX_IMAGES_PER_CARD})`}
+      hint="Drop, paste (⌘V), or click to attach. PNG / JPG / GIF / WebP up to 8 MB.">
+      <div
+        onDragOver={e => { e.preventDefault(); setOver(true); }}
+        onDragLeave={() => setOver(false)}
+        onDrop={e => {
+          e.preventDefault(); setOver(false);
+          upload(Array.from(e.dataTransfer?.files || []));
+        }}
+        onClick={() => fileInput.current?.click()}
+        className={`border-2 border-dashed rounded-lg px-3 py-4 text-center cursor-pointer transition
+          ${over
+            ? 'border-indigo-500 bg-indigo-50'
+            : 'border-slate-200 hover:border-slate-300 bg-slate-50/50'}`}>
+        <div className="flex items-center justify-center gap-2 text-xs text-slate-500">
+          {busy
+            ? <><Loader2 className="w-4 h-4 animate-spin" /> Uploading…</>
+            : <><ImagePlus className="w-4 h-4" /> Drop, paste, or click to add images</>}
+        </div>
+        <input ref={fileInput} type="file" accept="image/*" multiple hidden
+          onChange={e => {
+            upload(Array.from(e.target.files || []));
+            e.target.value = '';
+          }} />
+      </div>
+
+      {value.length > 0 && (
+        <div className="mt-3 grid grid-cols-4 gap-2">
+          {value.map(url => (
+            <div key={url} className="relative group">
+              <img src={url} alt=""
+                className="w-full h-20 object-cover rounded-md border border-slate-200" />
+              <button type="button" onClick={() => remove(url)}
+                className="absolute top-1 right-1 bg-slate-900/80 hover:bg-slate-900
+                           text-white rounded-full p-0.5 opacity-0 group-hover:opacity-100 transition"
+                aria-label="Remove image">
+                <X className="w-3 h-3" />
+              </button>
+            </div>
+          ))}
+        </div>
+      )}
+      {err && <p className="mt-2 text-xs text-rose-700">{err}</p>}
+    </Field>
+  );
+}
+
+// Small thumbnail strip rendered inline on the board card.
+function CardImageStrip({ urls }: { urls: string[] }) {
+  if (!urls || urls.length === 0) return null;
+  const shown = urls.slice(0, 3);
+  const extra = urls.length - shown.length;
+  return (
+    <div className="flex gap-1 mt-2">
+      {shown.map(u => (
+        <img key={u} src={u} alt=""
+          className="w-12 h-12 object-cover rounded border border-slate-200" />
+      ))}
+      {extra > 0 && (
+        <div className="w-12 h-12 rounded border border-slate-200 bg-slate-50
+                        text-xs text-slate-500 flex items-center justify-center">
+          +{extra}
+        </div>
+      )}
+    </div>
+  );
+}

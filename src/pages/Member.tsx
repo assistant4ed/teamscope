@@ -14,6 +14,7 @@ interface Subscriber {
   role: string | null; timezone: string;
   email?: string | null;
   language: 'zh' | 'en';
+  template_set_id?: string;
   slot_morning: string; slot_midday: string; slot_eod: string;
   working_days: number[]; active: boolean;
   created_at: string; updated_at?: string;
@@ -844,6 +845,8 @@ function ScheduleCard({ sub, isBoss, onSaved }: {
   const [days, setDays]       = useState<number[]>(sub.working_days ?? []);
   const [active, setActive]   = useState(sub.active);
   const [language, setLanguage] = useState<'zh' | 'en'>(sub.language ?? 'zh');
+  const [templateSetId, setTemplateSetId] = useState<string>(sub.template_set_id ?? 'default');
+  const [templateSets, setTemplateSets] = useState<Array<{ id: string; name: string }>>([]);
   const [busy, setBusy]       = useState(false);
   const [err, setErr]         = useState<string | null>(null);
   const [justSaved, setJustSaved] = useState(false);
@@ -857,7 +860,15 @@ function ScheduleCard({ sub, isBoss, onSaved }: {
     setDays(sub.working_days ?? []);
     setActive(sub.active);
     setLanguage(sub.language ?? 'zh');
+    setTemplateSetId(sub.template_set_id ?? 'default');
   }, [sub.updated_at, sub.id]);
+
+  // Load available template sets (cheap; one round-trip).
+  useEffect(() => {
+    apiGet<{ sets: Array<{ id: string; name: string }> }>('/api/config/template-sets')
+      .then(d => setTemplateSets(d.sets))
+      .catch(() => {});
+  }, []);
 
   function toggleDay(d: number) {
     setDays(prev => prev.includes(d) ? prev.filter(x => x !== d) : [...prev, d].sort());
@@ -876,6 +887,7 @@ function ScheduleCard({ sub, isBoss, onSaved }: {
           working_days: days,
           active,
           language,
+          template_set_id: templateSetId,
         }),
       });
       if (!res.ok) {
@@ -947,6 +959,19 @@ function ScheduleCard({ sub, isBoss, onSaved }: {
             );
           })}
         </div>
+      </Field>
+      <Field label="Question set" hint="Which morning / midday / EOD prompt does the bot send. Edit the text on the Team page.">
+        <select value={templateSetId} onChange={e => setTemplateSetId(e.target.value)}
+          disabled={!isBoss}
+          className="w-full border border-slate-200 rounded-lg px-3 py-2 text-sm bg-white
+                     disabled:bg-slate-50 disabled:text-slate-500 mb-4">
+          {templateSets.length === 0 && (
+            <option value="default">Default</option>
+          )}
+          {templateSets.map(s => (
+            <option key={s.id} value={s.id}>{s.name}</option>
+          ))}
+        </select>
       </Field>
       <label className="flex items-center gap-2 mb-4">
         <input type="checkbox" checked={active} onChange={e => setActive(e.target.checked)}

@@ -6,6 +6,7 @@ interface Subscriber {
   id: string; telegram_chat_id: number; name: string;
   role: string | null; timezone: string;
   language: 'zh' | 'en';
+  template_set_id?: string;
   slot_morning: string; slot_midday: string; slot_eod: string;
   working_days: number[]; active: boolean; created_at: string;
   updated_at?: string;
@@ -166,7 +167,7 @@ export default function Team({ me, onOpenMember }: {
         </div>
       </section>
 
-      <PromptTemplatesSection isBoss={me.role === 'boss'} />
+      <TemplateSetsSection isBoss={me.role === 'boss'} />
 
       <section>
         <h2 className="text-sm font-semibold text-slate-500 uppercase tracking-wider mb-3">
@@ -186,6 +187,206 @@ export default function Team({ me, onOpenMember }: {
 
       <PublicHolidaysSection isBoss={me.role === 'boss'} />
     </div>
+  );
+}
+
+// ---------- Question sets (per-role report prompts) ----------------- //
+// Surfaces ops.report_template_sets + ops.report_prompt_templates_v2.
+// Each set has its own morning / midday / eod prompt in zh and en;
+// boss can edit the text inline. {name} placeholder substitutes the
+// member's name at send time. Members are assigned to a set via the
+// Edit subscriber modal above.
+interface TemplateSet {
+  id: string;
+  name: string;
+  description: string | null;
+  templates: Record<string, Record<string, { text: string; updated_at: string; updated_by: string | null }>>;
+}
+
+function TemplateSetsSection({ isBoss }: { isBoss: boolean }) {
+  const [sets, setSets] = useState<TemplateSet[]>([]);
+  const [activeId, setActiveId] = useState<string>('default');
+  const [activeLang, setActiveLang] = useState<'en' | 'zh'>('en');
+  const [drafts, setDrafts] = useState<Record<string, string>>({});
+  const [savingKey, setSavingKey] = useState<string | null>(null);
+  const [creating, setCreating] = useState(false);
+  const [newId, setNewId] = useState('');
+  const [newName, setNewName] = useState('');
+  const [err, setErr] = useState<string | null>(null);
+
+  const load = useCallback(async () => {
+    try {
+      const d = await apiGet<{ sets: TemplateSet[] }>('/api/config/template-sets');
+      setSets(d.sets);
+      // Reset drafts to server text whenever we (re)load.
+      const next: Record<string, string> = {};
+      for (const s of d.sets) {
+        for (const slot of ['morning','midday','eod']) {
+          for (const lang of ['en','zh']) {
+            next[`${s.id}::${slot}::${lang}`] = s.templates[slot]?.[lang]?.text ?? '';
+          }
+        }
+      }
+      setDrafts(next);
+    } catch (e) { setErr(String(e)); }
+  }, []);
+  useEffect(() => { load(); }, [load]);
+
+  async function saveOne(setId: string, slot: string, lang: string) {
+    const key = `${setId}::${slot}::${lang}`;
+    const text = drafts[key]?.trim();
+    if (!text) return;
+    setSavingKey(key); setErr(null);
+    try {
+      const r = await apiFetch(
+        `/api/config/template-sets/${encodeURIComponent(setId)}/templates/${slot}/${lang}`,
+        { method: 'PATCH', body: JSON.stringify({ template_text: text }) }
+      );
+      if (!r.ok) {
+        const b = await r.json().catch(() => ({}));
+        throw new Error(b.error || `HTTP ${r.status}`);
+      }
+      await load();
+    } catch (e) { setErr((e as Error).message); }
+    finally { setSavingKey(null); }
+  }
+
+  async function createSet(e: React.FormEvent) {
+    e.preventDefault();
+    const id = newId.trim().toLowerCase().replace(/[^a-z0-9_]/g, '_');
+    if (!id || !newName.trim()) return;
+    setErr(null);
+    try {
+      const r = await apiFetch('/api/config/template-sets', {
+        method: 'POST', body: JSON.stringify({ id, name: newName.trim() }),
+      });
+      if (!r.ok) {
+        const b = await r.json().catch(() => ({}));
+        throw new Error(b.error || `HTTP ${r.status}`);
+      }
+      setNewId(''); setNewName(''); setCreating(false);
+      await load();
+      setActiveId(id);
+    } catch (e) { setErr((e as Error).message); }
+  }
+
+  async function deleteSet(id: string) {
+    if (id === 'default') return;
+    if (!window.confirm(`Delete the "${id}" question set? Members on this set will fall back to default.`)) return;
+    try {
+      await apiFetch(`/api/config/template-sets/${encodeURIComponent(id)}`, { method: 'DELETE' });
+      setActiveId('default');
+      await load();
+    } catch (e) { setErr((e as Error).message); }
+  }
+
+  const active = sets.find(s => s.id === activeId);
+
+  return (
+    <section>
+      <h2 className="text-sm font-semibold text-slate-500 uppercase tracking-wider mb-3">
+        Question sets
+      </h2>
+      <div className="bg-white border border-slate-200 rounded-xl p-4">
+        <p className="text-xs text-slate-400 mb-3">
+          Each set is its own morning / midday / EOD prompt in zh + en.
+          Members are assigned to a set in the Edit subscriber dialog above.
+          Use <code className="px-1 bg-slate-100 rounded">{'{name}'}</code> as the placeholder for the member's name.
+        </p>
+        <div className="flex flex-wrap gap-1.5 mb-4">
+          {sets.map(s => (
+            <button key={s.id} onClick={() => setActiveId(s.id)}
+              className={`text-xs px-3 py-1.5 rounded-lg border ${
+                s.id === activeId
+                  ? 'bg-slate-900 text-white border-slate-900'
+                  : 'bg-white text-slate-700 border-slate-200 hover:border-slate-300'}`}>
+              {s.name}
+            </button>
+          ))}
+          {isBoss && (
+            <button onClick={() => setCreating(true)}
+              className="text-xs px-3 py-1.5 rounded-lg border border-dashed border-slate-300 text-slate-500 hover:border-slate-400 hover:text-slate-700">
+              + New set
+            </button>
+          )}
+        </div>
+        {creating && (
+          <form onSubmit={createSet} className="mb-4 flex flex-wrap items-end gap-2">
+            <div>
+              <label className="block text-[11px] text-slate-500 mb-0.5">ID (lowercase, no spaces)</label>
+              <input value={newId} onChange={e => setNewId(e.target.value)}
+                placeholder="marketing"
+                className="border border-slate-200 rounded-lg px-2 py-1.5 text-sm font-mono" />
+            </div>
+            <div className="flex-1 min-w-[180px]">
+              <label className="block text-[11px] text-slate-500 mb-0.5">Display name</label>
+              <input value={newName} onChange={e => setNewName(e.target.value)}
+                placeholder="Marketing"
+                className="w-full border border-slate-200 rounded-lg px-2 py-1.5 text-sm" />
+            </div>
+            <button type="submit"
+              className="px-3 py-1.5 text-sm bg-slate-900 hover:bg-slate-800 text-white rounded-lg">
+              Create
+            </button>
+            <button type="button" onClick={() => setCreating(false)}
+              className="px-2 py-1.5 text-sm text-slate-500 hover:text-slate-800">
+              Cancel
+            </button>
+          </form>
+        )}
+        {active && (
+          <>
+            <div className="flex items-center justify-between mb-3">
+              <div className="inline-flex bg-slate-50 border border-slate-200 rounded-lg p-0.5">
+                <button onClick={() => setActiveLang('en')}
+                  className={`px-3 py-1 text-xs rounded ${activeLang==='en'?'bg-slate-900 text-white':'text-slate-600'}`}>
+                  English
+                </button>
+                <button onClick={() => setActiveLang('zh')}
+                  className={`px-3 py-1 text-xs rounded ${activeLang==='zh'?'bg-slate-900 text-white':'text-slate-600'}`}>
+                  中文
+                </button>
+              </div>
+              {isBoss && active.id !== 'default' && (
+                <button onClick={() => deleteSet(active.id)}
+                  className="text-xs text-rose-600 hover:underline">
+                  Delete this set
+                </button>
+              )}
+            </div>
+            <div className="space-y-3">
+              {(['morning','midday','eod'] as const).map(slot => {
+                const key = `${active.id}::${slot}::${activeLang}`;
+                const orig = active.templates[slot]?.[activeLang]?.text ?? '';
+                const dirty = (drafts[key] ?? '') !== orig;
+                return (
+                  <div key={slot} className="bg-slate-50 border border-slate-200 rounded-lg p-3">
+                    <div className="flex items-center justify-between mb-2">
+                      <div className="text-[11px] font-semibold uppercase tracking-wider text-slate-500">
+                        {slot === 'eod' ? 'End of day' : slot}
+                      </div>
+                      {isBoss && (
+                        <button onClick={() => saveOne(active.id, slot, activeLang)}
+                          disabled={!dirty || savingKey === key}
+                          className="text-xs px-2 py-1 bg-slate-900 hover:bg-slate-800 disabled:opacity-30 text-white rounded">
+                          {savingKey === key ? 'Saving…' : dirty ? 'Save' : 'Saved'}
+                        </button>
+                      )}
+                    </div>
+                    <textarea value={drafts[key] ?? ''}
+                      onChange={e => setDrafts({ ...drafts, [key]: e.target.value })}
+                      rows={6} disabled={!isBoss}
+                      className="w-full font-mono text-xs border border-slate-200 rounded-lg p-2 bg-white
+                                 disabled:bg-slate-50 disabled:text-slate-500" />
+                  </div>
+                );
+              })}
+            </div>
+          </>
+        )}
+        {err && <p className="text-xs text-rose-700 mt-3">{err}</p>}
+      </div>
+    </section>
   );
 }
 
@@ -563,6 +764,14 @@ function EditSubscriberModal({ id, onDone, onClose }: {
   const [days, setDays] = useState<number[]>([1, 2, 3, 4, 5]);
   const [active, setActive] = useState(true);
   const [language, setLanguage] = useState<'zh' | 'en'>('zh');
+  const [templateSetId, setTemplateSetId] = useState<string>('default');
+  const [templateSets, setTemplateSets] = useState<Array<{ id: string; name: string }>>([]);
+
+  useEffect(() => {
+    apiGet<{ sets: Array<{ id: string; name: string }> }>('/api/config/template-sets')
+      .then(d => setTemplateSets(d.sets))
+      .catch(() => {});
+  }, []);
 
   useEffect(() => {
     let cancelled = false;
@@ -584,6 +793,7 @@ function EditSubscriberModal({ id, onDone, onClose }: {
         setDays(d.subscriber.working_days ?? []);
         setActive(d.subscriber.active);
         setLanguage(d.subscriber.language ?? 'zh');
+        setTemplateSetId(d.subscriber.template_set_id ?? 'default');
       } catch (e) {
         if (!cancelled) setErr(String(e));
       } finally {
@@ -614,6 +824,7 @@ function EditSubscriberModal({ id, onDone, onClose }: {
           working_days: days,
           active,
           language,
+          template_set_id: templateSetId,
         }),
       });
       if (!res.ok) {
@@ -721,6 +932,16 @@ function EditSubscriberModal({ id, onDone, onClose }: {
                     );
                   })}
                 </div>
+              </Field>
+
+              <Field label="Question set" hint="Which morning / midday / EOD prompt the bot sends. Manage sets below.">
+                <select value={templateSetId} onChange={e => setTemplateSetId(e.target.value)}
+                  className="w-full border border-slate-200 rounded-lg px-3 py-2 text-sm">
+                  {templateSets.length === 0 && <option value="default">Default</option>}
+                  {templateSets.map(s => (
+                    <option key={s.id} value={s.id}>{s.name}</option>
+                  ))}
+                </select>
               </Field>
 
               <Field label="Working days">

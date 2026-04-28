@@ -639,7 +639,7 @@ app.get('/api/agent/classifications', async (req, res) => {
 app.get('/api/team', async (_req, res) => {
   try {
     const [subscribers, profiles] = await Promise.all([
-      query(`SELECT id, telegram_chat_id, name, role, timezone, email, language,
+      query(`SELECT id, telegram_chat_id, name, role, timezone, email, language, template_set_id,
                     slot_morning, slot_midday, slot_eod, working_days, active, created_at
                FROM ops.report_subscribers ORDER BY active DESC, name`),
       query(`SELECT id, telegram_chat_id, name, role, timezone, active, created_at
@@ -1351,7 +1351,7 @@ app.patch('/api/team/subscribers/:id',
     const allowed = ['name', 'role', 'timezone',
                      'slot_morning', 'slot_midday', 'slot_eod',
                      'working_days', 'active', 'telegram_chat_id',
-                     'email', 'language'] as const;
+                     'email', 'language', 'template_set_id'] as const;
     const sets: string[] = [];
     const vals: unknown[] = [];
     for (const k of allowed) {
@@ -1366,7 +1366,7 @@ app.patch('/api/team/subscribers/:id',
       const rows = await query(
         `UPDATE ops.report_subscribers SET ${sets.join(', ')}, updated_at = now()
           WHERE id = $${vals.length}
-        RETURNING id, telegram_chat_id, name, role, timezone, language,
+        RETURNING id, telegram_chat_id, name, role, timezone, language, template_set_id,
                   slot_morning, slot_midday, slot_eod, working_days, active`,
         vals
       );
@@ -1400,7 +1400,7 @@ app.get('/api/team/subscribers/:id',
     try {
       const [sub, reports] = await Promise.all([
         query(
-          `SELECT id, telegram_chat_id, name, role, timezone, email, language,
+          `SELECT id, telegram_chat_id, name, role, timezone, email, language, template_set_id,
                   slot_morning, slot_midday, slot_eod, working_days,
                   active, created_at, updated_at
              FROM ops.report_subscribers WHERE id = $1`,
@@ -3459,6 +3459,138 @@ app.get('/api/public/board/:token/cards/:id/timeline', async (req, res) => {
     res.status(pgErrorStatus(e)).json({ error: (e as Error).message });
   }
 });
+
+// ---------- Per-role template sets ---------------------------------- //
+// Each subscriber is assigned a set (default / operations /
+// customer_service / developer / …). The Report Prompter joins to fetch
+// the right text per (set, slot, language). Boss can edit the text or
+// add new sets. {name} placeholder is substituted at send time by n8n.
+
+interface TemplateSetRow {
+  id: string; name: string; description: string | null;
+}
+interface TemplateRow {
+  template_set_id: string; slot: string; language: string;
+  template_text: string; updated_at: string; updated_by: string | null;
+}
+
+app.get('/api/config/template-sets', async (_req, res) => {
+  try {
+    const [sets, templates] = await Promise.all([
+      query<TemplateSetRow>(
+        `SELECT id, name, description FROM ops.report_template_sets ORDER BY id`
+      ),
+      query<TemplateRow>(
+        `SELECT template_set_id, slot, language, template_text, updated_at, updated_by
+           FROM ops.report_prompt_templates_v2
+          ORDER BY template_set_id, slot, language`
+      ),
+    ]);
+    // Pivot into a friendly shape: sets[i].templates[slot][language] = text.
+    type PivotedSet = TemplateSetRow & {
+      templates: Record<string, Record<string, { text: string; updated_at: string; updated_by: string | null }>>;
+    };
+    const out: PivotedSet[] = sets.map(s => ({ ...s, templates: {} }));
+    const byId = new Map(out.map(s => [s.id, s]));
+    for (const t of templates) {
+      const set = byId.get(t.template_set_id);
+      if (!set) continue;
+      set.templates[t.slot] = set.templates[t.slot] || {};
+      set.templates[t.slot][t.language] = {
+        text: t.template_text, updated_at: t.updated_at, updated_by: t.updated_by,
+      };
+    }
+    res.json({ sets: out });
+  } catch (e) {
+    res.status(pgErrorStatus(e)).json({ error: (e as Error).message });
+  }
+});
+
+app.post('/api/config/template-sets',
+  requireRole('boss'),
+  async (req, res) => {
+    const id = ((req.body?.id as string) || '').trim().toLowerCase();
+    const name = ((req.body?.name as string) || '').trim();
+    const description = (req.body?.description as string | undefined)?.trim() || null;
+    if (!/^[a-z][a-z0-9_]*$/.test(id)) {
+      return res.status(400).json({ error: 'id must be lowercase alphanumeric+underscore, start with a letter' });
+    }
+    if (!name) return res.status(400).json({ error: 'name required' });
+    try {
+      await query(
+        `INSERT INTO ops.report_template_sets (id, name, description)
+         VALUES ($1, $2, $3)`,
+        [id, name, description]
+      );
+      // Seed the new set by copying default's templates so the boss has
+      // something to edit instead of an empty form.
+      await query(
+        `INSERT INTO ops.report_prompt_templates_v2
+              (template_set_id, slot, language, template_text)
+         SELECT $1, slot, language, template_text
+           FROM ops.report_prompt_templates_v2
+          WHERE template_set_id = 'default'`,
+        [id]
+      );
+      res.json({ set: { id, name, description } });
+    } catch (e) {
+      res.status(pgErrorStatus(e)).json({ error: (e as Error).message });
+    }
+  }
+);
+
+app.delete('/api/config/template-sets/:id',
+  requireRole('boss'),
+  async (req, res) => {
+    if (req.params.id === 'default') {
+      return res.status(409).json({ error: 'cannot_delete_default_set' });
+    }
+    try {
+      // Members on the deleted set fall back to default automatically.
+      await query(
+        `UPDATE ops.report_subscribers SET template_set_id = 'default'
+          WHERE template_set_id = $1`,
+        [String(req.params.id)]
+      );
+      await query(`DELETE FROM ops.report_template_sets WHERE id = $1`, [String(req.params.id)]);
+      res.json({ deleted: req.params.id });
+    } catch (e) {
+      res.status(pgErrorStatus(e)).json({ error: (e as Error).message });
+    }
+  }
+);
+
+app.patch('/api/config/template-sets/:id/templates/:slot/:language',
+  requireRole('boss'),
+  async (req, res) => {
+    const text = ((req.body?.template_text as string) || '').trim();
+    if (!text) return res.status(400).json({ error: 'template_text required' });
+    const slot = String(req.params.slot);
+    const lang = String(req.params.language);
+    if (!['morning','midday','eod'].includes(slot)) {
+      return res.status(400).json({ error: 'slot must be morning|midday|eod' });
+    }
+    if (!['zh','en'].includes(lang)) {
+      return res.status(400).json({ error: 'language must be zh|en' });
+    }
+    try {
+      const rows = await query<TemplateRow>(
+        `INSERT INTO ops.report_prompt_templates_v2
+              (template_set_id, slot, language, template_text, updated_by)
+         VALUES ($1, $2, $3, $4, $5)
+         ON CONFLICT (template_set_id, slot, language) DO UPDATE
+           SET template_text = EXCLUDED.template_text,
+               updated_by = EXCLUDED.updated_by,
+               updated_at = now()
+       RETURNING template_set_id, slot, language, template_text, updated_at, updated_by`,
+        [String(req.params.id), slot, lang, text, req.user!.email]
+      );
+      res.json({ template: rows[0] });
+    } catch (e) {
+      res.status(pgErrorStatus(e)).json({ error: (e as Error).message });
+    }
+  }
+);
 
 // ---------- Global search (⌘K) -------------------------------------- //
 // Single endpoint that searches across cards, reports, and members.

@@ -1,7 +1,7 @@
 import React, { useCallback, useEffect, useState } from 'react';
 import {
   LayoutDashboard, ListChecks, ClipboardList, Users, LogOut, Menu, X,
-  Bot, Activity as ActivityIcon, Kanban, Search,
+  Bot, Activity as ActivityIcon, Kanban, Search, Mail,
 } from 'lucide-react';
 import { Me, signOut } from './auth';
 import Dashboard from './pages/Dashboard';
@@ -12,10 +12,11 @@ import Team from './pages/Team';
 import Member from './pages/Member';
 import Agent from './pages/Agent';
 import Activity from './pages/Activity';
+import Support from './pages/Support';
 import SearchPalette, { ShortcutCheatsheet, type SearchHit } from './SearchPalette';
 import NotificationsBell from './NotificationsBell';
 
-type Tab = 'dashboard' | 'agent' | 'board' | 'tasks' | 'reports' | 'activity' | 'team';
+type Tab = 'dashboard' | 'agent' | 'board' | 'tasks' | 'reports' | 'activity' | 'team' | 'support';
 
 const NAV: { id: Tab; label: string; icon: React.ReactNode }[] = [
   { id: 'dashboard', label: 'Dashboard',    icon: <LayoutDashboard className="w-5 h-5" /> },
@@ -24,6 +25,7 @@ const NAV: { id: Tab; label: string; icon: React.ReactNode }[] = [
   { id: 'tasks',     label: 'Queue',        icon: <ListChecks      className="w-5 h-5" /> },
   { id: 'reports',   label: 'Work Reports', icon: <ClipboardList   className="w-5 h-5" /> },
   { id: 'activity',  label: 'Activity',     icon: <ActivityIcon    className="w-5 h-5" /> },
+  { id: 'support',   label: 'Support',      icon: <Mail            className="w-5 h-5" /> },
   { id: 'team',      label: 'Team',         icon: <Users           className="w-5 h-5" /> },
 ];
 
@@ -90,6 +92,7 @@ export default function Shell({ me }: { me: Me }) {
     tasks:     <Tasks me={me} />,
     reports:   <Reports me={me} />,
     activity:  <Activity />,
+    support:   <Support me={me} />,
     team:      <Team me={me} onOpenMember={id => setMemberId(id)} />,
   }[tab];
 

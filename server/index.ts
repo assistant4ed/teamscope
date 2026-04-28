@@ -2987,6 +2987,372 @@ app.get('/api/admin/email-logs', requireRole('boss'), async (req, res) => {
 // (end email subsystem)
 // =================================================================== //
 
+// =================================================================== //
+// Support inbox + AI draft replies + KB                              //
+// =================================================================== //
+// Mirrors Clipy AI's app/api/v1/support.py concept: anyone can file a
+// ticket, staff thread replies, AI can draft a reply grounded in
+// ops.support_kb facts. Each staff reply DMs the requester via the
+// support.ticket_replied email event.
+
+interface TicketRow {
+  id: string; subject: string;
+  requester_name: string; requester_email: string;
+  status: 'open' | 'pending' | 'resolved' | 'closed';
+  assignee_email: string | null;
+  source: string; language: 'en' | 'zh';
+  created_at: string; updated_at: string; closed_at: string | null;
+}
+
+app.get('/api/support/tickets', async (req, res) => {
+  const status = (req.query.status as string | undefined)?.trim();
+  const filters: string[] = [];
+  const vals: unknown[] = [];
+  if (status && ['open','pending','resolved','closed'].includes(status)) {
+    filters.push(`status = $${vals.length + 1}`);
+    vals.push(status);
+  }
+  const where = filters.length > 0 ? `WHERE ${filters.join(' AND ')}` : '';
+  try {
+    const rows = await query<TicketRow & { message_count: number; last_message_at: string | null }>(
+      `SELECT t.*,
+              (SELECT COUNT(*)::int FROM ops.support_messages m WHERE m.ticket_id = t.id) AS message_count,
+              (SELECT MAX(created_at) FROM ops.support_messages m WHERE m.ticket_id = t.id) AS last_message_at
+         FROM ops.support_tickets t
+         ${where}
+        ORDER BY
+          CASE WHEN t.status IN ('open','pending') THEN 0 ELSE 1 END,
+          t.updated_at DESC
+        LIMIT 100`,
+      vals
+    );
+    res.json({ tickets: rows });
+  } catch (e) {
+    res.status(pgErrorStatus(e)).json({ error: (e as Error).message });
+  }
+});
+
+app.post('/api/support/tickets', async (req, res) => {
+  const b = req.body || {};
+  const subject = ((b.subject as string) || '').trim().slice(0, 200);
+  const body = ((b.body as string) || '').trim();
+  const requesterName = ((b.requester_name as string) || req.user!.email.split('@')[0]).trim();
+  const requesterEmail = ((b.requester_email as string) || req.user!.email).trim().toLowerCase();
+  const language = ((b.language as string) === 'zh' ? 'zh' : 'en');
+  if (!subject || !body) return res.status(400).json({ error: 'subject + body required' });
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const ins = await client.query<TicketRow>(
+      `INSERT INTO ops.support_tickets
+         (subject, requester_name, requester_email, source, language)
+       VALUES ($1, $2, $3, 'web', $4)
+       RETURNING *`,
+      [subject, requesterName, requesterEmail, language]
+    );
+    const ticket = ins.rows[0];
+    await client.query(
+      `INSERT INTO ops.support_messages (ticket_id, author_email, author_kind, body)
+       VALUES ($1, $2, 'requester', $3)`,
+      [ticket.id, requesterEmail, body]
+    );
+    await client.query('COMMIT');
+    // Notify the boss in-app so the inbox isn't checked manually.
+    const bossUsers = Object.values(USERS).filter(u => u.role === 'boss');
+    for (const boss of bossUsers) {
+      await createNotification({
+        recipientEmail: boss.email,
+        kind: 'support.ticket_received',
+        title: `New support ticket: ${subject}`,
+        body: `From ${requesterName}`,
+        linkUrl: APP_URL ? `${APP_URL}/support/${ticket.id}` : null,
+      });
+    }
+    res.json({ ticket });
+  } catch (e) {
+    await client.query('ROLLBACK').catch(() => {});
+    res.status(pgErrorStatus(e)).json({ error: (e as Error).message });
+  } finally {
+    client.release();
+  }
+});
+
+app.get('/api/support/tickets/:id', async (req, res) => {
+  try {
+    const tickets = await query<TicketRow>(
+      `SELECT * FROM ops.support_tickets WHERE id = $1`,
+      [String(req.params.id)]
+    );
+    if (tickets.length === 0) return res.status(404).json({ error: 'not_found' });
+    const messages = await query(
+      `SELECT id, ticket_id, author_email, author_kind, body, created_at
+         FROM ops.support_messages
+        WHERE ticket_id = $1
+        ORDER BY created_at`,
+      [String(req.params.id)]
+    );
+    res.json({ ticket: tickets[0], messages });
+  } catch (e) {
+    res.status(pgErrorStatus(e)).json({ error: (e as Error).message });
+  }
+});
+
+app.post('/api/support/tickets/:id/messages',
+  requireRole('boss', 'pa'),
+  async (req, res) => {
+    const body = ((req.body?.body as string) || '').trim();
+    if (!body) return res.status(400).json({ error: 'body required' });
+    try {
+      const tickets = await query<TicketRow>(
+        `SELECT * FROM ops.support_tickets WHERE id = $1`,
+        [String(req.params.id)]
+      );
+      if (tickets.length === 0) return res.status(404).json({ error: 'not_found' });
+      const ticket = tickets[0];
+      const ins = await query(
+        `INSERT INTO ops.support_messages (ticket_id, author_email, author_kind, body)
+         VALUES ($1, $2, 'staff', $3)
+         RETURNING id, ticket_id, author_email, author_kind, body, created_at`,
+        [ticket.id, req.user!.email, body]
+      );
+      // Bump status to pending so it leaves "new" view; close manually via PATCH.
+      await query(
+        `UPDATE ops.support_tickets
+            SET status = CASE WHEN status = 'open' THEN 'pending' ELSE status END,
+                updated_at = now()
+          WHERE id = $1`,
+        [ticket.id]
+      );
+      // Email the requester via the catalog event.
+      const ticketUrl = APP_URL ? `${APP_URL}/support/${ticket.id}` : '';
+      sendEmail({
+        eventId: 'support.ticket_replied',
+        recipientEmail: ticket.requester_email,
+        language: ticket.language,
+        context: {
+          recipient_name: ticket.requester_name,
+          ticket_subject: ticket.subject,
+          ticket_url: ticketUrl,
+          reply_preview: body.slice(0, 200),
+        },
+        actorEmail: req.user!.email,
+      }).catch(e => console.error('[teamscope] sendEmail support.ticket_replied:', (e as Error).message));
+      res.json({ message: ins[0] });
+    } catch (e) {
+      res.status(pgErrorStatus(e)).json({ error: (e as Error).message });
+    }
+  }
+);
+
+// AI draft reply: pulls active KB entries, hands the thread + KB to
+// Claude, returns a draft string. Doesn't post — staff edits and posts
+// via the regular messages endpoint.
+app.post('/api/support/tickets/:id/draft',
+  requireRole('boss', 'pa'),
+  async (req, res) => {
+    if (!ANTHROPIC_API_KEY) {
+      return res.status(503).json({ error: 'anthropic_disabled' });
+    }
+    try {
+      const tickets = await query<TicketRow>(
+        `SELECT * FROM ops.support_tickets WHERE id = $1`,
+        [String(req.params.id)]
+      );
+      if (tickets.length === 0) return res.status(404).json({ error: 'not_found' });
+      const ticket = tickets[0];
+      const messages = await query<{ author_kind: string; author_email: string; body: string; created_at: string }>(
+        `SELECT author_kind, author_email, body, created_at
+           FROM ops.support_messages
+          WHERE ticket_id = $1
+          ORDER BY created_at`,
+        [ticket.id]
+      );
+      const kb = await query<{ title: string; body: string }>(
+        `SELECT title, body FROM ops.support_kb
+          WHERE is_active = true ORDER BY position, created_at`
+      );
+      const kbBlock = kb.length === 0
+        ? '(No KB entries — answer from general TeamScope knowledge only.)'
+        : kb.map(e => `### ${e.title}\n${e.body}`).join('\n\n');
+      const threadBlock = messages.map(m => {
+        const who = m.author_kind === 'requester' ? 'Customer'
+          : m.author_kind === 'staff' ? 'Staff'
+          : m.author_kind === 'ai_draft' ? 'AI draft'
+          : 'System';
+        return `--- ${who} (${m.author_email}) at ${m.created_at} ---\n${m.body}`;
+      }).join('\n\n');
+
+      const system =
+        "You are a support assistant for TeamScope, a Telegram-bot-driven " +
+        "ops + Kanban tool used by a small design studio. Your job is to draft " +
+        "a single reply to a customer support ticket.\n\n" +
+        "RULES — STRICT:\n" +
+        "1. Read the KB section below carefully. Ground money / fee / policy / " +
+        "feature questions in those facts. Do not invent numbers, prices, or policy.\n" +
+        "2. If the answer isn't in the KB and you'd otherwise have to guess, say " +
+        "\"Let me check this with the team and follow up today\" and stop.\n" +
+        "3. Be concise: 1 short paragraph or a 2-3 line bulleted list. Skip pleasantries.\n" +
+        "4. End with one concrete next step the customer can take.\n" +
+        "5. Match the customer's language — if their last message is in Chinese, reply in " +
+        "traditional Chinese; otherwise English.\n" +
+        "6. Output the reply text only. No subject line. No salutations like 'Dear X'.\n\n" +
+        "KB facts:\n---\n" +
+        kbBlock +
+        "\n---\n";
+      const user =
+        `Ticket subject: ${ticket.subject}\n` +
+        `Requester language: ${ticket.language}\n\n` +
+        `Conversation so far:\n${threadBlock}\n\n` +
+        `Draft the next reply now.`;
+
+      const upstream = await fetch('https://api.anthropic.com/v1/messages', {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          'anthropic-version': '2023-06-01',
+          'x-api-key': ANTHROPIC_API_KEY,
+        },
+        body: JSON.stringify({
+          model: 'claude-sonnet-4-6',
+          max_tokens: 800,
+          system,
+          messages: [{ role: 'user', content: user }],
+        }),
+      });
+      const data = await upstream.json().catch(() => ({} as Record<string, unknown>));
+      if (!upstream.ok) {
+        return res.status(502).json({ error: 'anthropic_error', detail: data });
+      }
+      const draft = (data as { content?: Array<{ text?: string }> })?.content?.[0]?.text || '';
+      // Persist the draft as a non-published message so the staff sees it
+      // in the thread and can copy/edit before posting.
+      const ins = await query(
+        `INSERT INTO ops.support_messages (ticket_id, author_email, author_kind, body)
+         VALUES ($1, $2, 'ai_draft', $3)
+         RETURNING id, ticket_id, author_email, author_kind, body, created_at`,
+        [ticket.id, req.user!.email, draft.trim()]
+      );
+      res.json({ draft: draft.trim(), message: ins[0] });
+    } catch (e) {
+      res.status(pgErrorStatus(e)).json({ error: (e as Error).message });
+    }
+  }
+);
+
+app.patch('/api/support/tickets/:id',
+  requireRole('boss', 'pa'),
+  async (req, res) => {
+    const b = req.body || {};
+    const sets: string[] = [];
+    const vals: unknown[] = [];
+    if (typeof b.status === 'string' && ['open','pending','resolved','closed'].includes(b.status)) {
+      sets.push(`status = $${sets.length + 1}`);
+      vals.push(b.status);
+      if (b.status === 'closed' || b.status === 'resolved') {
+        sets.push(`closed_at = now()`);
+      }
+    }
+    if (typeof b.assignee_email === 'string' || b.assignee_email === null) {
+      sets.push(`assignee_email = $${sets.length + 1}`);
+      vals.push(b.assignee_email);
+    }
+    if (typeof b.subject === 'string' && b.subject.trim()) {
+      sets.push(`subject = $${sets.length + 1}`);
+      vals.push(b.subject.trim().slice(0, 200));
+    }
+    if (sets.length === 0) return res.status(400).json({ error: 'no fields' });
+    sets.push(`updated_at = now()`);
+    vals.push(String(req.params.id));
+    try {
+      const rows = await query<TicketRow>(
+        `UPDATE ops.support_tickets SET ${sets.join(', ')}
+          WHERE id = $${vals.length}
+       RETURNING *`,
+        vals
+      );
+      if (rows.length === 0) return res.status(404).json({ error: 'not_found' });
+      res.json({ ticket: rows[0] });
+    } catch (e) {
+      res.status(pgErrorStatus(e)).json({ error: (e as Error).message });
+    }
+  }
+);
+
+// ---- Support KB (boss-managed) ------------------------------------ //
+app.get('/api/support/kb', async (_req, res) => {
+  try {
+    const rows = await query(
+      `SELECT id, title, body, is_active, position, updated_at
+         FROM ops.support_kb ORDER BY position, created_at`
+    );
+    res.json({ entries: rows });
+  } catch (e) {
+    res.status(pgErrorStatus(e)).json({ error: (e as Error).message });
+  }
+});
+
+app.post('/api/support/kb', requireRole('boss'), async (req, res) => {
+  const title = ((req.body?.title as string) || '').trim().slice(0, 200);
+  const body = ((req.body?.body as string) || '').trim();
+  if (!title || !body) return res.status(400).json({ error: 'title + body required' });
+  try {
+    const posRow = await query<{ next_pos: number }>(
+      `SELECT COALESCE(MAX(position), -1) + 1 AS next_pos FROM ops.support_kb`
+    );
+    const rows = await query(
+      `INSERT INTO ops.support_kb (title, body, position)
+       VALUES ($1, $2, $3) RETURNING id, title, body, is_active, position, updated_at`,
+      [title, body, posRow[0].next_pos]
+    );
+    res.json({ entry: rows[0] });
+  } catch (e) {
+    res.status(pgErrorStatus(e)).json({ error: (e as Error).message });
+  }
+});
+
+app.patch('/api/support/kb/:id', requireRole('boss'), async (req, res) => {
+  const b = req.body || {};
+  const sets: string[] = [];
+  const vals: unknown[] = [];
+  if (typeof b.title === 'string' && b.title.trim()) {
+    sets.push(`title = $${sets.length + 1}`); vals.push(b.title.trim().slice(0, 200));
+  }
+  if (typeof b.body === 'string' && b.body.trim()) {
+    sets.push(`body = $${sets.length + 1}`); vals.push(b.body.trim());
+  }
+  if (typeof b.is_active === 'boolean') {
+    sets.push(`is_active = $${sets.length + 1}`); vals.push(b.is_active);
+  }
+  if (sets.length === 0) return res.status(400).json({ error: 'no fields' });
+  sets.push(`updated_at = now()`);
+  vals.push(String(req.params.id));
+  try {
+    const rows = await query(
+      `UPDATE ops.support_kb SET ${sets.join(', ')}
+        WHERE id = $${vals.length}
+     RETURNING id, title, body, is_active, position, updated_at`,
+      vals
+    );
+    if (rows.length === 0) return res.status(404).json({ error: 'not_found' });
+    res.json({ entry: rows[0] });
+  } catch (e) {
+    res.status(pgErrorStatus(e)).json({ error: (e as Error).message });
+  }
+});
+
+app.delete('/api/support/kb/:id', requireRole('boss'), async (req, res) => {
+  try {
+    await query(`DELETE FROM ops.support_kb WHERE id = $1`, [String(req.params.id)]);
+    res.json({ deleted: req.params.id });
+  } catch (e) {
+    res.status(pgErrorStatus(e)).json({ error: (e as Error).message });
+  }
+});
+
+// =================================================================== //
+// (end support inbox)
+// =================================================================== //
+
 // Notify a set of subscribers about a card assignment. Runs outside
 // the user-facing request path — never awaited from the endpoint so
 // a slow Telegram API call does not delay the HTTP response.

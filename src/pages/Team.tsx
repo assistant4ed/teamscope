@@ -188,7 +188,159 @@ export default function Team({ me, onOpenMember }: {
       <PublicHolidaysSection isBoss={me.role === 'boss'} />
 
       {me.role === 'boss' && <EmailAdminSection />}
+      {me.role === 'boss' && <SupportKbSection />}
     </div>
+  );
+}
+
+// ---------- Support KB (boss-managed AI grounding facts) ----------- //
+interface KbEntry {
+  id: string; title: string; body: string;
+  is_active: boolean; position: number; updated_at: string;
+}
+
+function SupportKbSection() {
+  const [entries, setEntries] = useState<KbEntry[]>([]);
+  const [creating, setCreating] = useState(false);
+  const [newTitle, setNewTitle] = useState('');
+  const [newBody, setNewBody] = useState('');
+  const [editId, setEditId] = useState<string | null>(null);
+  const [editDraft, setEditDraft] = useState<{ title: string; body: string }>({ title: '', body: '' });
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+
+  const load = useCallback(async () => {
+    try {
+      const d = await apiGet<{ entries: KbEntry[] }>('/api/support/kb');
+      setEntries(d.entries);
+    } catch (e) { setErr(String(e)); }
+  }, []);
+  useEffect(() => { load(); }, [load]);
+
+  async function create(e: React.FormEvent) {
+    e.preventDefault();
+    if (!newTitle.trim() || !newBody.trim()) return;
+    setBusy(true); setErr(null);
+    try {
+      const r = await apiFetch('/api/support/kb', {
+        method: 'POST', body: JSON.stringify({ title: newTitle.trim(), body: newBody.trim() }),
+      });
+      if (!r.ok) throw new Error(`HTTP ${r.status}`);
+      setNewTitle(''); setNewBody(''); setCreating(false);
+      load();
+    } catch (e) { setErr((e as Error).message); }
+    finally { setBusy(false); }
+  }
+
+  async function toggle(entry: KbEntry) {
+    await apiFetch(`/api/support/kb/${entry.id}`, {
+      method: 'PATCH', body: JSON.stringify({ is_active: !entry.is_active }),
+    });
+    load();
+  }
+
+  async function saveEdit(id: string) {
+    if (!editDraft.title.trim() || !editDraft.body.trim()) return;
+    await apiFetch(`/api/support/kb/${id}`, {
+      method: 'PATCH', body: JSON.stringify(editDraft),
+    });
+    setEditId(null);
+    load();
+  }
+
+  async function remove(id: string) {
+    if (!window.confirm('Delete this KB entry?')) return;
+    await apiFetch(`/api/support/kb/${id}`, { method: 'DELETE' });
+    load();
+  }
+
+  return (
+    <section>
+      <h2 className="text-sm font-semibold text-slate-500 uppercase tracking-wider mb-3">
+        Support knowledge base
+      </h2>
+      <div className="bg-white border border-slate-200 rounded-xl p-4">
+        <p className="text-xs text-slate-400 mb-3">
+          Facts the AI draft-reply on the Support page grounds answers in.
+          Active entries are concatenated and appended to Claude's system prompt
+          so money / policy / fee answers don't get invented.
+        </p>
+        {creating ? (
+          <form onSubmit={create} className="border border-slate-200 rounded-lg p-3 mb-4 space-y-2">
+            <input value={newTitle} onChange={e => setNewTitle(e.target.value)}
+              placeholder="Title (e.g. Refund policy)"
+              className="w-full border border-slate-200 rounded-lg px-2 py-1.5 text-sm" />
+            <textarea value={newBody} onChange={e => setNewBody(e.target.value)}
+              placeholder="The fact, in 2-4 sentences. Be precise about numbers and conditions."
+              rows={4}
+              className="w-full border border-slate-200 rounded-lg px-2 py-1.5 text-sm" />
+            <div className="flex items-center justify-end gap-2">
+              <button type="button" onClick={() => setCreating(false)}
+                className="text-xs text-slate-500 hover:text-slate-800">Cancel</button>
+              <button type="submit" disabled={!newTitle.trim() || !newBody.trim() || busy}
+                className="px-3 py-1.5 text-xs bg-slate-900 hover:bg-slate-800 disabled:opacity-30 text-white rounded-lg">
+                {busy ? 'Saving…' : 'Add entry'}
+              </button>
+            </div>
+          </form>
+        ) : (
+          <button onClick={() => setCreating(true)}
+            className="mb-4 inline-flex items-center gap-1 text-xs px-2 py-1 text-slate-500 border border-dashed border-slate-300 rounded hover:border-slate-400 hover:text-slate-700">
+            + New entry
+          </button>
+        )}
+        {entries.length === 0 ? (
+          <p className="text-xs text-slate-400 italic">No KB entries yet.</p>
+        ) : (
+          <ul className="divide-y divide-slate-100">
+            {entries.map(en => (
+              <li key={en.id} className="py-3">
+                {editId === en.id ? (
+                  <div className="space-y-2">
+                    <input value={editDraft.title} onChange={e => setEditDraft({ ...editDraft, title: e.target.value })}
+                      className="w-full border border-slate-200 rounded-lg px-2 py-1.5 text-sm font-medium" />
+                    <textarea value={editDraft.body} onChange={e => setEditDraft({ ...editDraft, body: e.target.value })}
+                      rows={6}
+                      className="w-full border border-slate-200 rounded-lg px-2 py-1.5 text-sm" />
+                    <div className="flex items-center justify-end gap-2">
+                      <button onClick={() => setEditId(null)}
+                        className="text-xs text-slate-500 hover:text-slate-800">Cancel</button>
+                      <button onClick={() => saveEdit(en.id)}
+                        className="px-3 py-1 text-xs bg-slate-900 hover:bg-slate-800 text-white rounded">
+                        Save
+                      </button>
+                    </div>
+                  </div>
+                ) : (
+                  <div className="flex items-start justify-between gap-3">
+                    <div className="flex-1 min-w-0">
+                      <div className="flex items-center gap-2 mb-1">
+                        <h4 className={`text-sm font-medium ${en.is_active ? 'text-slate-800' : 'text-slate-400 line-through'}`}>
+                          {en.title}
+                        </h4>
+                        {!en.is_active && <span className="text-[10px] text-slate-400">disabled</span>}
+                      </div>
+                      <p className="text-xs text-slate-600 whitespace-pre-wrap">{en.body}</p>
+                    </div>
+                    <div className="flex items-center gap-2 flex-shrink-0">
+                      <button onClick={() => toggle(en)}
+                        className="text-[11px] text-slate-500 hover:text-slate-800">
+                        {en.is_active ? 'disable' : 'enable'}
+                      </button>
+                      <button onClick={() => { setEditId(en.id); setEditDraft({ title: en.title, body: en.body }); }}
+                        className="text-[11px] text-indigo-600 hover:text-indigo-800">edit</button>
+                      <button onClick={() => remove(en.id)}
+                        className="text-[11px] text-rose-600 hover:underline">delete</button>
+                    </div>
+                  </div>
+                )}
+              </li>
+            ))}
+          </ul>
+        )}
+        {err && <p className="text-xs text-rose-700 mt-2">{err}</p>}
+      </div>
+    </section>
   );
 }
 

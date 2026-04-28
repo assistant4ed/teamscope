@@ -55,9 +55,13 @@ CREATE INDEX IF NOT EXISTS idx_support_kb_active
     ON ops.support_kb (is_active, position) WHERE is_active = true;
 
 -- Seed a starter KB entry so the AI assistant has something to ground on
--- before the boss writes their own.
-INSERT INTO ops.support_kb (title, body, position) VALUES
-  ('How TeamScope reports work',
+-- before the boss writes their own. WHERE NOT EXISTS makes this safe
+-- against multiple boots — ON CONFLICT alone won't dedupe without a
+-- unique constraint and we don't want to enforce title uniqueness.
+INSERT INTO ops.support_kb (title, body, position)
+SELECT 'How TeamScope reports work',
 $$TeamScope sends three Telegram prompts a day per active subscriber: morning (default 09:00), midday (default 13:30), and end of day (default 18:30) in the subscriber's local timezone. Members reply via Telegram Reply; replies are auto-classified and stored as the daily report. The boss can also log reports manually via the web UI on the Reports page.$$,
-   0)
-ON CONFLICT DO NOTHING;
+   0
+ WHERE NOT EXISTS (
+   SELECT 1 FROM ops.support_kb WHERE title = 'How TeamScope reports work'
+ );

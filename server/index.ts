@@ -43,6 +43,11 @@ const {
   CLOUDFLARE_ACCOUNT_ID = '',
   CF_IMAGES_TOKEN = '',
   CF_IMAGES_ACCOUNT_HASH = '',
+  // Email — Resend. Without RESEND_API_KEY the dispatcher logs and
+  // skips silently so dev / preview deploys don't error.
+  RESEND_API_KEY = '',
+  EMAIL_FROM = 'noreply@clipyai.app',
+  EMAIL_FROM_NAME = 'TeamScope',
 } = process.env;
 
 if (!SUPABASE_DB_URL) {
@@ -2461,6 +2466,527 @@ async function sendTelegramMessage(chatId: number, text: string): Promise<'sent'
   return 'failed';
 }
 
+// =================================================================== //
+// Email subsystem (mirrors Clipy AI's app/services/email/* layout)    //
+// =================================================================== //
+// EMAIL_EVENT_CATALOG is the single source of truth for every
+// transactional email teamscope sends. Each event declares the
+// audience, default subject + body in en + zh, and the keys it expects
+// in the context dict. DB-stored ops.email_templates rows override the
+// in-code defaults per (event_id, language).
+
+type EmailAudience = 'subscriber' | 'boss' | 'pa' | 'support_user';
+
+interface EmailTemplate {
+  subject: string;
+  body: string;     // plain text; {key} placeholders substituted from context
+}
+
+interface EmailEvent {
+  id: string;
+  audience: EmailAudience;
+  when_fired: string;
+  required_context: readonly string[];
+  templates: Record<'en' | 'zh', EmailTemplate>;
+}
+
+const EMAIL_EVENT_CATALOG: readonly EmailEvent[] = [
+  {
+    id: 'card.assigned',
+    audience: 'subscriber',
+    when_fired: 'A boss / PA assigns a card to a member',
+    required_context: ['recipient_name', 'card_title', 'card_url', 'actor_name'],
+    templates: {
+      en: {
+        subject: 'New card assigned: {card_title}',
+        body:
+`Hi {recipient_name},
+
+{actor_name} assigned a card to you on TeamScope:
+
+  {card_title}
+
+Open it: {card_url}
+
+— TeamScope`,
+      },
+      zh: {
+        subject: '有新卡片指派給你: {card_title}',
+        body:
+`{recipient_name} 你好,
+
+{actor_name} 在 TeamScope 將卡片指派給你:
+
+  {card_title}
+
+開啟卡片: {card_url}
+
+— TeamScope`,
+      },
+    },
+  },
+  {
+    id: 'card.mentioned',
+    audience: 'subscriber',
+    when_fired: '@member appears in a card description or comment',
+    required_context: ['recipient_name', 'card_title', 'card_url', 'actor_name', 'context_kind'],
+    templates: {
+      en: {
+        subject: '{actor_name} mentioned you in {card_title}',
+        body:
+`Hi {recipient_name},
+
+{actor_name} mentioned you in a {context_kind} on TeamScope:
+
+  {card_title}
+
+Open: {card_url}
+
+— TeamScope`,
+      },
+      zh: {
+        subject: '{actor_name} 在 {card_title} 提到你',
+        body:
+`{recipient_name} 你好,
+
+{actor_name} 在 TeamScope 的{context_kind}中提到你:
+
+  {card_title}
+
+開啟: {card_url}
+
+— TeamScope`,
+      },
+    },
+  },
+  {
+    id: 'card.commented',
+    audience: 'subscriber',
+    when_fired: 'A new comment is added to a card you are assigned to',
+    required_context: ['recipient_name', 'card_title', 'card_url', 'actor_name', 'comment_preview'],
+    templates: {
+      en: {
+        subject: 'New comment on {card_title}',
+        body:
+`Hi {recipient_name},
+
+{actor_name} commented on a card you're on:
+
+  "{comment_preview}"
+
+Reply: {card_url}
+
+— TeamScope`,
+      },
+      zh: {
+        subject: '{card_title} 有新留言',
+        body:
+`{recipient_name} 你好,
+
+{actor_name} 在你負責的卡片留言:
+
+  「{comment_preview}」
+
+回覆: {card_url}
+
+— TeamScope`,
+      },
+    },
+  },
+  {
+    id: 'report.eod_missed',
+    audience: 'subscriber',
+    when_fired: 'Daily missed-slot digest job runs and finds an EOD missed',
+    required_context: ['recipient_name', 'report_date'],
+    templates: {
+      en: {
+        subject: 'You missed your EOD report for {report_date}',
+        body:
+`Hi {recipient_name},
+
+Heads up — you didn't file your end-of-day report for {report_date}.
+
+Reply to @edpapabot on Telegram, or log it on the web at {app_url}.
+
+— TeamScope`,
+      },
+      zh: {
+        subject: '{report_date} 的日結報告未提交',
+        body:
+`{recipient_name} 你好,
+
+提醒一下 — 你還沒有提交 {report_date} 的日結報告。
+
+請在 Telegram 回覆 @edpapabot,或在 {app_url} 補登。
+
+— TeamScope`,
+      },
+    },
+  },
+  {
+    id: 'share.link_invited',
+    audience: 'support_user',
+    when_fired: 'Boss shares a board via email from the Share modal (manual)',
+    required_context: ['recipient_name', 'board_name', 'share_url', 'actor_name', 'mode'],
+    templates: {
+      en: {
+        subject: '{actor_name} shared the {board_name} board with you',
+        body:
+`Hi {recipient_name},
+
+{actor_name} shared the "{board_name}" board with you on TeamScope.
+
+Permission: {mode}
+
+Open: {share_url}
+
+— TeamScope`,
+      },
+      zh: {
+        subject: '{actor_name} 與你分享了 {board_name} 看板',
+        body:
+`{recipient_name} 你好,
+
+{actor_name} 在 TeamScope 與你分享了「{board_name}」看板。
+
+權限: {mode}
+
+開啟: {share_url}
+
+— TeamScope`,
+      },
+    },
+  },
+  {
+    id: 'support.ticket_replied',
+    audience: 'support_user',
+    when_fired: 'Staff reply on a support ticket — DMs the requester',
+    required_context: ['recipient_name', 'ticket_subject', 'ticket_url', 'reply_preview'],
+    templates: {
+      en: {
+        subject: 'Re: {ticket_subject}',
+        body:
+`Hi {recipient_name},
+
+Your support ticket got a reply:
+
+  "{reply_preview}"
+
+Continue the thread: {ticket_url}
+
+— TeamScope Support`,
+      },
+      zh: {
+        subject: '回覆: {ticket_subject}',
+        body:
+`{recipient_name} 你好,
+
+你的支援工單已有回覆:
+
+  「{reply_preview}」
+
+繼續對話: {ticket_url}
+
+— TeamScope 支援`,
+      },
+    },
+  },
+] as const;
+
+const EMAIL_EVENTS_BY_ID: Record<string, EmailEvent> = Object.fromEntries(
+  EMAIL_EVENT_CATALOG.map(e => [e.id, e])
+);
+
+function substituteTemplate(text: string, context: Record<string, string | number | undefined>): string {
+  return text.replace(/\{(\w+)\}/g, (_, k) => {
+    const v = context[k];
+    return v === undefined || v === null ? '' : String(v);
+  });
+}
+
+// Resolve the active template for an event in the recipient's language.
+// Falls back: DB row in lang → DB row in en → in-code default in lang →
+// in-code default in en. Anything else returns null and the dispatcher
+// logs status='skipped'.
+async function resolveEmailTemplate(
+  eventId: string,
+  language: 'en' | 'zh',
+): Promise<EmailTemplate | null> {
+  const event = EMAIL_EVENTS_BY_ID[eventId];
+  if (!event) return null;
+  // DB overrides if present.
+  const rows = await query<{ language: string; subject: string; body: string }>(
+    `SELECT language, subject, body FROM ops.email_templates
+      WHERE event_id = $1 AND language = ANY($2::text[])`,
+    [eventId, [language, 'en']]
+  );
+  const byLang = new Map(rows.map(r => [r.language, r]));
+  const dbRow = byLang.get(language) || byLang.get('en');
+  if (dbRow) return { subject: dbRow.subject, body: dbRow.body };
+  return event.templates[language] || event.templates.en;
+}
+
+// Send via Resend. Returns provider-id on success.
+async function sendViaResend(
+  to: string, subject: string, body: string,
+): Promise<{ ok: true; id: string } | { ok: false; error: string }> {
+  if (!RESEND_API_KEY) return { ok: false, error: 'resend_disabled' };
+  try {
+    const r = await fetch('https://api.resend.com/emails', {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${RESEND_API_KEY}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        from: `${EMAIL_FROM_NAME} <${EMAIL_FROM}>`,
+        to: [to],
+        subject,
+        text: body,
+      }),
+    });
+    const data = await r.json().catch(() => ({} as Record<string, unknown>));
+    if (!r.ok) {
+      return { ok: false, error: `resend ${r.status}: ${JSON.stringify(data).slice(0, 200)}` };
+    }
+    const id = (data as { id?: string }).id || '';
+    return { ok: true, id };
+  } catch (e) {
+    return { ok: false, error: (e as Error).message };
+  }
+}
+
+// Public dispatcher — the one trigger sites call. Renders via the
+// catalog + DB overrides, sends via Resend, writes an EmailLog row,
+// optionally also creates an in-app Notification.
+async function sendEmail(args: {
+  eventId: string;
+  recipientEmail: string;
+  language?: 'en' | 'zh';
+  context: Record<string, string | number | undefined>;
+  actorEmail?: string;
+  alsoNotify?: { kind: string; title: string; body?: string; linkUrl?: string };
+}): Promise<void> {
+  const lang = args.language || 'en';
+  const event = EMAIL_EVENTS_BY_ID[args.eventId];
+  if (!event) {
+    console.error('[teamscope] sendEmail: unknown event_id', args.eventId);
+    return;
+  }
+  // Validate the caller passed every required key — rough sanity, not
+  // a hard fail since the substitute step renders missing keys to ''.
+  const missing = event.required_context.filter(k => !(k in args.context));
+  if (missing.length > 0) {
+    console.warn('[teamscope] sendEmail missing context keys:',
+      args.eventId, missing.join(','));
+  }
+  const tpl = await resolveEmailTemplate(args.eventId, lang);
+  if (!tpl) {
+    await query(
+      `INSERT INTO ops.email_logs
+         (event_id, recipient_email, language, status, error, actor_email)
+       VALUES ($1, $2, $3, 'skipped', 'no_template', $4)`,
+      [args.eventId, args.recipientEmail, lang, args.actorEmail ?? null]
+    );
+    return;
+  }
+  const ctx = { app_url: APP_URL, ...args.context };
+  const subject = substituteTemplate(tpl.subject, ctx);
+  const body = substituteTemplate(tpl.body, ctx);
+  const previewCtx = Object.fromEntries(
+    Object.entries(ctx).map(([k, v]) => [k, typeof v === 'string' ? v.slice(0, 200) : v])
+  );
+  const logRows = await query<{ id: string }>(
+    `INSERT INTO ops.email_logs
+       (event_id, recipient_email, subject, language, status, context_preview, actor_email)
+     VALUES ($1, $2, $3, $4, 'queued', $5::jsonb, $6)
+     RETURNING id`,
+    [args.eventId, args.recipientEmail, subject, lang,
+     JSON.stringify(previewCtx), args.actorEmail ?? null]
+  );
+  const logId = logRows[0].id;
+  const result = await sendViaResend(args.recipientEmail, subject, body);
+  if (result.ok === true) {
+    await query(
+      `UPDATE ops.email_logs
+          SET status = 'sent', provider = 'resend', provider_id = $1,
+              sent_at = now()
+        WHERE id = $2`,
+      [result.id, logId]
+    );
+  } else {
+    const errorMsg = result.error;
+    await query(
+      `UPDATE ops.email_logs
+          SET status = $1, error = $2, provider = 'resend'
+        WHERE id = $3`,
+      [errorMsg === 'resend_disabled' ? 'skipped' : 'failed',
+       errorMsg, logId]
+    );
+  }
+  // In-app notification mirror (independent of email outcome).
+  if (args.alsoNotify) {
+    await createNotification({
+      recipientEmail: args.recipientEmail,
+      kind: args.alsoNotify.kind,
+      title: args.alsoNotify.title,
+      body: args.alsoNotify.body,
+      linkUrl: args.alsoNotify.linkUrl,
+    });
+  }
+}
+
+async function createNotification(args: {
+  recipientEmail: string;
+  kind: string;
+  title: string;
+  body?: string;
+  linkUrl?: string;
+}): Promise<void> {
+  try {
+    await query(
+      `INSERT INTO ops.notifications (recipient_email, kind, title, body, link_url)
+       VALUES ($1, $2, $3, $4, $5)`,
+      [args.recipientEmail.toLowerCase(), args.kind, args.title,
+       args.body ?? null, args.linkUrl ?? null]
+    );
+  } catch (e) {
+    console.error('[teamscope] notification insert failed:', (e as Error).message);
+  }
+}
+
+// In-app notifications API — used by the sidebar bell.
+app.get('/api/notifications', async (req, res) => {
+  try {
+    const rows = await query(
+      `SELECT id, kind, title, body, link_url, read_at, created_at
+         FROM ops.notifications
+        WHERE recipient_email = $1
+        ORDER BY created_at DESC LIMIT 50`,
+      [req.user!.email.toLowerCase()]
+    );
+    const unread = rows.filter((r: any) => r.read_at === null).length;
+    res.json({ notifications: rows, unread });
+  } catch (e) {
+    res.status(pgErrorStatus(e)).json({ error: (e as Error).message });
+  }
+});
+
+app.post('/api/notifications/:id/read', async (req, res) => {
+  try {
+    await query(
+      `UPDATE ops.notifications SET read_at = now()
+        WHERE id = $1 AND recipient_email = $2 AND read_at IS NULL`,
+      [String(req.params.id), req.user!.email.toLowerCase()]
+    );
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(pgErrorStatus(e)).json({ error: (e as Error).message });
+  }
+});
+
+app.post('/api/notifications/mark-all-read', async (req, res) => {
+  try {
+    await query(
+      `UPDATE ops.notifications SET read_at = now()
+        WHERE recipient_email = $1 AND read_at IS NULL`,
+      [req.user!.email.toLowerCase()]
+    );
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(pgErrorStatus(e)).json({ error: (e as Error).message });
+  }
+});
+
+// ---- Admin: email events / templates / logs ---------------------- //
+app.get('/api/admin/email-events', requireRole('boss'), (_req, res) => {
+  res.json({
+    events: EMAIL_EVENT_CATALOG.map(e => ({
+      id: e.id, audience: e.audience,
+      when_fired: e.when_fired,
+      required_context: e.required_context,
+      defaults: e.templates,
+    })),
+  });
+});
+
+app.get('/api/admin/email-templates', requireRole('boss'), async (_req, res) => {
+  try {
+    const rows = await query(
+      `SELECT event_id, language, subject, body, updated_at, updated_by
+         FROM ops.email_templates ORDER BY event_id, language`
+    );
+    res.json({ overrides: rows });
+  } catch (e) {
+    res.status(pgErrorStatus(e)).json({ error: (e as Error).message });
+  }
+});
+
+app.patch('/api/admin/email-templates/:event/:language',
+  requireRole('boss'),
+  async (req, res) => {
+    const eventId = String(req.params.event);
+    const language = String(req.params.language);
+    if (!EMAIL_EVENTS_BY_ID[eventId]) {
+      return res.status(404).json({ error: 'unknown_event' });
+    }
+    if (language !== 'en' && language !== 'zh') {
+      return res.status(400).json({ error: 'language must be en|zh' });
+    }
+    const subject = ((req.body?.subject as string) || '').trim();
+    const body = ((req.body?.body as string) || '').trim();
+    if (!subject || !body) return res.status(400).json({ error: 'subject + body required' });
+    try {
+      const rows = await query(
+        `INSERT INTO ops.email_templates (event_id, language, subject, body, updated_by)
+         VALUES ($1, $2, $3, $4, $5)
+         ON CONFLICT (event_id, language) DO UPDATE
+           SET subject = EXCLUDED.subject, body = EXCLUDED.body,
+               updated_by = EXCLUDED.updated_by, updated_at = now()
+       RETURNING event_id, language, subject, body, updated_at, updated_by`,
+        [eventId, language, subject, body, req.user!.email]
+      );
+      res.json({ template: rows[0] });
+    } catch (e) {
+      res.status(pgErrorStatus(e)).json({ error: (e as Error).message });
+    }
+  }
+);
+
+app.delete('/api/admin/email-templates/:event/:language',
+  requireRole('boss'),
+  async (req, res) => {
+    try {
+      await query(
+        `DELETE FROM ops.email_templates WHERE event_id = $1 AND language = $2`,
+        [String(req.params.event), String(req.params.language)]
+      );
+      res.json({ deleted: true });
+    } catch (e) {
+      res.status(pgErrorStatus(e)).json({ error: (e as Error).message });
+    }
+  }
+);
+
+app.get('/api/admin/email-logs', requireRole('boss'), async (req, res) => {
+  const limit = Math.min(200, Math.max(1, Number(req.query.limit ?? 50)));
+  try {
+    const rows = await query(
+      `SELECT id, event_id, recipient_email, subject, language, status,
+              provider, provider_id, error, actor_email, created_at, sent_at
+         FROM ops.email_logs ORDER BY created_at DESC LIMIT $1`,
+      [limit]
+    );
+    res.json({ logs: rows });
+  } catch (e) {
+    res.status(pgErrorStatus(e)).json({ error: (e as Error).message });
+  }
+});
+
+// =================================================================== //
+// (end email subsystem)
+// =================================================================== //
+
 // Notify a set of subscribers about a card assignment. Runs outside
 // the user-facing request path — never awaited from the endpoint so
 // a slow Telegram API call does not delay the HTTP response.
@@ -2471,8 +2997,11 @@ async function notifyAssignment(
 ) {
   if (subscriberIds.length === 0) return;
   try {
-    const rows = await query<{ id: string; name: string; telegram_chat_id: number }>(
-      `SELECT id, name, telegram_chat_id
+    const rows = await query<{
+      id: string; name: string; telegram_chat_id: number;
+      email: string | null; language: 'en' | 'zh';
+    }>(
+      `SELECT id, name, telegram_chat_id, email, language
          FROM ops.report_subscribers
         WHERE id = ANY($1::uuid[]) AND active = true`,
       [subscriberIds]
@@ -2481,12 +3010,36 @@ async function notifyAssignment(
     const body =
       `📋 *New task assigned*\n\n` +
       `_${escapeMarkdown(card.title)}_${link}`;
+    const cardUrl = APP_URL ? `${APP_URL}/board` : '';
     for (const sub of rows) {
       const outcome = await sendTelegramMessage(sub.telegram_chat_id, body);
       console.log(
         `[teamscope] notify ${sub.name} (${sub.telegram_chat_id}) ` +
         `about card ${card.id.slice(0, 8)} → ${outcome} (by ${actorEmail})`
       );
+      // Email + in-app notification (in addition to Telegram). Email
+      // skipped if no address recorded for this subscriber. The bell
+      // notification always fires for the team-member email if known.
+      if (sub.email) {
+        sendEmail({
+          eventId: 'card.assigned',
+          recipientEmail: sub.email,
+          language: sub.language || 'en',
+          context: {
+            recipient_name: sub.name,
+            card_title: card.title,
+            card_url: cardUrl,
+            actor_name: actorEmail.split('@')[0],
+          },
+          actorEmail,
+          alsoNotify: {
+            kind: 'card.assigned',
+            title: `New card assigned: ${card.title}`,
+            body: `By ${actorEmail.split('@')[0]}`,
+            linkUrl: cardUrl,
+          },
+        }).catch(e => console.error('[teamscope] sendEmail card.assigned:', (e as Error).message));
+      }
     }
   } catch (e) {
     console.error('[teamscope] notify error:', (e as Error).message);

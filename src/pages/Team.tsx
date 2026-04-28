@@ -186,7 +186,236 @@ export default function Team({ me, onOpenMember }: {
       </section>
 
       <PublicHolidaysSection isBoss={me.role === 'boss'} />
+
+      {me.role === 'boss' && <EmailAdminSection />}
     </div>
+  );
+}
+
+// ---------- Admin: email templates + logs --------------------------- //
+// Boss-facing window into the email subsystem. Lists every event from
+// the catalog + the current resolved template (DB override or in-code
+// default) with inline editing. Below the events panel sits a recent
+// log table — sort by created_at DESC, status badge for failures.
+interface EmailEventDef {
+  id: string;
+  audience: string;
+  when_fired: string;
+  required_context: string[];
+  defaults: Record<'en' | 'zh', { subject: string; body: string }>;
+}
+interface EmailOverrideRow {
+  event_id: string; language: 'en' | 'zh';
+  subject: string; body: string;
+  updated_at: string; updated_by: string | null;
+}
+interface EmailLogRow {
+  id: string; event_id: string; recipient_email: string;
+  subject: string | null; language: string | null;
+  status: 'queued' | 'sent' | 'failed' | 'skipped';
+  provider: string | null; provider_id: string | null;
+  error: string | null; actor_email: string | null;
+  created_at: string; sent_at: string | null;
+}
+
+function EmailAdminSection() {
+  const [events, setEvents] = useState<EmailEventDef[]>([]);
+  const [overrides, setOverrides] = useState<EmailOverrideRow[]>([]);
+  const [logs, setLogs] = useState<EmailLogRow[]>([]);
+  const [activeId, setActiveId] = useState<string>('');
+  const [activeLang, setActiveLang] = useState<'en' | 'zh'>('en');
+  const [draftSubject, setDraftSubject] = useState('');
+  const [draftBody, setDraftBody] = useState('');
+  const [saving, setSaving] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+
+  const load = useCallback(async () => {
+    try {
+      const [evs, ovs, lgs] = await Promise.all([
+        apiGet<{ events: EmailEventDef[] }>('/api/admin/email-events'),
+        apiGet<{ overrides: EmailOverrideRow[] }>('/api/admin/email-templates'),
+        apiGet<{ logs: EmailLogRow[] }>('/api/admin/email-logs?limit=20'),
+      ]);
+      setEvents(evs.events);
+      setOverrides(ovs.overrides);
+      setLogs(lgs.logs);
+      if (!activeId && evs.events.length > 0) setActiveId(evs.events[0].id);
+    } catch (e) { setErr(String(e)); }
+  }, [activeId]);
+  useEffect(() => { load(); }, [load]);
+
+  const activeEvent = events.find(e => e.id === activeId);
+  const activeOverride = overrides.find(o => o.event_id === activeId && o.language === activeLang);
+  const effectiveSubject = activeOverride?.subject ?? activeEvent?.defaults[activeLang]?.subject ?? '';
+  const effectiveBody = activeOverride?.body ?? activeEvent?.defaults[activeLang]?.body ?? '';
+
+  // Re-prime the textareas when the active event/lang changes.
+  useEffect(() => {
+    setDraftSubject(effectiveSubject);
+    setDraftBody(effectiveBody);
+  }, [activeId, activeLang, activeOverride?.subject, activeOverride?.body, effectiveSubject, effectiveBody]);
+
+  const isOverridden = !!activeOverride;
+  const isDirty = draftSubject !== effectiveSubject || draftBody !== effectiveBody;
+
+  async function saveOverride() {
+    if (!activeId || !draftSubject.trim() || !draftBody.trim()) return;
+    setSaving(true); setErr(null);
+    try {
+      const r = await apiFetch(
+        `/api/admin/email-templates/${encodeURIComponent(activeId)}/${activeLang}`,
+        { method: 'PATCH', body: JSON.stringify({ subject: draftSubject, body: draftBody }) }
+      );
+      if (!r.ok) {
+        const b = await r.json().catch(() => ({}));
+        throw new Error(b.error || `HTTP ${r.status}`);
+      }
+      load();
+    } catch (e) { setErr((e as Error).message); }
+    finally { setSaving(false); }
+  }
+
+  async function resetToDefault() {
+    if (!activeId) return;
+    if (!window.confirm(`Reset ${activeId} (${activeLang}) to the in-code default?`)) return;
+    try {
+      await apiFetch(
+        `/api/admin/email-templates/${encodeURIComponent(activeId)}/${activeLang}`,
+        { method: 'DELETE' }
+      );
+      load();
+    } catch (e) { setErr((e as Error).message); }
+  }
+
+  return (
+    <section>
+      <h2 className="text-sm font-semibold text-slate-500 uppercase tracking-wider mb-3">
+        Email & notifications
+      </h2>
+      <div className="bg-white border border-slate-200 rounded-xl p-4 space-y-5">
+        <p className="text-xs text-slate-400">
+          Transactional emails sent via Resend. In-code defaults work without any DB rows;
+          editing here writes an override per (event, language). Use{' '}
+          <code className="px-1 bg-slate-100 rounded text-[11px]">{'{key}'}</code> placeholders —
+          required keys are listed under each event.
+        </p>
+
+        <div className="grid md:grid-cols-[200px_1fr] gap-4">
+          <div className="space-y-1 max-h-[320px] overflow-y-auto pr-1">
+            {events.map(e => {
+              const overridden = overrides.some(o => o.event_id === e.id);
+              return (
+                <button key={e.id} onClick={() => setActiveId(e.id)}
+                  className={`w-full text-left px-2 py-1.5 rounded text-xs ${
+                    e.id === activeId ? 'bg-slate-900 text-white' : 'text-slate-700 hover:bg-slate-50'}`}>
+                  <div className="font-mono">{e.id}</div>
+                  <div className="text-[10px] opacity-70">
+                    {e.audience}{overridden ? ' · custom' : ''}
+                  </div>
+                </button>
+              );
+            })}
+          </div>
+          {activeEvent && (
+            <div className="space-y-3">
+              <div>
+                <p className="text-xs text-slate-500 mb-1">{activeEvent.when_fired}</p>
+                <p className="text-[11px] text-slate-400">
+                  Required keys: {activeEvent.required_context.map(k => (
+                    <code key={k} className="mr-1 px-1 bg-slate-100 rounded text-[10px]">{`{${k}}`}</code>
+                  ))}
+                </p>
+              </div>
+              <div className="inline-flex bg-slate-50 border border-slate-200 rounded-lg p-0.5">
+                <button onClick={() => setActiveLang('en')}
+                  className={`px-3 py-1 text-xs rounded ${activeLang==='en'?'bg-slate-900 text-white':'text-slate-600'}`}>
+                  English
+                </button>
+                <button onClick={() => setActiveLang('zh')}
+                  className={`px-3 py-1 text-xs rounded ${activeLang==='zh'?'bg-slate-900 text-white':'text-slate-600'}`}>
+                  中文
+                </button>
+              </div>
+              <div>
+                <label className="block text-[11px] text-slate-500 mb-0.5">Subject</label>
+                <input value={draftSubject} onChange={e => setDraftSubject(e.target.value)}
+                  className="w-full border border-slate-200 rounded-lg px-2 py-1.5 text-sm" />
+              </div>
+              <div>
+                <label className="block text-[11px] text-slate-500 mb-0.5">Body</label>
+                <textarea value={draftBody} onChange={e => setDraftBody(e.target.value)}
+                  rows={10}
+                  className="w-full font-mono text-xs border border-slate-200 rounded-lg p-2" />
+              </div>
+              <div className="flex items-center gap-2">
+                <button onClick={saveOverride} disabled={!isDirty || saving}
+                  className="px-3 py-1.5 text-sm bg-slate-900 hover:bg-slate-800 disabled:opacity-30 text-white rounded-lg">
+                  {saving ? 'Saving…' : isOverridden ? 'Update override' : 'Override default'}
+                </button>
+                {isOverridden && (
+                  <button onClick={resetToDefault}
+                    className="text-xs text-rose-600 hover:underline">
+                    Reset to default
+                  </button>
+                )}
+                {isOverridden && (
+                  <span className="text-[10px] text-slate-400 ml-auto">
+                    edited {activeOverride?.updated_at ? new Date(activeOverride.updated_at).toLocaleString() : ''}
+                  </span>
+                )}
+              </div>
+            </div>
+          )}
+        </div>
+
+        <div>
+          <h3 className="text-[11px] font-semibold text-slate-500 uppercase tracking-wider mb-2">
+            Recent activity
+          </h3>
+          {logs.length === 0 ? (
+            <p className="text-xs text-slate-400">No emails sent yet.</p>
+          ) : (
+            <div className="overflow-x-auto -mx-2">
+              <table className="w-full text-xs">
+                <thead>
+                  <tr className="text-slate-400 text-left">
+                    <th className="px-2 py-1 font-medium">When</th>
+                    <th className="px-2 py-1 font-medium">Event</th>
+                    <th className="px-2 py-1 font-medium">To</th>
+                    <th className="px-2 py-1 font-medium">Status</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-slate-100">
+                  {logs.map(l => (
+                    <tr key={l.id}>
+                      <td className="px-2 py-1 text-slate-500 tabular-nums">
+                        {new Date(l.created_at).toLocaleString()}
+                      </td>
+                      <td className="px-2 py-1 font-mono text-slate-700">{l.event_id}</td>
+                      <td className="px-2 py-1 text-slate-600">{l.recipient_email}</td>
+                      <td className="px-2 py-1">
+                        <span className={`text-[10px] px-1.5 py-0.5 rounded ${
+                          l.status === 'sent' ? 'bg-emerald-100 text-emerald-800' :
+                          l.status === 'failed' ? 'bg-rose-100 text-rose-800' :
+                          l.status === 'skipped' ? 'bg-slate-100 text-slate-600' :
+                          'bg-amber-100 text-amber-800'
+                        }`}>{l.status}</span>
+                        {l.error && (
+                          <span className="ml-2 text-[10px] text-rose-600" title={l.error}>
+                            {l.error.slice(0, 40)}
+                          </span>
+                        )}
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
+        </div>
+        {err && <p className="text-xs text-rose-700">{err}</p>}
+      </div>
+    </section>
   );
 }
 

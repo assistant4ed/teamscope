@@ -13,6 +13,7 @@ import Member from './pages/Member';
 import Agent from './pages/Agent';
 import Activity from './pages/Activity';
 import SearchPalette, { ShortcutCheatsheet, type SearchHit } from './SearchPalette';
+import NotificationsBell from './NotificationsBell';
 
 type Tab = 'dashboard' | 'agent' | 'board' | 'tasks' | 'reports' | 'activity' | 'team';
 
@@ -123,6 +124,9 @@ export default function Shell({ me }: { me: Me }) {
               </button>
             ))}
           </nav>
+          <div className="px-3 pb-1">
+            <NotificationsBell />
+          </div>
           <div className="p-3 border-t border-slate-100">
             <div className="text-xs text-slate-500 mb-2 truncate">{me.email}</div>
             <div className="text-xs text-indigo-600 font-medium mb-2">role: {me.role}</div>

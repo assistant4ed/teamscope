@@ -3471,22 +3471,103 @@ async function notifyMentions(
   const handles = extractMentionHandles(text);
   if (handles.length === 0) return;
   try {
-    const targets = await resolveMentions(handles, actorEmail);
-    if (targets.length === 0) return;
+    // Pull email + language so we can send the email-channel mention too.
+    const targets = await query<{
+      id: string; name: string; telegram_chat_id: number;
+      email: string | null; language: 'en' | 'zh';
+    }>(
+      `SELECT id, name, telegram_chat_id, email, language
+         FROM ops.report_subscribers
+        WHERE active = true AND telegram_chat_id IS NOT NULL`
+    );
+    const matched = targets.filter(r => {
+      const handle = r.name.replace(/\s+/g, '').toLowerCase();
+      if (!handles.includes(handle)) return false;
+      if (r.email && r.email.toLowerCase() === actorEmail.toLowerCase()) return false;
+      return true;
+    });
+    if (matched.length === 0) return;
+
     const link = APP_URL ? `\n\n→ ${APP_URL}` : '';
     const verb = context.kind === 'comment' ? 'mentioned you in a comment on' : 'mentioned you in a card';
     const body =
       `🔔 *${escapeMarkdown(actorEmail.split('@')[0])}* ${verb}\n\n` +
       `_${escapeMarkdown(context.cardTitle)}_${link}`;
-    for (const sub of targets) {
+    const cardUrl = APP_URL ? `${APP_URL}/board` : '';
+    for (const sub of matched) {
       const outcome = await sendTelegramMessage(sub.telegram_chat_id, body);
       console.log(
         `[teamscope] mention ${sub.name} (${sub.telegram_chat_id}) ` +
         `via ${context.kind} on card ${context.cardId.slice(0, 8)} → ${outcome}`
       );
+      if (sub.email) {
+        sendEmail({
+          eventId: 'card.mentioned',
+          recipientEmail: sub.email,
+          language: sub.language,
+          context: {
+            recipient_name: sub.name,
+            card_title: context.cardTitle,
+            card_url: cardUrl,
+            actor_name: actorEmail.split('@')[0],
+            context_kind: context.kind,
+          },
+          actorEmail,
+          alsoNotify: {
+            kind: 'card.mentioned',
+            title: `${actorEmail.split('@')[0]} mentioned you`,
+            body: context.cardTitle,
+            linkUrl: cardUrl,
+          },
+        }).catch(e => console.error('[teamscope] sendEmail card.mentioned:', (e as Error).message));
+      }
     }
   } catch (e) {
     console.error('[teamscope] mention notify error:', (e as Error).message);
+  }
+}
+
+// Notify card assignees (and creator, if known by email) about a new
+// comment. Skips the comment author. Sends both email + in-app
+// notification; Telegram is reserved for @mentions to keep noise low.
+async function notifyCommentToAssignees(
+  cardId: string,
+  cardTitle: string,
+  commentBody: string,
+  authorEmail: string,
+): Promise<void> {
+  const rows = await query<{ name: string; email: string | null; language: 'en' | 'zh' }>(
+    `SELECT s.name, s.email, s.language
+       FROM ops.kanban_assignees a
+       JOIN ops.report_subscribers s ON s.id = a.subscriber_id
+      WHERE a.card_id = $1 AND s.active = true
+        AND s.email IS NOT NULL
+        AND lower(s.email) <> lower($2)`,
+    [cardId, authorEmail]
+  );
+  if (rows.length === 0) return;
+  const cardUrl = APP_URL ? `${APP_URL}/board` : '';
+  const preview = commentBody.replace(/\s+/g, ' ').slice(0, 200);
+  for (const sub of rows) {
+    sendEmail({
+      eventId: 'card.commented',
+      recipientEmail: sub.email!,
+      language: sub.language,
+      context: {
+        recipient_name: sub.name,
+        card_title: cardTitle,
+        card_url: cardUrl,
+        actor_name: authorEmail.split('@')[0],
+        comment_preview: preview,
+      },
+      actorEmail: authorEmail,
+      alsoNotify: {
+        kind: 'card.commented',
+        title: `New comment on ${cardTitle}`,
+        body: `${authorEmail.split('@')[0]}: ${preview.slice(0, 80)}`,
+        linkUrl: cardUrl,
+      },
+    }).catch(e => console.error('[teamscope] sendEmail card.commented:', (e as Error).message));
   }
 }
 
@@ -4264,9 +4345,14 @@ app.post('/api/kanban/cards/:id/comments',
       const titleRow = await query<{ title: string }>(
         `SELECT title FROM ops.kanban_cards WHERE id = $1`, [String(req.params.id)]
       );
+      const cardTitle = titleRow[0]?.title || '(card)';
       notifyMentions(body,
-        { kind: 'comment', cardId: String(req.params.id), cardTitle: titleRow[0]?.title || '(card)' },
+        { kind: 'comment', cardId: String(req.params.id), cardTitle },
         req.user!.email);
+      // Comment notifications to assignees (excluding the commenter)
+      // via card.commented event.
+      notifyCommentToAssignees(String(req.params.id), cardTitle, body, req.user!.email)
+        .catch(e => console.error('[teamscope] notify comment:', (e as Error).message));
       res.json({ comment: rows[0] });
     } catch (e) {
       res.status(pgErrorStatus(e)).json({ error: (e as Error).message });
@@ -4584,6 +4670,70 @@ app.get('/api/search', async (req, res) => {
       ),
     ]);
     res.json({ q, cards, reports, members });
+  } catch (e) {
+    res.status(pgErrorStatus(e)).json({ error: (e as Error).message });
+  }
+});
+
+// ---------- Bot pulse (visibility into n8n bot health) -------------- //
+// Per-active-member, per-slot status for "today" (in each member's
+// own timezone). Status:
+//   sent     — report_sessions row exists for (member, today, slot)
+//   pending  — local time hasn't reached slot.expected_local_time
+//   late     — passed but within 30 min grace
+//   missed   — passed >30 min ago and no row
+app.get('/api/dashboard/bot-pulse', async (_req, res) => {
+  try {
+    const rows = await query<{
+      subscriber_id: string; name: string; timezone: string;
+      slot: 'morning' | 'midday' | 'eod';
+      expected_local_time: string;
+      now_local_time: string;
+      sent: boolean;
+    }>(
+      `SELECT s.id AS subscriber_id, s.name, s.timezone,
+              slot.slot_name AS slot,
+              slot.expected_local_time::text AS expected_local_time,
+              (now() AT TIME ZONE s.timezone)::time::text AS now_local_time,
+              EXISTS (
+                SELECT 1 FROM ops.report_sessions rs
+                 WHERE rs.subscriber_id = s.id
+                   AND rs.report_date   = (now() AT TIME ZONE s.timezone)::date
+                   AND rs.slot          = slot.slot_name
+              ) AS sent
+         FROM ops.report_subscribers s
+         CROSS JOIN LATERAL (VALUES
+            ('morning', s.slot_morning),
+            ('midday',  s.slot_midday),
+            ('eod',     s.slot_eod)
+         ) AS slot(slot_name, expected_local_time)
+        WHERE s.active = true
+          AND EXTRACT(isodow FROM (now() AT TIME ZONE s.timezone))::int = ANY(s.working_days)
+        ORDER BY s.name, slot.expected_local_time`
+    );
+    // Project to status enum so the UI doesn't have to do time math.
+    type Status = 'sent' | 'pending' | 'late' | 'missed';
+    function classify(r: typeof rows[number]): Status {
+      if (r.sent) return 'sent';
+      const [eh, em] = r.expected_local_time.split(':').map(Number);
+      const [nh, nm] = r.now_local_time.split(':').map(Number);
+      const expectedMin = eh * 60 + em;
+      const nowMin = nh * 60 + nm;
+      if (nowMin < expectedMin) return 'pending';
+      return nowMin - expectedMin > 30 ? 'missed' : 'late';
+    }
+    const bySub = new Map<string, { name: string; slots: Record<string, { status: Status; expected_local_time: string }> }>();
+    for (const r of rows) {
+      let entry = bySub.get(r.subscriber_id);
+      if (!entry) {
+        entry = { name: r.name, slots: {} };
+        bySub.set(r.subscriber_id, entry);
+      }
+      entry.slots[r.slot] = { status: classify(r), expected_local_time: r.expected_local_time.slice(0, 5) };
+    }
+    res.json({
+      members: [...bySub.entries()].map(([id, v]) => ({ subscriber_id: id, ...v })),
+    });
   } catch (e) {
     res.status(pgErrorStatus(e)).json({ error: (e as Error).message });
   }

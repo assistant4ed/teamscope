@@ -2,7 +2,7 @@ import React, { useEffect, useState } from 'react';
 import { apiFetch, apiGet, Me } from '../auth';
 import {
   CheckCircle2, AlertCircle, Clock, Users, ListChecks,
-  AlertTriangle, Send, Loader2, Handshake,
+  AlertTriangle, Send, Loader2, Handshake, Activity,
 } from 'lucide-react';
 
 interface TodayReport {
@@ -42,6 +42,15 @@ interface MissedSubscriber {
 interface PromiseRow {
   subscriber_id: string; name: string; total: number; kept: number;
 }
+interface PulseSlotStatus {
+  status: 'sent' | 'pending' | 'late' | 'missed';
+  expected_local_time: string;
+}
+interface PulseRow {
+  subscriber_id: string;
+  name: string;
+  slots: Record<'morning' | 'midday' | 'eod', PulseSlotStatus | undefined>;
+}
 
 export default function Dashboard({ me }: { me: Me }) {
   const [data, setData] = useState<Data | null>(null);
@@ -51,6 +60,7 @@ export default function Dashboard({ me }: { me: Me }) {
   const [digestBusy, setDigestBusy] = useState(false);
   const [digestResult, setDigestResult] = useState<string | null>(null);
   const [promises, setPromises] = useState<PromiseRow[]>([]);
+  const [pulse, setPulse] = useState<PulseRow[]>([]);
 
   useEffect(() => {
     apiGet<Data>('/api/dashboard')
@@ -62,6 +72,9 @@ export default function Dashboard({ me }: { me: Me }) {
     apiGet<{ date: string; members: PromiseRow[] }>('/api/dashboard/promises')
       .then(d => setPromises(d.members || []))
       .catch(() => {/* silent — feature is opt-in via a morning report */});
+    apiGet<{ members: PulseRow[] }>('/api/dashboard/bot-pulse')
+      .then(d => setPulse(d.members || []))
+      .catch(() => {/* silent */});
   }, []);
 
   async function dmDigest() {
@@ -94,6 +107,52 @@ export default function Dashboard({ me }: { me: Me }) {
         <Card icon={<ListChecks className="w-5 h-5 text-indigo-600" />} label="Open tasks" value={data.pending.length} />
         <Card icon={<Clock className="w-5 h-5 text-amber-600" />} label="Recent actions" value={data.recentActions.length} />
       </div>
+
+      {pulse.length > 0 && (
+        <div className="mb-6 bg-white border border-slate-200 rounded-xl p-5">
+          <div className="flex items-center gap-2 mb-3">
+            <Activity className="w-5 h-5 text-emerald-600" />
+            <h2 className="text-sm font-semibold text-slate-700 uppercase tracking-wider">
+              Bot pulse — today
+            </h2>
+            {pulse.some(p => Object.values(p.slots).some(s => s?.status === 'missed')) && (
+              <span className="ml-auto text-[10px] text-rose-700 bg-rose-50 border border-rose-200 px-2 py-0.5 rounded-full">
+                misses detected
+              </span>
+            )}
+          </div>
+          <div className="space-y-1.5">
+            {pulse.map(p => (
+              <div key={p.subscriber_id} className="flex items-center gap-3 text-sm">
+                <span className="w-32 text-slate-700 font-medium truncate">{p.name}</span>
+                {(['morning','midday','eod'] as const).map(slot => {
+                  const s = p.slots[slot];
+                  if (!s) return null;
+                  const dotCls = {
+                    sent:    'bg-emerald-500',
+                    pending: 'bg-slate-300',
+                    late:    'bg-amber-400 animate-pulse',
+                    missed:  'bg-rose-500',
+                  }[s.status];
+                  return (
+                    <div key={slot} className="inline-flex items-center gap-1.5"
+                         title={`${slot} (${s.expected_local_time}) — ${s.status}`}>
+                      <span className={`w-2 h-2 rounded-full ${dotCls}`} />
+                      <span className="text-[11px] text-slate-500 tabular-nums">{s.expected_local_time}</span>
+                    </div>
+                  );
+                })}
+              </div>
+            ))}
+          </div>
+          <div className="mt-3 flex flex-wrap gap-3 text-[10px] text-slate-400">
+            <span><span className="inline-block w-2 h-2 rounded-full bg-emerald-500 mr-1" />sent</span>
+            <span><span className="inline-block w-2 h-2 rounded-full bg-slate-300 mr-1" />pending</span>
+            <span><span className="inline-block w-2 h-2 rounded-full bg-amber-400 mr-1" />late (within 30m)</span>
+            <span><span className="inline-block w-2 h-2 rounded-full bg-rose-500 mr-1" />missed (&gt;30m)</span>
+          </div>
+        </div>
+      )}
 
       {promises.length > 0 && (
         <div className="mb-6 bg-white border border-slate-200 rounded-xl p-5">

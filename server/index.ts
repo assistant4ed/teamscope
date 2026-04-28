@@ -3585,6 +3585,24 @@ async function loadBoardData(boardId: string) {
   return { columns, cards, assignees, subscribers, labels, card_labels: cardLabels, checklist_progress: checklistAgg };
 }
 
+// Columns list scoped to one board — used by EditCardModal's "move to
+// folder" dropdown so it can show the destination board's columns
+// without pulling all the cards via /api/kanban/board.
+app.get('/api/kanban/boards/:id/columns', async (req, res) => {
+  try {
+    const rows = await query(
+      `SELECT id, name, position, is_done, wip_limit
+         FROM ops.kanban_columns
+        WHERE deleted_at IS NULL AND board_id = $1
+        ORDER BY position`,
+      [String(req.params.id)]
+    );
+    res.json({ columns: rows });
+  } catch (e) {
+    res.status(pgErrorStatus(e)).json({ error: (e as Error).message });
+  }
+});
+
 // List all boards (folders). Anyone whitelisted can see all of them.
 app.get('/api/kanban/boards', async (_req, res) => {
   try {

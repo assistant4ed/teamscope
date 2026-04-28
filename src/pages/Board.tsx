@@ -1249,11 +1249,61 @@ function EditCardModal({
   const [err, setErr] = useState<string | null>(null);
   const [confirmDel, setConfirmDel] = useState(false);
 
+  // Folder-to-folder move support: load all boards once; when the user
+  // picks a different folder, fetch its columns lazily so the column
+  // dropdown cascades. On save, if column_id changed we issue a move
+  // call before the regular PATCH.
   const apiCtx = useApiCtx();
+  const isAuthed = apiCtx.kind === 'authed';
+  const [allBoards, setAllBoards] = useState<BoardSummary[]>([]);
+  const [destBoardId, setDestBoardId] = useState<string>(boardId || '');
+  const [destColumns, setDestColumns] = useState<Column[]>(columns);
+  const [destColumnId, setDestColumnId] = useState<string>(card.column_id);
+
+  useEffect(() => {
+    if (!isAuthed) return;
+    apiGet<{ boards: BoardSummary[] }>('/api/kanban/boards')
+      .then(d => setAllBoards(d.boards))
+      .catch(() => {});
+  }, [isAuthed]);
+
+  useEffect(() => {
+    if (!destBoardId || destBoardId === boardId) {
+      setDestColumns(columns);
+      return;
+    }
+    apiGet<{ columns: Column[] }>(`/api/kanban/boards/${destBoardId}/columns`)
+      .then(d => {
+        setDestColumns(d.columns);
+        // Reset the column selection to the first column of the new
+        // folder — the original column belongs to a different board.
+        if (!d.columns.some(c => c.id === destColumnId)) {
+          setDestColumnId(d.columns[0]?.id || '');
+        }
+      })
+      .catch(() => {});
+  // We deliberately omit destColumnId from deps — it's reset inside the
+  // effect when needed.
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [destBoardId, boardId, columns]);
+
   async function save(e: React.FormEvent) {
     e.preventDefault();
     setBusy(true); setErr(null);
     try {
+      // Move first if column changed (target column may be in another
+      // board). The move endpoint is the only one that retargets a
+      // card across folders.
+      if (destColumnId && destColumnId !== card.column_id) {
+        const moveRes = await apiFetch(`/api/kanban/cards/${cardId}/move`, {
+          method: 'PUT',
+          body: JSON.stringify({ column_id: destColumnId, position: 0 }),
+        });
+        if (!moveRes.ok) {
+          const body = await moveRes.json().catch(() => ({}));
+          throw new Error(body.error || `move failed: HTTP ${moveRes.status}`);
+        }
+      }
       const res = await apiFetch(`${urlCardsBase(apiCtx)}/${cardId}`, {
         method: 'PATCH',
         body: JSON.stringify({
@@ -1329,6 +1379,29 @@ function EditCardModal({
           <Field label="Description" hint="Drop or paste images directly into the text.">
             <DescriptionField value={description} onChange={setDescription} />
           </Field>
+          {isAuthed && (
+            <div className="grid grid-cols-2 gap-3">
+              <Field label="Folder">
+                <select value={destBoardId} onChange={e => setDestBoardId(e.target.value)}
+                  className="w-full border border-slate-200 rounded-lg px-3 py-2 text-sm">
+                  {allBoards.length === 0 && (
+                    <option value={destBoardId}>(loading…)</option>
+                  )}
+                  {allBoards.map(b => (
+                    <option key={b.id} value={b.id}>{b.name}{b.is_default ? ' · default' : ''}</option>
+                  ))}
+                </select>
+              </Field>
+              <Field label="Column">
+                <select value={destColumnId} onChange={e => setDestColumnId(e.target.value)}
+                  className="w-full border border-slate-200 rounded-lg px-3 py-2 text-sm">
+                  {destColumns.map(c => (
+                    <option key={c.id} value={c.id}>{c.name}</option>
+                  ))}
+                </select>
+              </Field>
+            </div>
+          )}
           <div className="grid grid-cols-2 gap-3">
             <Field label="Priority">
               <PrioritySelect value={priority} onChange={setPriority} />
@@ -2330,8 +2403,8 @@ function FoldersModal({ boards, activeId, onPick, onChanged, onShare, onClose }:
   const [renamingId, setRenamingId] = useState<string | null>(null);
   const [renameValue, setRenameValue] = useState('');
 
-  async function create(e: React.FormEvent) {
-    e.preventDefault();
+  async function create(e?: React.FormEvent | React.MouseEvent) {
+    e?.preventDefault();
     if (!newName.trim()) return;
     setBusy(true); setErr(null);
     try {
@@ -2393,16 +2466,17 @@ function FoldersModal({ boards, activeId, onPick, onChanged, onShare, onClose }:
       onSubmit={e => e.preventDefault()}
       footer={<button type="button" onClick={onClose}
         className="ml-auto px-3 py-2 text-sm text-slate-600 hover:bg-slate-100 rounded-lg">Done</button>}>
-      <form onSubmit={create} className="flex items-center gap-2">
+      <div className="flex items-center gap-2">
         <input value={newName} onChange={e => setNewName(e.target.value)}
+          onKeyDown={e => { if (e.key === 'Enter') { e.preventDefault(); create(); } }}
           placeholder="New folder name"
           className="flex-1 border border-slate-200 rounded-lg px-3 py-2 text-sm" />
-        <button type="submit" disabled={!newName.trim() || busy}
+        <button type="button" onClick={create} disabled={!newName.trim() || busy}
           className="inline-flex items-center gap-1 px-3 py-2 text-sm bg-slate-900 hover:bg-slate-800
                      disabled:opacity-40 text-white rounded-lg">
           <FolderPlus className="w-4 h-4" /> Add
         </button>
-      </form>
+      </div>
       <ul className="divide-y divide-slate-100 border border-slate-200 rounded-lg">
         {boards.map(b => (
           <li key={b.id} className="px-3 py-2 flex items-center gap-2">
